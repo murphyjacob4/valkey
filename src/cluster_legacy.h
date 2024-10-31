@@ -10,6 +10,7 @@
 #define CLUSTER_MF_TIMEOUT 5000              /* Milliseconds to do a manual failover. */
 #define CLUSTER_MF_PAUSE_MULT 2              /* Primary pause manual failover mult. */
 #define CLUSTER_REPLICA_MIGRATION_DELAY 5000 /* Delay for replica migration. */
+#define CLUSTER_SLOT_MIGRATION_TIMEOUT 30000 /* Milliseconds to do a slot migration. */
 
 /* Reasons why a replica is not able to failover. */
 #define CLUSTER_CANT_FAILOVER_NONE 0
@@ -364,6 +365,26 @@ typedef struct slotStat {
     uint64_t network_bytes_out;
 } slotStat;
 
+typedef enum slotMigrationState {
+    SLOT_MIGRATION_QUEUED,          /* Queued behind some other slot migration. */
+    SLOT_MIGRATION_SYNCING,         /* Syncing contents from current owner. */
+    SLOT_MIGRATION_GATHERING_VOTES, /* Gathering votes necessary for slot-level takeover. */
+    SLOT_MIGRATION_FAILED,
+} slotMigrationState;
+
+typedef struct slotMigration {
+    short slot;
+    slotMigrationState state;
+    clusterNode *source_node;
+    mstime_t end_time; /* Slot migration time limit (ms unixtime).
+                          If not yet in progress (e.g. queued), will be zero. */
+    // connection *conn;
+    // sds output_buff;
+    // int output_buff_cursor;
+    // sds response_buff;
+    replicationLink *link;
+} slotMigration;
+
 struct clusterState {
     clusterNode *myself; /* This node */
     uint64_t currentEpoch;
@@ -413,6 +434,7 @@ struct clusterState {
     unsigned char owner_not_claiming_slot[CLUSTER_SLOTS / 8];
     /* Struct used for storing slot statistics, for all slots owned by the current shard. */
     slotStat slot_stats[CLUSTER_SLOTS];
+    list *slot_migrations; /* Queue of ongoing slot migrations. */
 };
 
 #endif // CLUSTER_LEGACY_H

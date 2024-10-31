@@ -814,6 +814,20 @@ unsigned int countKeysInSlot(unsigned int slot) {
     return kvstoreDictSize(server.db->keys, slot);
 }
 
+unsigned int dropKeysInSlot(unsigned int hashslot, int async) {
+    unsigned int result = kvstoreSize(server.db[hashslot].keys);
+    if (async) {
+        emptyDbAsync(&server.db[hashslot]);
+    } else {
+        kvstoreEmpty(server.db[hashslot].keys, NULL);
+        kvstoreEmpty(server.db[hashslot].expires, NULL);
+    }
+    /* Because all keys of database are removed, reset average ttl. */
+    server.db[hashslot].avg_ttl = 0;
+    server.db[hashslot].expires_cursor = 0;
+    return result;
+}
+
 void clusterCommandHelp(client *c) {
     const char *help[] = {
         "COUNTKEYSINSLOT <slot>",

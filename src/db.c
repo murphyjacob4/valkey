@@ -109,7 +109,7 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
          * It's possible that the WRITE flag is set even during a readonly
          * command, since the command may trigger events that cause modules to
          * perform additional writes. */
-        int is_ro_replica = server.primary_host && server.repl_replica_ro;
+        int is_ro_replica = server.primary_replication_link && server.repl_replica_ro;
         int expire_flags = 0;
         if (flags & LOOKUP_WRITE && !is_ro_replica) expire_flags |= EXPIRE_FORCE_DELETE_EXPIRED;
         if (flags & LOOKUP_NOEXPIRE) expire_flags |= EXPIRE_AVOID_DELETE_EXPIRED;
@@ -385,7 +385,7 @@ robj *dbRandomKey(serverDb *db) {
         key = dictGetKey(de);
         keyobj = createStringObject(key, sdslen(key));
         if (dbFindExpiresWithDictIndex(db, key, randomDictIndex)) {
-            if (allvolatile && server.primary_host && --maxtries == 0) {
+            if (allvolatile && server.primary_replication_link && --maxtries == 0) {
                 /* If the DB is composed only of keys with an expire set,
                  * it could happen that all the keys are already logically
                  * expired in the repilca, so the function cannot stop because
@@ -1694,7 +1694,7 @@ void setExpire(client *c, serverDb *db, robj *key, long long when) {
         dictSetSignedIntegerVal(de, when);
     }
 
-    int writable_replica = server.primary_host && server.repl_replica_ro == 0;
+    int writable_replica = server.primary_replication_link && server.repl_replica_ro == 0;
     if (c && writable_replica && !c->flag.primary) rememberReplicaKeyWithExpire(db, key);
 }
 
@@ -1823,7 +1823,7 @@ keyStatus expireIfNeededWithDictIndex(serverDb *db, robj *key, int flags, int di
      *
      * When replicating commands from the primary, keys are never considered
      * expired. */
-    if (server.primary_host != NULL) {
+    if (server.primary_replication_link != NULL) {
         if (server.current_client && (server.current_client->flag.primary)) return KEY_VALID;
         if (!(flags & EXPIRE_FORCE_DELETE_EXPIRED)) return KEY_EXPIRED;
     }

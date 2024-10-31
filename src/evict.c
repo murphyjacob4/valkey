@@ -478,7 +478,7 @@ static int isSafeToPerformEvictions(void) {
 
     /* By default replicas should ignore maxmemory
      * and just be primaries exact copies. */
-    if (server.primary_host && server.repl_replica_ignore_maxmemory) return 0;
+    if (server.primary_replication_link && server.repl_replica_ignore_maxmemory) return 0;
 
     /* If 'evict' action is paused, for whatever reason, then return false */
     if (isPausedActionsWithUpdate(PAUSE_ACTION_EVICT)) return 0;

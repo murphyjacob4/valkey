@@ -3666,9 +3666,9 @@ int modulePopulateReplicationInfoStructure(void *ri, int structver) {
     ValkeyModuleReplicationInfoV1 *ri1 = ri;
     memset(ri1, 0, sizeof(*ri1));
     ri1->version = structver;
-    ri1->primary = server.primary_host == NULL;
-    ri1->primary_host = server.primary_host ? server.primary_host : "";
-    ri1->primary_port = server.primary_port;
+    ri1->primary = server.primary_replication_link == NULL;
+    ri1->primary_host = server.primary_replication_link ? server.primary_replication_link->host : "";
+    ri1->primary_port = server.primary_replication_link ? server.primary_replication_link->port : 0;
     ri1->replid1 = server.replid;
     ri1->replid2 = server.replid2;
     ri1->repl1_offset = server.primary_repl_offset;
@@ -3882,7 +3882,7 @@ int VM_GetContextFlags(ValkeyModuleCtx *ctx) {
         flags |= VALKEYMODULE_CTX_FLAGS_LOADING;
 
     /* Maxmemory and eviction policy */
-    if (server.maxmemory > 0 && (!server.primary_host || !server.repl_replica_ignore_maxmemory)) {
+    if (server.maxmemory > 0 && (!server.primary_replication_link || !server.repl_replica_ignore_maxmemory)) {
         flags |= VALKEYMODULE_CTX_FLAGS_MAXMEMORY;
 
         if (server.maxmemory_policy != MAXMEMORY_NO_EVICTION) flags |= VALKEYMODULE_CTX_FLAGS_EVICT;
@@ -3893,22 +3893,22 @@ int VM_GetContextFlags(ValkeyModuleCtx *ctx) {
     if (server.saveparamslen > 0) flags |= VALKEYMODULE_CTX_FLAGS_RDB;
 
     /* Replication flags */
-    if (server.primary_host == NULL) {
+    if (server.primary_replication_link == NULL) {
         flags |= VALKEYMODULE_CTX_FLAGS_PRIMARY;
     } else {
         flags |= VALKEYMODULE_CTX_FLAGS_REPLICA;
         if (server.repl_replica_ro) flags |= VALKEYMODULE_CTX_FLAGS_READONLY;
 
         /* Replica state flags. */
-        if (server.repl_state == REPL_STATE_CONNECT || server.repl_state == REPL_STATE_CONNECTING) {
+        if (server.primary_replication_link->state == REPL_STATE_CONNECT || server.primary_replication_link->state == REPL_STATE_CONNECTING) {
             flags |= VALKEYMODULE_CTX_FLAGS_REPLICA_IS_CONNECTING;
-        } else if (server.repl_state == REPL_STATE_TRANSFER) {
+        } else if (server.primary_replication_link->state == REPL_STATE_TRANSFER) {
             flags |= VALKEYMODULE_CTX_FLAGS_REPLICA_IS_TRANSFERRING;
-        } else if (server.repl_state == REPL_STATE_CONNECTED) {
+        } else if (server.primary_replication_link->state == REPL_STATE_CONNECTED) {
             flags |= VALKEYMODULE_CTX_FLAGS_REPLICA_IS_ONLINE;
         }
 
-        if (server.repl_state != REPL_STATE_CONNECTED) flags |= VALKEYMODULE_CTX_FLAGS_REPLICA_IS_STALE;
+        if (server.primary_replication_link->state != REPL_STATE_CONNECTED) flags |= VALKEYMODULE_CTX_FLAGS_REPLICA_IS_STALE;
     }
 
     /* OOM flag. */
@@ -6370,7 +6370,7 @@ ValkeyModuleCallReply *VM_Call(ValkeyModuleCtx *ctx, const char *cmdname, const 
                 goto cleanup;
             }
 
-            if (server.primary_host && server.repl_replica_ro && !obey_client) {
+            if (server.primary_replication_link && server.repl_replica_ro && !obey_client) {
                 errno = ESPIPE;
                 if (error_as_call_replies) {
                     sds msg = sdsdup(shared.roreplicaerr->ptr);
@@ -6380,7 +6380,7 @@ ValkeyModuleCallReply *VM_Call(ValkeyModuleCtx *ctx, const char *cmdname, const 
             }
         }
 
-        if (server.primary_host && server.repl_state != REPL_STATE_CONNECTED && server.repl_serve_stale_data == 0 &&
+        if (server.primary_replication_link && server.primary_replication_link->state != REPL_STATE_CONNECTED && server.repl_serve_stale_data == 0 &&
             !(cmd_flags & CMD_STALE)) {
             errno = ESPIPE;
             if (error_as_call_replies) {
@@ -8688,7 +8688,7 @@ int VM_AddPostNotificationJob(ValkeyModuleCtx *ctx,
                               ValkeyModulePostNotificationJobFunc callback,
                               void *privdata,
                               void (*free_privdata)(void *)) {
-    if (server.loading || (server.primary_host && server.repl_replica_ro)) {
+    if (server.loading || (server.primary_replication_link && server.repl_replica_ro)) {
         return VALKEYMODULE_ERR;
     }
     ValkeyModulePostExecUnitJob *job = zmalloc(sizeof(*job));
@@ -12957,7 +12957,7 @@ int VM_RdbLoad(ValkeyModuleCtx *ctx, ValkeyModuleRdbStream *stream, int flags) {
     }
 
     /* Not allowed on replicas. */
-    if (server.primary_host != NULL) {
+    if (server.primary_replication_link != NULL) {
         errno = ENOTSUP;
         return VALKEYMODULE_ERR;
     }

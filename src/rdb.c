@@ -2925,12 +2925,13 @@ void rdbLoadProgressCallback(rio *r, const void *buf, size_t len) {
     if (server.loading_process_events_interval_bytes &&
         (r->processed_bytes + len) / server.loading_process_events_interval_bytes >
             r->processed_bytes / server.loading_process_events_interval_bytes) {
-        if (server.primary_host && server.repl_state == REPL_STATE_TRANSFER) replicationSendNewlineToPrimary();
+        // TODO(murphyjacob4) should we also send these to the slot migration sources?
+        if (server.primary_replication_link && server.primary_replication_link->state == REPL_STATE_TRANSFER) replicationSendNewlineToSource(server.primary_replication_link);
         loadingAbsProgress(r->processed_bytes);
         processEventsWhileBlocked();
         processModuleLoadingProgressEvent(0);
     }
-    if (server.repl_state == REPL_STATE_TRANSFER && rioCheckType(r) == RIO_TYPE_CONN) {
+    if (server.primary_replication_link && server.primary_replication_link->state == REPL_STATE_TRANSFER && rioCheckType(r) == RIO_TYPE_CONN) {
         server.stat_net_repl_input_bytes += len;
     }
 }
@@ -3736,7 +3737,7 @@ rdbSaveInfo *rdbPopulateSaveInfo(rdbSaveInfo *rsi) {
      * connects to us, the NULL repl_backlog will trigger a full
      * synchronization, at the same time we will use a new replid and clear
      * replid2. */
-    if (!server.primary_host && server.repl_backlog) {
+    if (!server.primary_replication_link && server.repl_backlog) {
         /* Note that when server.replicas_eldb is -1, it means that this primary
          * didn't apply any write commands after a full synchronization.
          * So we can let repl_stream_db be 0, this allows a restarted replica
@@ -3748,8 +3749,8 @@ rdbSaveInfo *rdbPopulateSaveInfo(rdbSaveInfo *rsi) {
 
     /* If the instance is a replica we need a connected primary
      * in order to fetch the currently selected DB. */
-    if (server.primary) {
-        rsi->repl_stream_db = server.primary->db->id;
+    if (server.primary_replication_link && server.primary_replication_link->client) {
+        rsi->repl_stream_db = server.primary_replication_link->client->db->id;
         return rsi;
     }
 

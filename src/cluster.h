@@ -110,6 +110,7 @@ client *createCachedResponseClient(int resp);
 void deleteCachedResponseClient(client *recording_client);
 void clearCachedClusterSlotsResponse(void);
 unsigned int countKeysInSlot(unsigned int hashslot);
+unsigned int dropKeysInSlot(unsigned int hashslot, int async);
 int getSlotOrReply(client *c, robj *o);
 
 /* functions with shared implementations */
