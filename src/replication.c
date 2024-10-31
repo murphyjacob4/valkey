@@ -1901,7 +1901,7 @@ void replicationEmptyDbCallback(dict *d) {
 /* Once we have a link with the source and the synchronization was
  * performed, this function materializes the source client we store
  * at link->client, starting from the specified file descriptor. */
-void replicationCreateSourceClientWithHandler(replicationLink *link, int dbid, int primary, ConnectionCallbackFunc handler) {
+void replicationCreateSourceClientWithHandler(replicationLink *link, int dbid, ConnectionCallbackFunc handler) {
     link->client = createClient(link->transfer_s);
     if (link->transfer_s) connSetReadHandler(link->client->conn, handler);
 
@@ -1916,8 +1916,12 @@ void replicationCreateSourceClientWithHandler(replicationLink *link, int dbid, i
      * to pass the execution to a background thread and unblock after the
      * execution is done. This is the reason why we allow blocking the replication
      * connection. */
-    link->client->flag.primary = primary;
+    link->client->flag.primary = 1;
     link->client->flag.authenticated = 1;
+    if (link != server.primary_replication_link) {
+        /* Don't try to cache our non-primary replication link. */
+        link->client->flag.dont_cache_primary = 1;
+    }
 
     /* Allocate a private query buffer for the replication link client instead of using the shared query buffer.
      * This is done because the replication link's query buffer data needs to be preserved for my sub-replicas to use. */
@@ -1930,12 +1934,13 @@ void replicationCreateSourceClientWithHandler(replicationLink *link, int dbid, i
      * PSYNC capable, so we flag it accordingly. */
     if (link->client->reploff == -1) link->client->flag.pre_psync = 1;
     if (dbid != -1) selectDb(link->client, dbid);
+    link->client->primary_slot_num = link->slot_num;
 }
 
 /* Wrapper for replicationCreateSourceClientWithHandler, init primary connection handler
  * with ordinary client connection handler */
-void replicationCreateSourceClient(replicationLink *link, int dbid, int primary) {
-    replicationCreateSourceClientWithHandler(link, dbid, primary, readQueryFromClient);
+void replicationCreateSourceClient(replicationLink *link, int dbid) {
+    replicationCreateSourceClientWithHandler(link, dbid, readQueryFromClient);
 }
 
 /* This function will try to re-enable the AOF file after the
@@ -2417,7 +2422,7 @@ void readSyncBulkPayload(connection *conn) {
     if (conn == link->rdb_transfer_s) {
         dualChannelSyncHandleRdbLoadCompletion(link);
     } else {
-        replicationCreateSourceClient(link, rsi.repl_stream_db, link == server.primary_replication_link);
+        replicationCreateSourceClient(link, rsi.repl_stream_db);
         link->state = REPL_STATE_CONNECTED;
         /* Send the initial ACK immediately to put this replica in online state. */
         replicationSendAck(link);
@@ -4309,7 +4314,7 @@ void replicationCachePrimaryUsingMyself(void) {
 
     /* The primary client we create can be set to any DBID, because
      * the new primary will start its replication stream with SELECT. */
-    replicationCreateSourceClient(temp_link, -1, 1);
+    replicationCreateSourceClient(temp_link, -1);
 
     /* Use our own ID / offset. */
     memcpy(temp_link->client->replid, server.replid, sizeof(server.replid));
@@ -4397,7 +4402,7 @@ void replicationSteadyStateInit(replicationLink *link) {
 void replicationResurrectProvisionalSource(replicationLink *link) {
     /* Create a primary client, but do not initialize the read handler yet, as this replica still has a local buffer to
      * drain. */
-    replicationCreateSourceClientWithHandler(link, link->provisional_source_state.dbid, link == server.primary_replication_link, NULL);
+    replicationCreateSourceClientWithHandler(link, link->provisional_source_state.dbid, NULL);
     memcpy(link->client->replid, link->provisional_source_state.replid, CONFIG_RUN_ID_SIZE);
     link->client->reploff = link->provisional_source_state.reploff;
     link->client->read_reploff = link->provisional_source_state.read_reploff;

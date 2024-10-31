@@ -1694,8 +1694,12 @@ void freeClient(client *c) {
      *
      * Note that before doing this we make sure that the client is not in
      * some unexpected state, by checking its flags. */
-    if (server.primary_replication_link && c->flag.primary) {
-        serverLog(LL_NOTICE, "Connection with primary lost.");
+    if (c->flag.primary) {
+        if (c->primary_slot_num >= 0) {
+            serverLog(LL_NOTICE, "Connection with primary (of slot %d) lost.", c->primary_slot_num);
+        } else {
+            serverLog(LL_NOTICE, "Connection with primary lost.");
+        }
         if (!c->flag.dont_cache_primary && !(c->flag.protocol_error || c->flag.blocked)) {
             c->flag.close_asap = 0;
             c->flag.close_after_reply = 0;
@@ -1706,10 +1710,18 @@ void freeClient(client *c) {
 
     /* Log link disconnection with replica */
     if (getClientType(c) == CLIENT_TYPE_REPLICA) {
-        serverLog(LL_NOTICE,
-                  c->flag.repl_rdb_channel ? "Replica %s rdb channel disconnected."
-                                           : "Connection with replica %s lost.",
-                  replicationGetReplicaName(c));
+        if (c->replica_slot_num >= 0) {
+            serverLog(LL_NOTICE,
+                    c->flag.repl_rdb_channel ? "Replica %s rdb channel disconnected."
+                                            : "Connection with replica %s (of slot %d) lost.",
+                    replicationGetReplicaName(c),
+                    c->replica_slot_num);
+        } else {
+            serverLog(LL_NOTICE,
+                    c->flag.repl_rdb_channel ? "Replica %s rdb channel disconnected."
+                                            : "Connection with replica %s lost.",
+                    replicationGetReplicaName(c));
+        }
     }
 
     /* Free the query buffer */
@@ -1796,7 +1808,7 @@ void freeClient(client *c) {
 
     /* Primary/replica cleanup Case 2:
      * we lost the connection with the primary. */
-    if (c->flag.primary) replicationHandlePrimaryDisconnection();
+    if (c->flag.primary && server.primary_replication_link != NULL && server.primary_replication_link->client == c) replicationHandlePrimaryDisconnection();
 
     /* Remove client from memory usage buckets */
     if (c->mem_usage_bucket) {

@@ -1303,6 +1303,7 @@ typedef struct client {
     int replica_version;                       /* Version on the form 0xMMmmpp. */
     short replica_capa;                        /* Replica capabilities: REPLICA_CAPA_* bitwise OR. */
     short replica_req;                         /* Replica requirements: REPLICA_REQ_* */
+    int primary_slot_num;                      /* The slot number this primary connection is replicating. */
     int replica_slot_num;                      /* Optionally given by REPLCONF slot-num */
     uint64_t associated_rdb_client_id;         /* The client id of this replica's rdb connection */
     time_t rdb_client_disconnect_time;         /* Time of the first freeClient call on this client. Used for delaying free. */
