@@ -3787,6 +3787,7 @@ void syncWithSource(connection *conn) {
     if (psync_result == PSYNC_FULLRESYNC_DUAL_CHANNEL) {
         /* Create RDB connection */
         link->rdb_transfer_s = connCreate(connTypeOfReplication());
+        connSetPrivateData(link->rdb_transfer_s, link);
         if (connConnect(link->rdb_transfer_s, link->host, link->port, server.bind_source_addr,
                         dualChannelFullSyncWithSource) == C_ERR) {
             serverLog(LL_WARNING, "Unable to connect to Primary: %s", connGetLastError(link->transfer_s));
@@ -4038,6 +4039,8 @@ void replicationUnsetPrimary(void) {
     /* Clear primary_host first, since the freeClient calls
      * replicationHandlePrimaryDisconnection which can attempt to re-connect. */
     freeReplicationLink(server.primary_replication_link);
+    server.primary_replication_link = NULL;
+
     replicationDiscardCachedPrimary();
     /* When a replica is turned into a primary, the current replication ID
      * (that was inherited from the primary at synchronization time) is
