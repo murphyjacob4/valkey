@@ -31,6 +31,18 @@ void lazyfreeFreeDatabase(void *args[]) {
     atomic_fetch_add_explicit(&lazyfreed_objects, numkeys, memory_order_relaxed);
 }
 
+/* Release a dictionary from the lazyfree thread. */
+void lazyfreeFreeDictionary(void *args[]) {
+    dict *d1 = args[0];
+    dict *d2 = args[1];
+
+    size_t numkeys = dictSize(d1);
+    dictRelease(d1);
+    if (d2) dictRelease(d2);
+    atomic_fetch_sub_explicit(&lazyfree_objects, numkeys, memory_order_relaxed);
+    atomic_fetch_add_explicit(&lazyfreed_objects, numkeys, memory_order_relaxed);
+}
+
 /* Release the key tracking table. */
 void lazyFreeTrackingTable(void *args[]) {
     rax *rt = args[0];
@@ -196,6 +208,17 @@ void emptyDbAsync(serverDb *db) {
     db->expires = kvstoreCreate(&kvstoreExpiresDictType, slot_count_bits, flags);
     atomic_fetch_add_explicit(&lazyfree_objects, kvstoreSize(oldkeys), memory_order_relaxed);
     bioCreateLazyFreeJob(lazyfreeFreeDatabase, 2, oldkeys, oldexpires);
+}
+
+/* Empty a dictionary asynchrounously. */
+void emptyDictAsync(serverDb *db, int didx) {
+    dict *oldkeys = kvstoreUnlinkDict(db->keys, didx);
+    dict *oldexpires = kvstoreUnlinkDict(db->expires, didx);
+    if (!oldkeys) {
+        return;
+    }
+    atomic_fetch_add_explicit(&lazyfree_objects, dictSize(oldkeys), memory_order_relaxed);
+    bioCreateLazyFreeJob(lazyfreeFreeDictionary, 2, oldkeys, oldexpires);
 }
 
 /* Free the key tracking table.

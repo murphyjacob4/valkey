@@ -1215,7 +1215,7 @@ void syncCommand(client *c) {
 
         /* CASE 3: There is no BGSAVE is in progress. */
     } else {
-        if (c->replica_slot_num != -1 && server.repl_diskless_sync && (c->replica_capa & REPLICA_CAPA_EOF) && server.repl_diskless_sync_delay) {
+        if (c->replica_slot_num == -1 && server.repl_diskless_sync && (c->replica_capa & REPLICA_CAPA_EOF) && server.repl_diskless_sync_delay) {
             /* Diskless replication RDB child is created inside
              * replicationCron() since we want to delay its start a
              * few seconds to wait for more replicas to arrive. */
@@ -2230,7 +2230,6 @@ void readSyncBulkPayload(connection *conn) {
         if (link->slot_num != -1) {
             dbarray = server.db;
             functions_lib_ctx = functionsLibCtxGetCurrent();
-            functionsLibCtxClear(functions_lib_ctx);
         } else if (server.repl_diskless_load == REPL_DISKLESS_LOAD_SWAPDB) {
             /* Async loading means we continue serving read commands during full resync, and
              * "swap" the new db with the old db only when loading is done.

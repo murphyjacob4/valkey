@@ -287,12 +287,7 @@ kvstore *kvstoreCreate(dictType *type, int num_dicts_bits, int flags) {
 
 void kvstoreEmpty(kvstore *kvs, void(callback)(dict *)) {
     for (int didx = 0; didx < kvs->num_dicts; didx++) {
-        dict *d = kvstoreGetDict(kvs, didx);
-        if (!d) continue;
-        kvstoreDictMetadata *metadata = (kvstoreDictMetadata *)dictMetadata(d);
-        if (metadata->rehashing_node) metadata->rehashing_node = NULL;
-        dictEmpty(d, callback);
-        freeDictIfNeeded(kvs, didx);
+        kvstoreEmptyDict(kvs, didx, callback);
     }
 
     listEmpty(kvs->rehashing);
@@ -304,6 +299,28 @@ void kvstoreEmpty(kvstore *kvs, void(callback)(dict *)) {
     if (kvs->dict_size_index) memset(kvs->dict_size_index, 0, sizeof(unsigned long long) * (kvs->num_dicts + 1));
     kvs->overhead_hashtable_lut = 0;
     kvs->overhead_hashtable_rehashing = 0;
+}
+
+void kvstoreEmptyDict(kvstore *kvs, int didx, void(callback)(dict *)) {
+    dict *d = kvstoreGetDict(kvs, didx);
+    if (!d) return;
+    kvstoreDictMetadata *metadata = (kvstoreDictMetadata *)dictMetadata(d);
+    if (metadata->rehashing_node) metadata->rehashing_node = NULL;
+    dictEmpty(d, callback);
+    freeDictIfNeeded(kvs, didx);
+}
+
+dict *kvstoreUnlinkDict(kvstore *kvs, int didx) {
+    dict *olddict = kvstoreGetDict(kvs, didx);
+    if (!olddict) return NULL;
+
+    /* Pause rehashing on the to be unlinked node. */
+    kvstoreDictMetadata *oldmetadata = (kvstoreDictMetadata *)dictMetadata(olddict);
+    if (oldmetadata->rehashing_node) oldmetadata->rehashing_node = NULL;
+
+    kvs->dicts[didx] = NULL;
+    kvs->allocated_dicts--;
+    return olddict;
 }
 
 void kvstoreRelease(kvstore *kvs) {
@@ -573,7 +590,7 @@ kvstoreIterator *kvstoreSingleDictIteratorInit(kvstore *kvs, int didx) {
     kvs_it->kvs = kvs;
     kvs_it->didx = didx;
     kvs_it->next_didx = -1;
-    dictInitSafeIterator(&kvs_it->di, NULL);
+    dictInitSafeIterator(&kvs_it->di, kvstoreGetDict(kvs, didx));
     return kvs_it;
 }
 

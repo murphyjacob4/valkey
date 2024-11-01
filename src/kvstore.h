@@ -15,6 +15,8 @@ typedef int(kvstoreExpandShouldSkipDictIndex)(int didx);
 #define KVSTORE_FREE_EMPTY_DICTS (1 << 1)
 kvstore *kvstoreCreate(dictType *type, int num_dicts_bits, int flags);
 void kvstoreEmpty(kvstore *kvs, void(callback)(dict *));
+void kvstoreEmptyDict(kvstore *kvs, int didx, void(callback)(dict *));
+dict *kvstoreUnlinkDict(kvstore *kvs, int didx);
 void kvstoreRelease(kvstore *kvs);
 unsigned long long kvstoreSize(kvstore *kvs);
 unsigned long kvstoreBuckets(kvstore *kvs);

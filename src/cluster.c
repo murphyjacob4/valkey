@@ -815,16 +815,13 @@ unsigned int countKeysInSlot(unsigned int slot) {
 }
 
 unsigned int dropKeysInSlot(unsigned int hashslot, int async) {
-    unsigned int result = kvstoreSize(server.db[hashslot].keys);
+    unsigned int result = kvstoreDictSize(server.db->keys, hashslot);
     if (async) {
-        emptyDbAsync(&server.db[hashslot]);
+        emptyDictAsync(server.db, hashslot);
     } else {
-        kvstoreEmpty(server.db[hashslot].keys, NULL);
-        kvstoreEmpty(server.db[hashslot].expires, NULL);
+        kvstoreEmptyDict(server.db->keys, hashslot, NULL);
+        kvstoreEmptyDict(server.db->expires, hashslot, NULL);
     }
-    /* Because all keys of database are removed, reset average ttl. */
-    server.db[hashslot].avg_ttl = 0;
-    server.db[hashslot].expires_cursor = 0;
     return result;
 }
 

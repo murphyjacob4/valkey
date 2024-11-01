@@ -4364,6 +4364,7 @@ void clusterProceedWithSlotMigration(void) {
                 /* Delete the migration from the queue and proceed to the next migration */
                 listDelNode(server.cluster->slot_migrations, curr_node);
                 freeReplicationLink(curr_migration->link);
+                dropKeysInSlot(curr_migration->slot, server.repl_replica_lazy_flush);
                 zfree(curr_migration);
                 continue;
         }
