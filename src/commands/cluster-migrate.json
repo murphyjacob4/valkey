@@ -1,6 +1,6 @@
 {
     "MIGRATE": {
-        "summary": "Initiates server driven hash slot migration from this shard to a designated shard.",
+        "summary": "Initiates server driven hash slot migration, importing the given slot to this shard.",
         "complexity": "O(N) where N is the total number of hash slot arguments",
         "group": "cluster",
         "since": "8.1.0",
