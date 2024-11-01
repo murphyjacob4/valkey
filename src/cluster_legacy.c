@@ -6993,6 +6993,7 @@ int clusterCommandSpecial(client *c) {
                 to_enqueue->slot = i;
                 to_enqueue->state = SLOT_MIGRATION_QUEUED;
                 to_enqueue->end_time = 0; /* Will be set once started. */
+                to_enqueue->link = NULL;
                 // to_enqueue->output_buff = sdsempty();
                 // to_enqueue->output_buff_cursor = 0;
                 // to_enqueue->response_buff = sdsempty();

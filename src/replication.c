@@ -980,7 +980,7 @@ int startBgsaveForReplication(int mincapa, int req, int slot_num) {
             /* Keep the page cache since it'll get used soon */
             sds file_out = sdsnew(server.rdb_filename);
             if (slot_num != -1)
-                sdscatfmt(file_out, "-slot%d", server.rdb_filename, slot_num);
+                file_out = sdscatfmt(file_out, "-slot%d", server.rdb_filename, slot_num);
             retval = rdbSaveBackground(req, file_out, rsiptr, RDBFLAGS_REPLICATION | RDBFLAGS_KEEP_CACHE, slot_num);
             sdsfree(file_out);
         }
@@ -1908,7 +1908,11 @@ void replicationEmptyDbCallback(dict *d) {
  * at link->client, starting from the specified file descriptor. */
 void replicationCreateSourceClientWithHandler(replicationLink *link, int dbid, ConnectionCallbackFunc handler) {
     link->client = createClient(link->transfer_s);
-    if (link->transfer_s) connSetReadHandler(link->client->conn, handler);
+    if (link->transfer_s) {
+        connSetReadHandler(link->client->conn, handler);
+        /* link->client takes ownership of this connection now */
+        link->transfer_s = NULL;
+    }
 
     /**
      * Important note:
@@ -3084,7 +3088,7 @@ void dualChannelSyncHandleRdbLoadCompletion(replicationLink *link) {
 #define PSYNC_TRY_LATER 5
 #define PSYNC_FULLRESYNC_DUAL_CHANNEL 6
 int replicaTryPartialResynchronization(replicationLink *link, int read_reply) {
-    char *psync_replid;
+    char *psync_replid = NULL;
     char psync_offset[32];
     sds reply;
 
@@ -3103,13 +3107,18 @@ int replicaTryPartialResynchronization(replicationLink *link, int read_reply) {
             snprintf(psync_offset, sizeof(psync_offset), "%lld", link->provisional_source_state.reploff + 1);
             serverLog(LL_NOTICE, "Trying a partial resynchronization using main channel (request %s:%s).", psync_replid,
                       psync_offset);
-        } else if (server.cached_primary && link == server.primary_replication_link) {
+        } else if (link != server.primary_replication_link) {
+            serverLog(LL_NOTICE, "Partial resynchronization not possible (not primary replication)");
+        } else if (server.cached_primary) {
             /* If this is a replication related sync, we can try to use the cached primary. */
             psync_replid = server.cached_primary->replid;
             snprintf(psync_offset, sizeof(psync_offset), "%lld", server.cached_primary->reploff + 1);
             serverLog(LL_NOTICE, "Trying a partial resynchronization (request %s:%s).", psync_replid, psync_offset);
         } else {
             serverLog(LL_NOTICE, "Partial resynchronization not possible (no cached primary)");
+
+        }
+        if (!psync_replid) {
             psync_replid = "?";
             memcpy(psync_offset, "-1", 3);
         }
@@ -3652,6 +3661,7 @@ void syncWithSource(connection *conn) {
         }
         sdsfree(err);
         link->state = REPL_STATE_RECEIVE_CAPA_REPLY;
+        return;
     }
 
     /* Receive CAPA reply. */
@@ -3908,7 +3918,6 @@ int connectReplicationLink(replicationLink *link) {
         link->transfer_s = NULL;
         return C_ERR;
     }
-
 
     link->transfer_lastio = server.unixtime;
     link->state = REPL_STATE_CONNECTING;
