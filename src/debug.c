@@ -563,7 +563,7 @@ void debugCommand(client *c) {
         if (save) {
             rdbSaveInfo rsi, *rsiptr;
             rsiptr = rdbPopulateSaveInfo(&rsi);
-            if (rdbSave(REPLICA_REQ_NONE, server.rdb_filename, rsiptr, RDBFLAGS_NONE) != C_OK) {
+            if (rdbSave(REPLICA_REQ_NONE, server.rdb_filename, rsiptr, RDBFLAGS_NONE, -1) != C_OK) {
                 addReplyErrorObject(c, shared.err);
                 return;
             }

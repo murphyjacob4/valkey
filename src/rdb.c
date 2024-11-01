@@ -1315,7 +1315,7 @@ werr:
     return -1;
 }
 
-ssize_t rdbSaveDb(rio *rdb, int dbid, int rdbflags, long *key_counter) {
+ssize_t rdbSaveDb(rio *rdb, int dbid, int rdbflags, long *key_counter, int slot_num) {
     dictEntry *de;
     ssize_t written = 0;
     ssize_t res;
@@ -1342,7 +1342,11 @@ ssize_t rdbSaveDb(rio *rdb, int dbid, int rdbflags, long *key_counter) {
     if ((res = rdbSaveLen(rdb, expires_size)) < 0) goto werr;
     written += res;
 
-    kvs_it = kvstoreIteratorInit(db->keys);
+    if (slot_num == -1) {
+        kvs_it = kvstoreIteratorInit(db->keys);
+    } else {
+        kvs_it = kvstoreSingleDictIteratorInit(db->keys, slot_num);
+    }
     int last_slot = -1;
     /* Iterate this DB writing every entry */
     while ((de = kvstoreIteratorNext(kvs_it)) != NULL) {
@@ -1401,7 +1405,7 @@ werr:
  * When the function returns C_ERR and if 'error' is not NULL, the
  * integer pointed by 'error' is set to the value of errno just after the I/O
  * error. */
-int rdbSaveRio(int req, rio *rdb, int *error, int rdbflags, rdbSaveInfo *rsi) {
+int rdbSaveRio(int req, rio *rdb, int *error, int rdbflags, rdbSaveInfo *rsi, int slot_num) {
     char magic[10];
     uint64_t cksum;
     long key_counter = 0;
@@ -1419,11 +1423,11 @@ int rdbSaveRio(int req, rio *rdb, int *error, int rdbflags, rdbSaveInfo *rsi) {
     /* save all databases, skip this if we're in functions-only mode */
     if (!(req & REPLICA_REQ_RDB_EXCLUDE_DATA)) {
         for (j = 0; j < server.dbnum; j++) {
-            if (rdbSaveDb(rdb, j, rdbflags, &key_counter) == -1) goto werr;
+            if (rdbSaveDb(rdb, j, rdbflags, &key_counter, slot_num) == -1) goto werr;
         }
     }
 
-    if (!(req & REPLICA_REQ_RDB_EXCLUDE_DATA) && rdbSaveModulesAux(rdb, VALKEYMODULE_AUX_AFTER_RDB) == -1) goto werr;
+    if (!(req & REPLICA_REQ_RDB_EXCLUDE_DATA && slot_num != -1) && rdbSaveModulesAux(rdb, VALKEYMODULE_AUX_AFTER_RDB) == -1) goto werr;
 
     /* EOF opcode */
     if (rdbSaveType(rdb, RDB_OPCODE_EOF) == -1) goto werr;
@@ -1449,7 +1453,7 @@ werr:
  * While the suffix is the 40 bytes hex string we announced in the prefix.
  * This way processes receiving the payload can understand when it ends
  * without doing any processing of the content. */
-int rdbSaveRioWithEOFMark(int req, rio *rdb, int *error, rdbSaveInfo *rsi) {
+int rdbSaveRioWithEOFMark(int req, rio *rdb, int *error, rdbSaveInfo *rsi, int slot_num) {
     char eofmark[RDB_EOF_MARK_SIZE];
 
     startSaving(RDBFLAGS_REPLICATION);
@@ -1458,7 +1462,7 @@ int rdbSaveRioWithEOFMark(int req, rio *rdb, int *error, rdbSaveInfo *rsi) {
     if (rioWrite(rdb, "$EOF:", 5) == 0) goto werr;
     if (rioWrite(rdb, eofmark, RDB_EOF_MARK_SIZE) == 0) goto werr;
     if (rioWrite(rdb, "\r\n", 2) == 0) goto werr;
-    if (rdbSaveRio(req, rdb, error, RDBFLAGS_REPLICATION, rsi) == C_ERR) goto werr;
+    if (rdbSaveRio(req, rdb, error, RDBFLAGS_REPLICATION, rsi, slot_num) == C_ERR) goto werr;
     if (rioWrite(rdb, eofmark, RDB_EOF_MARK_SIZE) == 0) goto werr;
     stopSaving(1);
     return C_OK;
@@ -1470,7 +1474,7 @@ werr: /* Write error. */
     return C_ERR;
 }
 
-static int rdbSaveInternal(int req, const char *filename, rdbSaveInfo *rsi, int rdbflags) {
+static int rdbSaveInternal(int req, const char *filename, rdbSaveInfo *rsi, int rdbflags, int slot_num) {
     char cwd[MAXPATHLEN]; /* Current working dir path for error messages. */
     rio rdb;
     int error = 0;
@@ -1497,7 +1501,7 @@ static int rdbSaveInternal(int req, const char *filename, rdbSaveInfo *rsi, int 
         if (!(rdbflags & RDBFLAGS_KEEP_CACHE)) rioSetReclaimCache(&rdb, 1);
     }
 
-    if (rdbSaveRio(req, &rdb, &error, rdbflags, rsi) == C_ERR) {
+    if (rdbSaveRio(req, &rdb, &error, rdbflags, rsi, slot_num) == C_ERR) {
         errno = error;
         err_op = "rdbSaveRio";
         goto werr;
@@ -1537,7 +1541,7 @@ werr:
 int rdbSaveToFile(const char *filename) {
     startSaving(RDBFLAGS_NONE);
 
-    if (rdbSaveInternal(REPLICA_REQ_NONE, filename, NULL, RDBFLAGS_NONE) != C_OK) {
+    if (rdbSaveInternal(REPLICA_REQ_NONE, filename, NULL, RDBFLAGS_NONE, -1) != C_OK) {
         int saved_errno = errno;
         stopSaving(0);
         errno = saved_errno;
@@ -1549,14 +1553,14 @@ int rdbSaveToFile(const char *filename) {
 }
 
 /* Save the DB on disk. Return C_ERR on error, C_OK on success. */
-int rdbSave(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
+int rdbSave(int req, char *filename, rdbSaveInfo *rsi, int rdbflags, int slot_num) {
     char tmpfile[256];
     char cwd[MAXPATHLEN]; /* Current working dir path for error messages. */
 
     startSaving(rdbflags);
     snprintf(tmpfile, 256, "temp-%d.rdb", (int)getpid());
 
-    if (rdbSaveInternal(req, tmpfile, rsi, rdbflags) != C_OK) {
+    if (rdbSaveInternal(req, tmpfile, rsi, rdbflags, slot_num) != C_OK) {
         stopSaving(0);
         return C_ERR;
     }
@@ -1588,7 +1592,7 @@ int rdbSave(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     return C_OK;
 }
 
-int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
+int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags, int slot_num) {
     pid_t childpid;
 
     if (hasActiveChildProcess()) return C_ERR;
@@ -1607,7 +1611,7 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
             serverSetProcTitle("valkey-rdb-bgsave");
         }
         serverSetCpuAffinity(server.bgsave_cpulist);
-        retval = rdbSave(req, filename, rsi, rdbflags);
+        retval = rdbSave(req, filename, rsi, rdbflags, slot_num);
         if (retval == C_OK) {
             sendChildCowInfo(CHILD_INFO_TYPE_RDB_COW_SIZE, "RDB");
         }
@@ -3505,7 +3509,7 @@ void killRDBChild(void) {
 
 /* Spawn an RDB child that writes the RDB to the sockets of the replicas
  * that are currently in REPLICA_STATE_WAIT_BGSAVE_START state. */
-int rdbSaveToReplicasSockets(int req, rdbSaveInfo *rsi) {
+int rdbSaveToReplicasSockets(int req, rdbSaveInfo *rsi, int slot_num) {
     listNode *ln;
     listIter li;
     pid_t childpid;
@@ -3555,6 +3559,7 @@ int rdbSaveToReplicasSockets(int req, rdbSaveInfo *rsi) {
         if (replica->repl_state == REPLICA_STATE_WAIT_BGSAVE_START) {
             /* Check replica has the exact requirements */
             if (replica->replica_req != req) continue;
+            if (replica->replica_slot_num != slot_num) continue;
 
             conns[connsnum++] = replica->conn;
             if (dual_channel) {
@@ -3594,7 +3599,7 @@ int rdbSaveToReplicasSockets(int req, rdbSaveInfo *rsi) {
         }
         serverSetCpuAffinity(server.bgsave_cpulist);
 
-        retval = rdbSaveRioWithEOFMark(req, &rdb, NULL, rsi);
+        retval = rdbSaveRioWithEOFMark(req, &rdb, NULL, rsi, slot_num);
         if (retval == C_OK && rioFlush(&rdb) == 0) retval = C_ERR;
 
         if (retval == C_OK) {
@@ -3674,7 +3679,7 @@ void saveCommand(client *c) {
 
     rdbSaveInfo rsi, *rsiptr;
     rsiptr = rdbPopulateSaveInfo(&rsi);
-    if (rdbSave(REPLICA_REQ_NONE, server.rdb_filename, rsiptr, RDBFLAGS_NONE) == C_OK) {
+    if (rdbSave(REPLICA_REQ_NONE, server.rdb_filename, rsiptr, RDBFLAGS_NONE, -1) == C_OK) {
         addReply(c, shared.ok);
     } else {
         addReplyErrorObject(c, shared.err);
@@ -3710,7 +3715,7 @@ void bgsaveCommand(client *c) {
                              "Use BGSAVE SCHEDULE in order to schedule a BGSAVE whenever "
                              "possible.");
         }
-    } else if (rdbSaveBackground(REPLICA_REQ_NONE, server.rdb_filename, rsiptr, RDBFLAGS_NONE) == C_OK) {
+    } else if (rdbSaveBackground(REPLICA_REQ_NONE, server.rdb_filename, rsiptr, RDBFLAGS_NONE, -1) == C_OK) {
         addReplyStatus(c, "Background saving started");
     } else {
         addReplyErrorObject(c, shared.err);

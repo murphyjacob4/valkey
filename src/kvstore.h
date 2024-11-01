@@ -43,6 +43,7 @@ size_t kvstoreDictMetadataSize(dict *d);
 
 /* kvstore iterator specific functions */
 kvstoreIterator *kvstoreIteratorInit(kvstore *kvs);
+kvstoreIterator *kvstoreSingleDictIteratorInit(kvstore *kvs, int didx);
 void kvstoreIteratorRelease(kvstoreIterator *kvs_it);
 int kvstoreIteratorGetCurrentDictIndex(kvstoreIterator *kvs_it);
 dictEntry *kvstoreIteratorNext(kvstoreIterator *kvs_it);

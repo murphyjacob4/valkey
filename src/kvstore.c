@@ -568,6 +568,15 @@ kvstoreIterator *kvstoreIteratorInit(kvstore *kvs) {
     return kvs_it;
 }
 
+kvstoreIterator *kvstoreSingleDictIteratorInit(kvstore *kvs, int didx) {
+    kvstoreIterator *kvs_it = zmalloc(sizeof(*kvs_it));
+    kvs_it->kvs = kvs;
+    kvs_it->didx = didx;
+    kvs_it->next_didx = -1;
+    dictInitSafeIterator(&kvs_it->di, NULL);
+    return kvs_it;
+}
+
 /* Free the kvs_it returned by kvstoreIteratorInit. */
 void kvstoreIteratorRelease(kvstoreIterator *kvs_it) {
     dictIterator *iter = &kvs_it->di;

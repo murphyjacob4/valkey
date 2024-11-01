@@ -951,7 +951,7 @@ need_full_resync:
  *    started.
  *
  * Returns C_OK on success or C_ERR otherwise. */
-int startBgsaveForReplication(int mincapa, int req) {
+int startBgsaveForReplication(int mincapa, int req, int slot_num) {
     int retval;
     int socket_target = 0;
     listIter li;
@@ -964,9 +964,10 @@ int startBgsaveForReplication(int mincapa, int req) {
     /* `SYNC` should have failed with error if we don't support socket and require a filter, assert this here */
     serverAssert(socket_target || !(req & REPLICA_REQ_RDB_MASK));
 
-    serverLog(LL_NOTICE, "Starting BGSAVE for SYNC with target: %s using: %s",
+    serverLog(LL_NOTICE, "Starting BGSAVE for SYNC with target: %s using: %s for slot: %d",
               socket_target ? "replicas sockets" : "disk",
-              (req & REPLICA_REQ_RDB_CHANNEL) ? "dual-channel" : "normal sync");
+              (req & REPLICA_REQ_RDB_CHANNEL) ? "dual-channel" : "normal sync",
+              slot_num);
 
     rdbSaveInfo rsi, *rsiptr;
     rsiptr = rdbPopulateSaveInfo(&rsi);
@@ -974,10 +975,14 @@ int startBgsaveForReplication(int mincapa, int req) {
      * otherwise replica will miss repl-stream-db. */
     if (rsiptr) {
         if (socket_target)
-            retval = rdbSaveToReplicasSockets(req, rsiptr);
+            retval = rdbSaveToReplicasSockets(req, rsiptr, slot_num);
         else {
             /* Keep the page cache since it'll get used soon */
-            retval = rdbSaveBackground(req, server.rdb_filename, rsiptr, RDBFLAGS_REPLICATION | RDBFLAGS_KEEP_CACHE);
+            sds file_out = sdsnew(server.rdb_filename);
+            if (slot_num != -1)
+                sdscatfmt(file_out, "-slot%d", server.rdb_filename, slot_num);
+            retval = rdbSaveBackground(req, file_out, rsiptr, RDBFLAGS_REPLICATION | RDBFLAGS_KEEP_CACHE, slot_num);
+            sdsfree(file_out);
         }
         if (server.debug_pause_after_fork) debugPauseProcess();
     } else {
@@ -1166,8 +1171,8 @@ void syncCommand(client *c) {
                   server.replid, server.replid2);
     }
 
-    /* CASE 1: BGSAVE is in progress, with disk target. */
-    if (server.child_type == CHILD_TYPE_RDB && server.rdb_child_type == RDB_CHILD_TYPE_DISK) {
+    /* CASE 1: BGSAVE of entire DB is in progress, with disk target. */
+    if (server.child_type == CHILD_TYPE_RDB && server.rdb_child_type == RDB_CHILD_TYPE_DISK && c->replica_slot_num == -1) {
         /* Ok a background save is in progress. Let's check if it is a good
          * one for replication, i.e. if there is another replica that is
          * registering differences since the server forked to save. */
@@ -1210,7 +1215,7 @@ void syncCommand(client *c) {
 
         /* CASE 3: There is no BGSAVE is in progress. */
     } else {
-        if (server.repl_diskless_sync && (c->replica_capa & REPLICA_CAPA_EOF) && server.repl_diskless_sync_delay) {
+        if (c->replica_slot_num != -1 && server.repl_diskless_sync && (c->replica_capa & REPLICA_CAPA_EOF) && server.repl_diskless_sync_delay) {
             /* Diskless replication RDB child is created inside
              * replicationCron() since we want to delay its start a
              * few seconds to wait for more replicas to arrive. */
@@ -1219,7 +1224,7 @@ void syncCommand(client *c) {
             /* We don't have a BGSAVE in progress, let's start one. Diskless
              * or disk-based mode is determined by replica's capacity. */
             if (!hasActiveChildProcess()) {
-                startBgsaveForReplication(c->replica_capa, c->replica_req);
+                startBgsaveForReplication(c->replica_capa, c->replica_req, c->replica_slot_num);
             } else {
                 serverLog(LL_NOTICE, "No BGSAVE in progress, but another BG operation is active. "
                                      "BGSAVE for replication delayed");
@@ -4887,7 +4892,7 @@ void replicationCron(void) {
     replication_cron_loops++; /* Incremented with frequency 1 HZ. */
 }
 
-int shouldStartChildReplication(int *mincapa_out, int *req_out) {
+int shouldStartChildReplication(int *mincapa_out, int *req_out, int *slot_num_out) {
     /* We should start a BGSAVE good for replication if we have replicas in
      * WAIT_BGSAVE_START state.
      *
@@ -4899,6 +4904,7 @@ int shouldStartChildReplication(int *mincapa_out, int *req_out) {
         int replicas_waiting = 0;
         int mincapa;
         int req;
+        int slot_num;
         int first = 1;
         listNode *ln;
         listIter li;
@@ -4910,7 +4916,8 @@ int shouldStartChildReplication(int *mincapa_out, int *req_out) {
                 if (first) {
                     /* Get first replica's requirements */
                     req = replica->replica_req;
-                } else if (req != replica->replica_req) {
+                    slot_num = replica->replica_slot_num;
+                } else if (req != replica->replica_req || slot_num != replica->replica_slot_num) {
                     /* Skip replicas that don't match */
                     continue;
                 }
@@ -4928,6 +4935,7 @@ int shouldStartChildReplication(int *mincapa_out, int *req_out) {
                                  max_idle >= server.repl_diskless_sync_delay)) {
             if (mincapa_out) *mincapa_out = mincapa;
             if (req_out) *req_out = req;
+            if (slot_num) *slot_num_out = slot_num;
             return 1;
         }
     }
@@ -4938,12 +4946,13 @@ int shouldStartChildReplication(int *mincapa_out, int *req_out) {
 int replicationStartPendingFork(void) {
     int mincapa = -1;
     int req = -1;
+    int slot_num = -1;
 
-    if (shouldStartChildReplication(&mincapa, &req)) {
+    if (shouldStartChildReplication(&mincapa, &req, &slot_num)) {
         /* Start the BGSAVE. The called function may start a
          * BGSAVE with socket target or disk target depending on the
          * configuration and replicas capabilities and requirements. */
-        startBgsaveForReplication(mincapa, req);
+        startBgsaveForReplication(mincapa, req, slot_num);
         return 1;
     }
     return 0;
