@@ -2950,6 +2950,7 @@ static int setConfigReplicaOfOption(standardConfig *config, sds *argv, int argc,
     }
 
     freeReplicationLink(server.primary_replication_link);
+    server.primary_replication_link = NULL;
 
     if (!strcasecmp(argv[0], "no") && !strcasecmp(argv[1], "one")) {
         return 1;
@@ -2961,8 +2962,7 @@ static int setConfigReplicaOfOption(standardConfig *config, sds *argv, int argc,
         *err = "Invalid primary port";
         return 0;
     }
-    sds primary_host = sdsnew(argv[0]);
-    server.primary_replication_link = createReplicationLink(primary_host, primary_port, -1);
+    server.primary_replication_link = createReplicationLink(argv[0], primary_port, -1);
     server.primary_replication_link->state = REPL_STATE_CONNECT;
     return 1;
 }

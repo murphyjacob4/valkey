@@ -1700,7 +1700,7 @@ void freeClient(client *c) {
         } else {
             serverLog(LL_NOTICE, "Connection with primary lost.");
         }
-        if (!c->flag.dont_cache_primary && !(c->flag.protocol_error || c->flag.blocked)) {
+        if (!c->flag.dont_cache_primary && !(c->flag.protocol_error || c->flag.blocked) && c->primary_slot_num == -1) {
             c->flag.close_asap = 0;
             c->flag.close_after_reply = 0;
             replicationCachePrimary(c);
