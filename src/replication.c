@@ -2606,7 +2606,6 @@ void replicationAbortDualChannelSyncTransfer(replicationLink *link) {
     link->rdb_channel_state = REPL_DUAL_CHANNEL_STATE_NONE;
     link->provisional_source_state.read_reploff = 0;
     link->provisional_source_state.reploff = 0;
-    link->provisional_source_state.conn = NULL;
     link->provisional_source_state.dbid = -1;
     link->rdb_client_id = -1;
     freePendingReplDataBuf(link);
@@ -2733,8 +2732,7 @@ static int dualChannelReplHandleEndOffsetResponse(connection *conn, replicationL
     link->initial_offset = reploffset;
 
     /* Initiate repl_provisional_primary to act as this replica temp primary until RDB is loaded */
-    link->provisional_source_state.conn = link->transfer_s;
-    memcpy(link->provisional_source_state.replid, primary_replid, CONFIG_RUN_ID_SIZE);
+    memcpy(link->provisional_source_state.replid, primary_replid, CONFIG_RUN_ID_SIZE + 1);
     link->provisional_source_state.reploff = reploffset;
     link->provisional_source_state.read_reploff = reploffset;
     link->provisional_source_state.dbid = dbid;
@@ -2997,7 +2995,7 @@ int dualChannelSyncHandlePsync(replicationLink *link) {
     serverAssert(link->state == REPL_STATE_RECEIVE_PSYNC_REPLY);
     if (link->rdb_channel_state < REPL_DUAL_CHANNEL_RDB_LOADED) {
         /* RDB is still loading */
-        if (connSetReadHandler(link->provisional_source_state.conn, bufferReplData) == C_ERR) {
+        if (connSetReadHandler(link->transfer_s, bufferReplData) == C_ERR) {
             serverLog(LL_WARNING, "Error while setting readable handler: %s", strerror(errno));
             cancelReplicationHandshake(link, 1);
             return C_ERR;
@@ -3112,7 +3110,6 @@ int replicaTryPartialResynchronization(replicationLink *link, int read_reply) {
             serverLog(LL_NOTICE, "Trying a partial resynchronization (request %s:%s).", psync_replid, psync_offset);
         } else {
             serverLog(LL_NOTICE, "Partial resynchronization not possible (no cached primary)");
-
         }
         if (!psync_replid) {
             psync_replid = "?";
@@ -3828,7 +3825,11 @@ error:
         link->rdb_transfer_s = NULL;
     }
     if (link->transfer_fd != -1) close(link->transfer_fd);
-    if (link->transfer_tmpfile) zfree(link->transfer_tmpfile);
+    if (link->transfer_tmpfile) {
+        /* Remove, so the next retry can create it successfully. */
+        remove(link->transfer_tmpfile);
+        zfree(link->transfer_tmpfile);
+    }
     link->transfer_tmpfile = NULL;
     link->transfer_fd = -1;
     link->state = REPL_STATE_CONNECT;
@@ -3859,7 +3860,6 @@ replicationLink *createReplicationLink(char *host, int port, int slot_num) {
     result->transfer_fd = -1;
     result->transfer_tmpfile = NULL;
     result->transfer_lastio = 0;
-    result->provisional_source_state.conn = NULL;
     result->provisional_source_state.replid[0] = '\0';
     result->provisional_source_state.reploff = -1;
     result->provisional_source_state.read_reploff = -1;

@@ -1679,7 +1679,6 @@ typedef struct replicationLink {
     char *transfer_tmpfile;        /* Replica-> Primary SYNC temp file name */
     time_t transfer_lastio;        /* Unix time of the latest read, for timeout */
     struct {
-        connection *conn;
         char replid[CONFIG_RUN_ID_SIZE + 1];
         long long reploff;
         long long read_reploff;
