@@ -3878,6 +3878,7 @@ void freeReplicationLink(replicationLink *link) {
      * replicationHandlePrimaryDisconnection which can trigger a re-connect
      * directly from within that call. */
     sdsfree(link->host);
+    link->host = NULL;
     if (link->client) {
         freeClient(link->client);
         link->client = NULL;
@@ -4380,7 +4381,10 @@ void replicationResurrectCachedPrimary(replicationLink *link) {
     serverAssert(link == server.primary_replication_link);
     link->client = server.cached_primary;
     server.cached_primary = NULL;
+
+    /* The client takes ownership of the connection now. */
     link->client->conn = link->transfer_s;
+    link->transfer_s = NULL;
 
     establishSourceConnection(link);
     /* Re-add to the list of clients. */
