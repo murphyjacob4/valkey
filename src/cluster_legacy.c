@@ -3523,7 +3523,7 @@ int clusterProcessPacket(clusterLink *link) {
         clusterProcessPublishPacket(&hdr->data.publish.msg, type);
     } else if (type == CLUSTERMSG_TYPE_FAILOVER_AUTH_REQUEST) {
         if (!sender) return 1; /* We don't know that node. */
-        if (clusterValidateFailoverAuth(sender, hdr, -1) == C_OK) {
+        if (clusterValidateFailoverAuth(sender, hdr, -1) != C_ERR) {
             clusterSendFailoverAuth(sender);
         }
     } else if (type == CLUSTERMSG_TYPE_FAILOVER_AUTH_ACK) {
@@ -4538,10 +4538,10 @@ void clusterSendMFStart(clusterNode *node) {
 }
 
 int clusterValidateSlotForFailover(int slot_num, clusterNode* request_node, uint64_t request_epoch) {
-    if (!isSlotUnclaimed(slot_num) && server.cluster->slots[slot_num]->configEpoch <= request_epoch) {
-        /* If we reached this point we found a slot that in our current slots
-        * is served by a primary with a greater configEpoch than the one claimed
-        * by the replica requesting our vote. Refuse to vote for this replica. */
+    if (!isSlotUnclaimed(slot_num) && server.cluster->slots[slot_num]->configEpoch > request_epoch) {
+        /* We found a slot that in our current slots is served by a primary
+         * with a greater configEpoch than the one claimed by the replica
+         * requesting our vote. Refuse to vote for this replica. */
         serverLog(LL_WARNING,
                 "Failover auth denied to %.40s (%s): "
                 "slot %d epoch (%llu) > reqEpoch (%llu)",
@@ -4641,8 +4641,8 @@ int clusterValidateFailoverAuth(clusterNode *node, clusterMsg *request, int slot
     server.cluster->lastVoteEpoch = server.cluster->currentEpoch;
     primary_node->voted_time = mstime();
     clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG | CLUSTER_TODO_FSYNC_CONFIG);
-    serverLog(LL_NOTICE, "Failover auth granted to %.40s (%s) for epoch %llu", node->name, node->human_nodename,
-              (unsigned long long)server.cluster->currentEpoch);
+    serverLog(LL_NOTICE, "Failover auth granted to %.40s (%s) for epoch %llu, slot number %d", node->name, node->human_nodename,
+              (unsigned long long)server.cluster->currentEpoch, slot_num);
     return C_OK;
 }
 
@@ -7133,9 +7133,12 @@ int clusterCommandSpecial(client *c) {
                 to_enqueue->state = SLOT_MIGRATION_QUEUED;
                 to_enqueue->end_time = 0; /* Will be set once started. */
                 to_enqueue->link = NULL;
-                // to_enqueue->output_buff = sdsempty();
-                // to_enqueue->output_buff_cursor = 0;
-                // to_enqueue->response_buff = sdsempty();
+                to_enqueue->pause_end = 0;
+                to_enqueue->pause_primary_offset = 0;
+                to_enqueue->vote_end_time = 0;
+                to_enqueue->vote_retry_time = 0;
+                to_enqueue->vote_epoch = 0;
+                to_enqueue->auth_count = 0;
                 listAddNodeTail(server.cluster->slot_migrations, to_enqueue);
             }
         }

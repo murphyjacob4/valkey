@@ -394,10 +394,6 @@ typedef struct slotMigration {
     clusterNode *source_node;
     mstime_t end_time; /* Slot migration time limit (ms unixtime).
                           If not yet in progress (e.g. queued), will be zero. */
-    // connection *conn;
-    // sds output_buff;
-    // int output_buff_cursor;
-    // sds response_buff;
     replicationLink *link;
     mstime_t pause_end;
     long long pause_primary_offset;
