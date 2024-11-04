@@ -90,7 +90,7 @@ slotMigration *clusterGetCurrentSlotMigration(void);
 void clusterSendMigrateSlotStart(clusterNode *node, int slot_num);
 void clusterRequestMigrateSlot(int slot_num);
 void clusterSendMigrateSlotAck(clusterNode *node, int slot_num);
-mstime_t clusterGetVoteTimeout();
+mstime_t clusterGetVoteTimeout(void);
 void moduleCallClusterReceivers(const char *sender_id,
                                 uint64_t module_id,
                                 uint8_t type,
