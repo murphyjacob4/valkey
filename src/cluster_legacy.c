@@ -60,7 +60,8 @@ void clusterAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 void clusterReadHandler(connection *conn);
 void clusterSendPing(clusterLink *link, int type);
 void clusterSendFail(char *nodename);
-void clusterSendFailoverAuthIfNeeded(clusterNode *node, clusterMsg *request);
+int clusterValidateFailoverAuth(clusterNode *node, clusterMsg *request, int slot_num);
+void clusterSendFailoverAuth(clusterNode *node);
 void clusterUpdateState(void);
 list *clusterGetNodesInMyShard(clusterNode *node);
 int clusterNodeAddReplica(clusterNode *primary, clusterNode *replica);
@@ -85,6 +86,10 @@ sds representSlotInfo(sds ci, uint16_t *slot_info_pairs, int slot_info_pairs_cou
 void clusterFreeNodesSlotsInfo(clusterNode *n);
 uint64_t clusterGetMaxEpoch(void);
 int clusterBumpConfigEpochWithoutConsensus(void);
+slotMigration *clusterGetCurrentSlotMigration(void);
+void clusterSendMigrateSlotStart(clusterNode *node, int slot_num);
+void clusterRequestMigrateSlot(int slot_num);
+void clusterSendMigrateSlotAck(clusterNode *node, int slot_num);
 void moduleCallClusterReceivers(const char *sender_id,
                                 uint64_t module_id,
                                 uint8_t type,
@@ -2507,6 +2512,13 @@ void clusterUpdateSlotsConfigWith(clusterNode *sender, uint64_t senderConfigEpoc
                     migrated_our_slots++;
                 }
 
+                /* Was this slot mine and it was being manually failed over
+                 * (e.g. via slot migration)? If so, clear the manual failover
+                 * state. */
+                if (server.cluster->slots[j] == myself && server.cluster->mf_end && server.cluster->mf_replica == sender) {
+                    resetManualFailover();
+                }
+
                 /* If the sender who claims this slot is not in the same shard,
                  * it must be a result of deliberate operator actions. Therefore,
                  * we should honor it and clear the outstanding migrating_slots_to
@@ -3150,6 +3162,21 @@ int clusterProcessPacket(clusterLink *link) {
                       "primary manual failover: %lld",
                       server.cluster->mf_primary_offset);
         }
+        /* If we are a primary performing slot migration and the slot owner
+         * sent its offset while already paused, populate the MF state. */
+        slotMigration * curr_migration = clusterGetCurrentSlotMigration();
+        if (server.cluster->mf_end && hdr->mflags[0] & CLUSTERMSG_FLAG0_PAUSED &&
+            server.cluster->mf_primary_offset == -1 && curr_migration != NULL &&
+            curr_migration->state == SLOT_MIGRATION_PAUSE_OWNER &&
+            curr_migration->source_node == sender) {
+            serverLog(LL_NOTICE,
+                    "Received replication offset for paused "
+                    "slot migration failover: %lld",
+                    server.cluster->mf_primary_offset);
+            curr_migration->pause_primary_offset = sender->repl_offset;
+            curr_migration->state = SLOT_MIGRATION_SYNCING_TO_PAUSE;
+            clusterDoBeforeSleep(CLUSTER_TODO_HANDLE_SLOTMIGRATION);
+        }
     }
 
     /* Initial processing of PING and MEET requests replying with a PONG. */
@@ -3496,7 +3523,9 @@ int clusterProcessPacket(clusterLink *link) {
         clusterProcessPublishPacket(&hdr->data.publish.msg, type);
     } else if (type == CLUSTERMSG_TYPE_FAILOVER_AUTH_REQUEST) {
         if (!sender) return 1; /* We don't know that node. */
-        clusterSendFailoverAuthIfNeeded(sender, hdr);
+        if (clusterValidateFailoverAuth(sender, hdr, -1) == C_OK) {
+            clusterSendFailoverAuth(sender);
+        }
     } else if (type == CLUSTERMSG_TYPE_FAILOVER_AUTH_ACK) {
         if (!sender) return 1; /* We don't know that node. */
         /* We consider this vote only if the sender is a primary serving
@@ -3554,6 +3583,44 @@ int clusterProcessPacket(clusterLink *link) {
         uint8_t type = hdr->data.module.msg.type;
         unsigned char *payload = hdr->data.module.msg.bulk_data;
         moduleCallClusterReceivers(sender->name, module_id, type, payload, len);
+    } else if (type == CLUSTERMSG_TYPE_MIGRATE_SLOT_START) {
+        uint16_t slot_num = hdr->data.slot_migration.msg.slot_num;
+        /* This message is acceptable only if I'm a primary and I own the slot */
+        if (!sender || server.cluster->slots[slot_num] != myself) return 1;
+        /* Initialize the slot migration state accordingly */
+        resetManualFailover();
+        server.cluster->mf_end = now + CLUSTER_MF_TIMEOUT;
+        server.cluster->mf_replica = sender;
+        /* TODO(murphyjacob4) we should just pause this one slot */
+        pauseActions(PAUSE_DURING_FAILOVER, now + (CLUSTER_MF_TIMEOUT * CLUSTER_MF_PAUSE_MULT),
+                     PAUSE_ACTIONS_CLIENT_WRITE_SET);
+        serverLog(LL_NOTICE, "Slot migration requested by node %.40s (%s).", sender->name, sender->human_nodename);
+        /* We need to send a ping message to the replica, as it would carry
+         * `server.cluster->mf_primary_offset`, which means the primary paused clients
+         * at offset `server.cluster->mf_primary_offset`, so that the replica would
+         * know that it is safe to set its `server.cluster->mf_can_start` to 1 so as
+         * to complete failover as quickly as possible. */
+        clusterSendPing(link, CLUSTERMSG_TYPE_PING);
+    } else if (type == CLUSTERMSG_TYPE_MIGRATE_SLOT_REQUEST) {
+        if (!sender) return 1; /* We don't know that node. */
+        uint16_t slot_num = hdr->data.slot_migration.msg.slot_num;
+        if (clusterValidateFailoverAuth(sender, hdr, slot_num) == C_OK) {
+            clusterSendMigrateSlotAck(sender, slot_num);
+        }
+    } else if (type == CLUSTERMSG_TYPE_MIGRATE_SLOT_ACK) {
+        if (!sender) return 1; /* We don't know that node. */
+        /* We consider this vote only if the sender is a primary serving
+         * a non zero number of slots, and its currentEpoch is greater or
+         * equal to epoch where this node started the election. */
+        slotMigration *curr_migration = clusterGetCurrentSlotMigration();
+        if (curr_migration == NULL) return 1;
+        if (curr_migration->state != SLOT_MIGRATION_GATHERING_VOTES) return 1;
+        if (clusterNodeIsVotingPrimary(sender) && sender_claimed_current_epoch >= curr_migration->vote_epoch) {
+            curr_migration->auth_count++;
+            /* Maybe we reached a quorum here, set a flag to make sure
+             * we check ASAP. */
+            clusterDoBeforeSleep(CLUSTER_TODO_HANDLE_SLOTMIGRATION);
+        }
     } else {
         serverLog(LL_WARNING, "Received unknown packet type: %d", type);
     }
@@ -4241,81 +4308,31 @@ void clusterPropagatePublish(robj *channel, robj *message, int sharded) {
  * Slot Migration functions
  * -------------------------------------------------------------------------- */
 
-// sds slotMigrationResponseBufferPopLine(slotMigration *migration) {
-//     int line_marker = -1;
-//     for (int i = 1; i < sdslen(migration->response_buff); i++) {
-//         if (migration->response_buff[i-1] == '\r' && migration->response_buff[i] == '\n') {
-//             line_marker = i + 1;
-//             break;
-//         }
-//     }
-//     if (line_marker == -1) {
-//         return NULL;
-//     }
-//     sds result = sdsnewlen(migration->response_buff, line_marker);
-//     sdssubstr(migration->response_buff, line_marker, sdslen(migration->response_buff) - line_marker);
-//     return result;
-// }
-
-// void slotMigrationTryRead(slotMigration *migration) {
-//     connection *conn = migration->conn;
-//     size_t old_len = sdslen(migration->response_buff);
-//     int n = connRead(conn, migration->response_buff + old_len, sdsavail(migration->response_buff));
-//     if (n <= 0) {
-//         if (connGetState(conn) == CONN_STATE_CONNECTED) return;
-//         serverLog(LL_WARNING, "Failed to read from target node %.40s for slot %d: %s", migration->target_node, migration->slot, connGetLastError(conn));
-//         migration->state = SLOT_MIGRATION_ORIGIN_FAILED;
-//     }
-// }
-
-// void slotMigrationReadHandler(connection *conn) {
-//     slotMigration *migration = connGetPrivateData(conn);
-//     slotMigrationTryRead(migration);
-//     clusterProceedWithSlotMigration();
-// }
-
-// void slotMigrationTryWrite(slotMigration *migration) {
-//     connection *conn = migration->conn;
-//     int n = connWrite(conn, migration->output_buff + migration->output_buff_cursor, sdslen(migration->output_buff) - migration->output_buff_cursor);
-//     if (n <= 0) {
-//         if (connGetState(conn) == CONN_STATE_CONNECTED) return;
-//         serverLog(LL_WARNING, "Failed to write to target node %.40s for slot %d: %s", migration->target_node, migration->slot, connGetLastError(conn));
-//         migration->state = SLOT_MIGRATION_ORIGIN_FAILED;
-//     }
-//     migration->output_buff_cursor += n;
-//     if (sdslen(migration->output_buff) == migration->output_buff_cursor) {
-//         sdsclear(migration->output_buff);
-//         migration->output_buff_cursor = 0;
-//     }
-// }
-
-// void slotMigrationWriteHandler(connection *conn) {
-//     slotMigration *migration = connGetPrivateData(conn);
-//     if (sdslen(migration->output_buff)) {
-//         slotMigrationTryWrite(migration);
-//     }
-//     clusterProceedWithSlotMigration();
-// }
-
-// int slotMigrationStartExportSlot() {
-// }
-
-// void slotMigrationDestinationHandler(connection *conn) {
-//     slotMigration *migration = connGetPrivateData(conn);
-// }
+/* Gets the current slot migration from the head of the queue. */
+slotMigration *clusterGetCurrentSlotMigration(void) {
+    if (listLength(server.cluster->slot_migrations) == 0) return NULL;
+    return (slotMigration *) listFirst(server.cluster->slot_migrations)->value;
+}
 
 /* This is the main state machine for the slot migration workflow. This function will do as much
  * work as possible synchronously, processing the current enqueued slot migrations, only returning
  * once we are waiting on some IO. */
 void clusterProceedWithSlotMigration(void) {
     mstime_t now = mstime();
-    while (listLength(server.cluster->slot_migrations) != 0) {
+    server.cluster->todo_before_sleep &= ~CLUSTER_TODO_HANDLE_SLOTMIGRATION;
+    while (clusterGetCurrentSlotMigration() != NULL) {
         listNode *curr_node = listFirst(server.cluster->slot_migrations);
-        slotMigration * curr_migration = (slotMigration *) curr_node->value;
+        slotMigration *curr_migration = (slotMigration *) curr_node->value;
         if (curr_migration->state != SLOT_MIGRATION_QUEUED && curr_migration->end_time < now) {
             serverLog(LL_WARNING,
                 "Timed out for slot migration from source node %.40s for slot %d", curr_migration->source_node->name, curr_migration->slot);
             curr_migration->state = SLOT_MIGRATION_FAILED;
+        }
+        if (curr_migration->state >= SLOT_MIGRATION_PAUSE_OWNER && curr_migration->pause_end < now) {
+            /* If the owner ever unpauses, we have to move back in the state machine and retry. */
+            serverLog(LL_WARNING, "Timed out waiting to sync to slot owner's paused time. Going to reinitiate pause and retry.");
+            curr_migration->state = SLOT_MIGRATION_PAUSE_OWNER;
+            curr_migration->pause_end = mstime() + CLUSTER_MF_TIMEOUT;
         }
         switch(curr_migration->state) {
             case SLOT_MIGRATION_QUEUED:
@@ -4351,14 +4368,85 @@ void clusterProceedWithSlotMigration(void) {
                     continue;
                 }
                 if (curr_migration->link->state == REPL_STATE_CONNECTED) {
-                    curr_migration->state = SLOT_MIGRATION_GATHERING_VOTES;
+                    curr_migration->state = SLOT_MIGRATION_PAUSE_OWNER;
                     continue;
                 }
                 /* If we are in another state, nothing to do right now. */
                 return;
-            case SLOT_MIGRATION_GATHERING_VOTES:
-                serverLog(LL_WARNING, "Failover at the slot level is not implemented");
-                curr_migration->state = SLOT_MIGRATION_FAILED;
+            case SLOT_MIGRATION_PAUSE_OWNER:
+                serverLog(LL_NOTICE, "Replication link to slot owner %.40s has been established. Pausing source node on slot %d and waiting to contiune", curr_migration->source_node->name, curr_migration->slot);
+                clusterSendMigrateSlotStart(curr_migration->source_node, curr_migration->slot);
+                curr_migration->pause_end = mstime() + CLUSTER_MF_TIMEOUT;
+                curr_migration->state = SLOT_MIGRATION_SYNCING_TO_PAUSE;
+                continue;
+            case SLOT_MIGRATION_SYNCING_TO_PAUSE:
+                if (curr_migration->pause_primary_offset && curr_migration->link->client->reploff >= curr_migration->pause_primary_offset) {
+                    serverLog(LL_NOTICE, "Replication of slot %d has caught up to paused slot owner, slot migration can start.", curr_migration->slot);
+                    curr_migration->state = SLOT_MIGRATION_STARTING_VOTE;
+                    continue;
+                }
+                /* Need to wait for the sync to progress further */
+                return;
+            case SLOT_MIGRATION_STARTING_VOTE:
+                if (curr_migration->vote_retry_time < now) {
+                    /* Compute the failover timeout (the max time we have to send votes
+                     * and wait for replies), and the failover retry time (the time to wait
+                     * before trying to get voted again).
+                     *
+                     * Timeout is MAX(NODE_TIMEOUT*2,2000) milliseconds.
+                     * Retry is two times the Timeout.
+                     */
+                    // TODO(murphyjacob4) lets make this a function and share with repl
+                    mstime_t timeout = server.cluster_node_timeout * 2;
+                    if (timeout < CLUSTER_OPERATION_TIMEOUT) timeout = CLUSTER_OPERATION_TIMEOUT;
+                    curr_migration->vote_retry_time = now + timeout * 2;
+                    curr_migration->vote_end_time = now + timeout;
+                    server.cluster->currentEpoch++;
+                    curr_migration->vote_epoch = server.cluster->currentEpoch;
+                    curr_migration->auth_count = 0;
+                    serverLog(LL_NOTICE, "Starting slot migration vote for slot %d on epoch %llu", curr_migration->slot, (unsigned long long) server.cluster->currentEpoch);
+                    clusterRequestMigrateSlot(curr_migration->slot);
+                    curr_migration->state = SLOT_MIGRATION_GATHERING_VOTES;
+                    // TODO(murphyjacob4) does this actually do anything? Should we add something to the nodes.conf
+                    clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG | CLUSTER_TODO_UPDATE_STATE | CLUSTER_TODO_FSYNC_CONFIG);
+                    continue;
+                }
+
+                /* Must wait to start another vote. */
+                return;
+            case SLOT_MIGRATION_GATHERING_VOTES: {
+                int needed_quorum = (server.cluster->size / 2) + 1;
+                if (curr_migration->vote_end_time < now) {
+                    curr_migration->state = SLOT_MIGRATION_STARTING_VOTE;
+                    continue;
+                }
+                if (curr_migration->auth_count >= needed_quorum) {
+                    serverLog(LL_NOTICE, "Slot migration vote succeeded: I'm the new owner.");
+
+                    /* Update my configEpoch to the epoch of the election. */
+                    if (myself->configEpoch < curr_migration->vote_epoch) {
+                        myself->configEpoch = curr_migration->vote_epoch;
+                        serverLog(LL_NOTICE, "configEpoch set to %llu after successful slot migration",
+                                (unsigned long long)myself->configEpoch);
+                    }
+
+                    /* Take responsibility for the cluster slots. */
+                    curr_migration->state = SLOT_MIGRATION_FINISH;
+                    continue;
+                }
+                /* Still waiting on votes. */
+                return;
+            }
+            case SLOT_MIGRATION_FINISH:
+                serverLog(LL_NOTICE, "Setting myself to owner of slot %d and broadcasting", curr_migration->slot);
+                clusterDelSlot(curr_migration->slot);
+                clusterAddSlot(myself, curr_migration->slot);
+                clusterUpdateState();
+                clusterSaveConfigOrDie(1);
+                clusterBroadcastPong(CLUSTER_BROADCAST_ALL);
+                listDelNode(server.cluster->slot_migrations, curr_node);
+                freeReplicationLink(curr_migration->link);
+                zfree(curr_migration);
                 continue;
             case SLOT_MIGRATION_FAILED:
                 /* Delete the migration from the queue and proceed to the next migration */
@@ -4409,6 +4497,35 @@ void clusterSendFailoverAuth(clusterNode *node) {
     clusterMsgSendBlockDecrRefCount(msgblock);
 }
 
+clusterMsgSendBlock *clusterCreateSlotMigrationMessage(int type, int slot_num) {
+    uint32_t msglen = sizeof(clusterMsg) - sizeof(union clusterMsgData) + sizeof(clusterMsgSlotMigration);
+    clusterMsgSendBlock *msgblock = createClusterMsgSendBlock(type, msglen);
+
+    clusterMsg *hdr = &msgblock->msg;
+    hdr->data.slot_migration.msg.slot_num = slot_num;
+    return msgblock;
+}
+
+void clusterSendMigrateSlotStart(clusterNode *node, int slot_num) {
+    if (!node->link) return;
+    clusterMsgSendBlock *msgblock = clusterCreateSlotMigrationMessage(CLUSTERMSG_TYPE_MIGRATE_SLOT_START, slot_num);
+    clusterSendMessage(node->link, msgblock);
+    clusterMsgSendBlockDecrRefCount(msgblock);
+}
+
+void clusterRequestMigrateSlot(int slot_num) {
+    clusterMsgSendBlock *msgblock = clusterCreateSlotMigrationMessage(CLUSTERMSG_TYPE_MIGRATE_SLOT_REQUEST, slot_num);
+    clusterBroadcastMessage(msgblock);
+    clusterMsgSendBlockDecrRefCount(msgblock);
+}
+
+void clusterSendMigrateSlotAck(clusterNode *node, int slot_num) {
+    if (!node->link) return;
+    clusterMsgSendBlock *msgblock = clusterCreateSlotMigrationMessage(CLUSTERMSG_TYPE_MIGRATE_SLOT_ACK, slot_num);
+    clusterSendMessage(node->link, msgblock);
+    clusterMsgSendBlockDecrRefCount(msgblock);
+}
+
 /* Send a MFSTART message to the specified node. */
 void clusterSendMFStart(clusterNode *node) {
     if (!node->link) return;
@@ -4420,8 +4537,23 @@ void clusterSendMFStart(clusterNode *node) {
     clusterMsgSendBlockDecrRefCount(msgblock);
 }
 
+int clusterValidateSlotForFailover(int slot_num, clusterNode* request_node, uint64_t request_epoch) {
+    if (!isSlotUnclaimed(slot_num) && server.cluster->slots[slot_num]->configEpoch <= request_epoch) {
+        /* If we reached this point we found a slot that in our current slots
+        * is served by a primary with a greater configEpoch than the one claimed
+        * by the replica requesting our vote. Refuse to vote for this replica. */
+        serverLog(LL_WARNING,
+                "Failover auth denied to %.40s (%s): "
+                "slot %d epoch (%llu) > reqEpoch (%llu)",
+                request_node->name, request_node->human_nodename, slot_num, (unsigned long long)server.cluster->slots[slot_num]->configEpoch,
+                (unsigned long long)request_epoch);
+        return C_ERR;
+    }
+    return C_OK;
+}
+
 /* Vote for the node asking for our vote if there are the conditions. */
-void clusterSendFailoverAuthIfNeeded(clusterNode *node, clusterMsg *request) {
+int clusterValidateFailoverAuth(clusterNode *node, clusterMsg *request, int slot_num) {
     clusterNode *primary = node->replicaof;
     uint64_t requestCurrentEpoch = ntohu64(request->currentEpoch);
     uint64_t requestConfigEpoch = ntohu64(request->configEpoch);
@@ -4433,7 +4565,7 @@ void clusterSendFailoverAuthIfNeeded(clusterNode *node, clusterMsg *request) {
      * right to vote, as the cluster size is the number
      * of primaries serving at least one slot, and quorum is the cluster
      * size + 1 */
-    if (!clusterNodeIsVotingPrimary(myself)) return;
+    if (!clusterNodeIsVotingPrimary(myself)) return C_ERR;
 
     /* Request epoch must be >= our currentEpoch.
      * Note that it is impossible for it to actually be greater since
@@ -4443,20 +4575,21 @@ void clusterSendFailoverAuthIfNeeded(clusterNode *node, clusterMsg *request) {
         serverLog(LL_WARNING, "Failover auth denied to %.40s (%s): reqEpoch (%llu) < curEpoch(%llu)", node->name,
                   node->human_nodename, (unsigned long long)requestCurrentEpoch,
                   (unsigned long long)server.cluster->currentEpoch);
-        return;
+        return C_ERR;
     }
 
     /* I already voted for this epoch? Return ASAP. */
     if (server.cluster->lastVoteEpoch == server.cluster->currentEpoch) {
         serverLog(LL_WARNING, "Failover auth denied to %.40s (%s): already voted for epoch %llu", node->name,
                   node->human_nodename, (unsigned long long)server.cluster->currentEpoch);
-        return;
+        return C_ERR;
     }
 
     /* Node must be a replica and its primary down.
      * The primary can be non failing if the request is flagged
-     * with CLUSTERMSG_FLAG0_FORCEACK (manual failover). */
-    if (clusterNodeIsPrimary(node) || primary == NULL || (!nodeFailed(primary) && !force_ack)) {
+     * with CLUSTERMSG_FLAG0_FORCEACK (manual failover) or slot_num
+     * is set to some slot (slot migration). */
+    if (slot_num == -1 && (clusterNodeIsPrimary(node) || primary == NULL || (!nodeFailed(primary) && !force_ack))) {
         if (clusterNodeIsPrimary(node)) {
             serverLog(LL_WARNING, "Failover auth denied to %.40s (%s) for epoch %llu: it is a primary node", node->name,
                       node->human_nodename, (unsigned long long)requestCurrentEpoch);
@@ -4467,47 +4600,50 @@ void clusterSendFailoverAuthIfNeeded(clusterNode *node, clusterMsg *request) {
             serverLog(LL_WARNING, "Failover auth denied to %.40s (%s) for epoch %llu: its primary is up", node->name,
                       node->human_nodename, (unsigned long long)requestCurrentEpoch);
         }
-        return;
+        return C_ERR;
     }
 
-    /* We did not voted for a replica about this primary for two
+    /* We did not voted for a failover about this primary for two
      * times the node timeout. This is not strictly needed for correctness
      * of the algorithm but makes the base case more linear. */
-    if (mstime() - node->replicaof->voted_time < server.cluster_node_timeout * 2) {
+    clusterNode *primary_node;
+    if (slot_num != -1) {
+        primary_node = server.cluster->slots[slot_num];
+    } else {
+        primary_node = node->replicaof;
+    }
+    if (mstime() - primary_node->voted_time < server.cluster_node_timeout * 2) {
         serverLog(LL_WARNING,
                   "Failover auth denied to %.40s %s: "
                   "can't vote about this primary before %lld milliseconds",
                   node->name, node->human_nodename,
                   (long long)((server.cluster_node_timeout * 2) - (mstime() - node->replicaof->voted_time)));
-        return;
+        return C_ERR;
     }
 
     /* The replica requesting the vote must have a configEpoch for the claimed
      * slots that is >= the one of the primaries currently serving the same
      * slots in the current configuration. */
-    for (j = 0; j < CLUSTER_SLOTS; j++) {
-        if (bitmapTestBit(claimed_slots, j) == 0) continue;
-        if (isSlotUnclaimed(j) || server.cluster->slots[j]->configEpoch <= requestConfigEpoch) {
-            continue;
+    if (slot_num != -1) {
+        if (clusterValidateSlotForFailover(slot_num, node, requestConfigEpoch) == C_ERR) {
+            return C_ERR;
         }
-        /* If we reached this point we found a slot that in our current slots
-         * is served by a primary with a greater configEpoch than the one claimed
-         * by the replica requesting our vote. Refuse to vote for this replica. */
-        serverLog(LL_WARNING,
-                  "Failover auth denied to %.40s (%s): "
-                  "slot %d epoch (%llu) > reqEpoch (%llu)",
-                  node->name, node->human_nodename, j, (unsigned long long)server.cluster->slots[j]->configEpoch,
-                  (unsigned long long)requestConfigEpoch);
-        return;
+    } else {
+        for (j = 0; j < CLUSTER_SLOTS; j++) {
+            if (bitmapTestBit(claimed_slots, j) == 0) continue;
+            if (clusterValidateSlotForFailover(j, node, requestConfigEpoch) == C_ERR) {
+                return C_ERR;
+            }
+        }
     }
 
     /* We can vote for this replica. */
     server.cluster->lastVoteEpoch = server.cluster->currentEpoch;
-    node->replicaof->voted_time = mstime();
+    primary_node->voted_time = mstime();
     clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG | CLUSTER_TODO_FSYNC_CONFIG);
-    clusterSendFailoverAuth(node);
     serverLog(LL_NOTICE, "Failover auth granted to %.40s (%s) for epoch %llu", node->name, node->human_nodename,
               (unsigned long long)server.cluster->currentEpoch);
+    return C_OK;
 }
 
 /* This function returns the "rank" of this instance, a replica, in the context
@@ -5265,6 +5401,9 @@ void clusterBeforeSleep(void) {
         /* Handle failover, this is needed when it is likely that there is already
          * the quorum from primaries in order to react fast. */
         clusterHandleReplicaFailover();
+    } else if (flags & CLUSTER_TODO_HANDLE_SLOTMIGRATION) {
+        /* Continue with slot migration (e.g. if votes are received) */
+        clusterProceedWithSlotMigration();
     }
 
     /* Update the cluster state. */

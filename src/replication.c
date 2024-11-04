@@ -3386,6 +3386,7 @@ int dualChannelReplMainConnRecvPsyncReply(replicationLink *link, sds *err, int *
 void dualChannelSetupMainConnForPsync(connection *conn) {
     char *err = NULL;
     int ret;
+    int link_closed;
 
     replicationLink *link = (replicationLink *) connGetPrivateData(conn);
 
@@ -3408,8 +3409,6 @@ void dualChannelSetupMainConnForPsync(connection *conn) {
         if (ret == C_OK) link->state = REPL_STATE_RECEIVE_PSYNC_REPLY;
         break;
     case REPL_STATE_RECEIVE_PSYNC_REPLY:
-        serverLog(LL_NOTICE, "Handle PSYNC");
-        int link_closed;
         ret = dualChannelReplMainConnRecvPsyncReply(link, &err, &link_closed);
         if (link_closed) return;
         if (ret == C_OK && link->rdb_channel_state != REPL_DUAL_CHANNEL_STATE_NONE)
