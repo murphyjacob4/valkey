@@ -1659,6 +1659,7 @@ typedef enum childInfoType {
 #define REPL_PURPOSE_SLOT_IMPORT 1
 
 typedef struct replicationLink {
+    int ref_count; /* Reference count to this replication link for memory management.*/
     int state; /* State of the sync operation overall. */
     int rdb_channel_state;
     client *client;
@@ -2897,7 +2898,7 @@ int processIOThreadsReadDone(void);
 int processIOThreadsWriteDone(void);
 replicationLink *createReplicationLink(char *host, int port, int slot_num);
 int connectReplicationLink(replicationLink *link);
-void freeReplicationLink(replicationLink *link);
+int freeReplicationLink(replicationLink *link);
 
 /* logreqres.c - logging of requests and responses */
 void reqresReset(client *c, int free_buf);
