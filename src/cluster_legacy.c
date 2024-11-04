@@ -4374,7 +4374,7 @@ void clusterProceedWithSlotMigration(void) {
                 /* If we are in another state, nothing to do right now. */
                 return;
             case SLOT_MIGRATION_PAUSE_OWNER:
-                serverLog(LL_NOTICE, "Replication link to slot owner %.40s has been established. Pausing source node on slot %d and waiting to contiune", curr_migration->source_node->name, curr_migration->slot);
+                serverLog(LL_NOTICE, "Replication link to slot owner %.40s has been established. Pausing source node on slot %d and waiting to continue", curr_migration->source_node->name, curr_migration->slot);
                 clusterSendMigrateSlotStart(curr_migration->source_node, curr_migration->slot);
                 curr_migration->pause_end = mstime() + CLUSTER_MF_TIMEOUT;
                 curr_migration->state = SLOT_MIGRATION_SYNCING_TO_PAUSE;
