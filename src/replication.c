@@ -651,7 +651,7 @@ void replicationFeedStreamFromPrimaryStream(char *buf, size_t buflen) {
     /* Debugging: this is handy to see the stream sent from primary
      * to replicas. Disabled with if(0). */
     if (0) {
-        if (server.hide_user_data_from_log) {
+        if (!server.hide_user_data_from_log) {
             printf("%zu:", buflen);
             for (size_t j = 0; j < buflen; j++) {
                 printf("%c", isprint(buf[j]) ? buf[j] : '.');
@@ -1761,6 +1761,7 @@ void updateReplicasWaitingBgsave(int bgsaveerr, int type) {
         client *replica = ln->value;
 
         if (replica->repl_state == REPLICA_STATE_WAIT_BGSAVE_END) {
+            int repldbfd;
             struct valkey_stat buf;
 
             if (bgsaveerr != C_OK) {
@@ -1810,17 +1811,26 @@ void updateReplicasWaitingBgsave(int bgsaveerr, int type) {
                 }
                 replica->repl_start_cmd_stream_on_ack = 1;
             } else {
-                if ((replica->repldbfd = open(server.rdb_filename, O_RDONLY)) == -1 ||
-                    valkey_fstat(replica->repldbfd, &buf) == -1) {
+                repldbfd = open(server.rdb_filename, O_RDONLY);
+                if (repldbfd == -1) {
                     freeClientAsync(replica);
-                    serverLog(LL_WARNING, "SYNC failed. Can't open/stat DB after BGSAVE: %s", strerror(errno));
+                    serverLog(LL_WARNING, "SYNC failed. Can't open DB after BGSAVE: %s", strerror(errno));
                     continue;
                 }
+                if (valkey_fstat(repldbfd, &buf) == -1) {
+                    freeClientAsync(replica);
+                    serverLog(LL_WARNING, "SYNC failed. Can't stat DB after BGSAVE: %s", strerror(errno));
+                    close(repldbfd);
+                    continue;
+                }
+                replica->repldbfd = repldbfd;
                 replica->repldboff = 0;
                 replica->repldbsize = buf.st_size;
                 replica->repl_state = REPLICA_STATE_SEND_BULK;
                 replica->replpreamble = sdscatprintf(sdsempty(), "$%lld\r\n", (unsigned long long)replica->repldbsize);
 
+                /* When repl_state changes to REPLICA_STATE_SEND_BULK, we will release
+                 * the resources in freeClient. */
                 connSetWriteHandler(replica->conn, NULL);
                 if (connSetWriteHandler(replica->conn, sendBulkToReplica) == C_ERR) {
                     freeClientAsync(replica);
