@@ -4022,6 +4022,13 @@ int processCommand(client *c) {
         }
     }
 
+    /* If we are replicating from a slot, ignore requests for other slots. */
+    if (obey_client && c->primary_slot_num != -1) {
+        serverLog(LL_NOTICE, "Received request from primary in slot %d", c->slot);
+        getNodeByQuery(c, c->cmd, c->argv, c->argc, &c->slot, NULL);
+        if (c->slot != c->primary_slot_num) return C_OK;
+    }
+
     if (!server.cluster_enabled && c->capa & CLIENT_CAPA_REDIRECT && server.primary_replication_link && !obey_client &&
         (is_write_command || (is_read_command && !c->flag.readonly))) {
         if (server.failover_state == FAILOVER_IN_PROGRESS) {

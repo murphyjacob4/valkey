@@ -351,7 +351,6 @@ struct _clusterNode {
     mstime_t pong_received;                 /* Unix time we received the pong */
     mstime_t data_received;                 /* Unix time we received any data */
     mstime_t fail_time;                     /* Unix time when FAIL flag was set */
-    mstime_t voted_time;                    /* Last time we voted for a replica of this primary */
     mstime_t repl_offset_time;              /* Unix time we received offset for this node */
     mstime_t orphaned_time;                 /* Starting time of orphaned primary condition */
     long long repl_offset;                  /* Last known repl offset for this node. */
@@ -381,7 +380,8 @@ typedef enum slotMigrationState {
     SLOT_MIGRATION_QUEUED,          /* Queued behind some other slot migration. */
     SLOT_MIGRATION_SYNCING,         /* Syncing contents from current owner. */
     SLOT_MIGRATION_PAUSE_OWNER,
-    SLOT_MIGRATION_SYNCING_TO_PAUSE,
+    SLOT_MIGRATION_WAITING_FOR_OFFSET,
+    SLOT_MIGRATION_SYNCING_TO_OFFSET,
     SLOT_MIGRATION_STARTING_VOTE,
     SLOT_MIGRATION_GATHERING_VOTES, /* Gathering votes necessary for slot-level takeover. */
     SLOT_MIGRATION_FINISH,
@@ -414,6 +414,7 @@ struct clusterState {
     clusterNode *migrating_slots_to[CLUSTER_SLOTS];
     clusterNode *importing_slots_from[CLUSTER_SLOTS];
     clusterNode *slots[CLUSTER_SLOTS];
+    mstime_t last_slot_vote_time[CLUSTER_SLOTS];
     /* The following fields are used to take the replica state on elections. */
     mstime_t failover_auth_time;  /* Time of previous or next election. */
     int failover_auth_count;      /* Number of votes received so far. */
