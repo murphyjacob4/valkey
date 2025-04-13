@@ -511,3 +511,34 @@ start_cluster 3 6 {tags {external:skip cluster} overrides {cluster-node-timeout 
         wait_for_slot_state 2 ""
     }
 }
+
+
+proc log_file_matches {log pattern} {
+    set fp [open $log r]
+    set content [read $fp]
+    close $fp
+    string match $pattern $content
+}
+
+start_cluster 3 6 {tags {external:skip cluster} overrides {cluster-node-timeout 1000} } {
+    test "Slot migration blockClientForReplicaAck timeout is reset" {
+        # Start migrating a slot which will trigger blockClientForReplicaAck
+        migrate_slot 0 1 0
+        assert_equal {OK} [R 0 CLUSTER SETSLOT 0 NODE [R 1 CLUSTER MYID]]
+
+        # Trigger some write load
+        set load_handle [start_write_load [srv 0 host] [srv 0 port] 2000]
+
+        # Wait some time to ensure the blocked timeout is in the past
+        after 3000
+
+        # The write load should trigger BLOCKED_SHUTDOWN. If the timeout wasn't
+        # cleared previously, this will crash as it unblocks prematurely in
+        # replyToBlockedClientTimedOut.
+        catch {R 0 SHUTDOWN NOSAVE}
+
+        stop_write_load $load_handle
+        
+        assert_equal [log_file_matches [srv 0 stdout] "*BUG REPORT START*"] 0
+    }
+}
