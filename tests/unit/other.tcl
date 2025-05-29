@@ -551,6 +551,11 @@ start_cluster 1 0 {tags {"other external:skip cluster slow"}} {
             fail "hash tables weren't resize."
         }
     } {} {needs:debug}
+
+    test "CLUSTER FORGET with invalid node ID" {
+         catch {r cluster forget 1} err
+         set _ $err
+    } {*ERR Unknown node*} 
 }
 
 start_server {tags {"other external:skip"}} {
@@ -571,6 +576,25 @@ start_server {tags {"other external:skip"}} {
         } else {
             fail "dict did not resize in time"
         }   
+    }
+}
+
+start_server {tags {"other external:skip"}} {
+    test "test io-threads are runtime modifiable" {
+        # Test set
+        r config set io-threads 5
+        set thread_num [lindex [r config get io-threads] 1]
+        assert_equal 5 $thread_num
+
+        # Test decrease
+        r config set io-threads 1
+        set thread_num [lindex [r config get io-threads] 1]
+        assert_equal 1 $thread_num
+
+        # Test increase
+        r config set io-threads 4
+        set thread_num [lindex [r config get io-threads] 1]
+        assert_equal 4 $thread_num
     }
 }
 
