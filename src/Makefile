@@ -464,6 +464,7 @@ ENGINE_SERVER_OBJ = \
     childinfo.o \
     cluster.o \
     cluster_legacy.o \
+    cluster_raft.o \
     cluster_link.o \
     cluster_nodes.o \
     cluster_state.o \

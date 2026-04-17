@@ -70,6 +70,7 @@ void freeClusterLink(clusterLink *link) {
         if (link->node->link == link) {
             serverAssert(!link->inbound);
             link->node->link = NULL;
+            if (clusterCurrentBus->onLinkFree) clusterCurrentBus->onLinkFree(link);
         } else if (link->node->inbound_link == link) {
             serverAssert(link->inbound);
             link->node->inbound_link = NULL;

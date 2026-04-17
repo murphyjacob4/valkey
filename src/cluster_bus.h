@@ -3,11 +3,14 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 
 typedef char *sds;
 struct serverObject;
 struct client;
 struct clusterLink;
+struct clusterNode;
+struct slotRange;
 
 /* Interface for cluster bus protocol implementations.
  * Only includes operations that code outside the protocol
@@ -35,6 +38,10 @@ typedef struct clusterBusType {
     /* Called after an outbound link connection is established. The
      * implementation typically sends an initial message (e.g. PING). */
     void (*postConnect)(struct clusterLink *link);
+
+    /* Called when a cluster link is freed. The implementation typically
+     * cleans up protocol-specific state associated with the link or node. */
+    void (*onLinkFree)(struct clusterLink *link);
 
     /* Called after a config change updates myself's metadata (IP, ports,
      * hostname, flags, etc.). The protocol implementation should arrange

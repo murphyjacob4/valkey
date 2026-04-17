@@ -10,7 +10,7 @@ TIMEOUT=2000
 NODES=6
 REPLICAS=1
 PROTECTED_MODE=yes
-ADDITIONAL_OPTIONS=""
+ADDITIONAL_OPTIONS="--cluster-raft-enabled yes"
 
 # You may want to put the above config parameters into config.sh in order to
 # override the defaults without modifying this script.

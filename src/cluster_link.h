@@ -13,7 +13,7 @@ typedef struct clusterNode clusterNode;
 /* A refcounted block of bytes queued for sending on a cluster link.
  * The data member is uint64_t to ensure alignment for protocol
  * implementations that cast it to message structs with uint64_t fields. */
-typedef struct {
+typedef struct clusterMsgSendBlock {
     size_t totlen; /* Total allocation size including this header */
     size_t len;    /* Bytes of data to send (<= totlen - sizeof(header)) */
     int refcount;
