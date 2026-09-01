@@ -4416,6 +4416,7 @@ int VM_DeleteKey(ValkeyModuleKey *key) {
     if (!(key->mode & VALKEYMODULE_WRITE)) return VALKEYMODULE_ERR;
     if (key->value) {
         dbDelete(key->db, key->key);
+        notifyKeyspaceEvent(NOTIFY_GENERIC, "del", key->key, key->db->id);
         key->value = NULL;
     }
     return VALKEYMODULE_OK;
@@ -4430,6 +4431,7 @@ int VM_UnlinkKey(ValkeyModuleKey *key) {
     if (!(key->mode & VALKEYMODULE_WRITE)) return VALKEYMODULE_ERR;
     if (key->value) {
         dbAsyncDelete(key->db, key->key);
+        notifyKeyspaceEvent(NOTIFY_GENERIC, "del", key->key, key->db->id);
         key->value = NULL;
     }
     return VALKEYMODULE_OK;
@@ -4548,7 +4550,10 @@ int VM_GetToDbIdFromOptCtx(ValkeyModuleKeyOptCtx *ctx) {
  * writing or there is an active iterator, VALKEYMODULE_ERR is returned. */
 int VM_StringSet(ValkeyModuleKey *key, ValkeyModuleString *str) {
     if (!(key->mode & VALKEYMODULE_WRITE) || key->iter) return VALKEYMODULE_ERR;
-    VM_DeleteKey(key);
+    if (key->value) {
+        dbDelete(key->db, key->key);
+        key->value = NULL;
+    }
     /* Retain str so setKey copies it to db rather than reallocating it. */
     incrRefCount(str);
     setKey(key->ctx->client, key->db, key->key, &str, SETKEY_NO_SIGNAL | SETKEY_DOESNT_EXIST);
@@ -7568,7 +7573,10 @@ moduleType *VM_CreateDataType(ValkeyModuleCtx *ctx, const char *name, int encver
  * writing or there is an active iterator, VALKEYMODULE_ERR is returned. */
 int VM_ModuleTypeSetValue(ValkeyModuleKey *key, moduleType *mt, void *value) {
     if (!(key->mode & VALKEYMODULE_WRITE) || key->iter) return VALKEYMODULE_ERR;
-    VM_DeleteKey(key);
+    if (key->value) {
+        dbDelete(key->db, key->key);
+        key->value = NULL;
+    }
     robj *o = createModuleObject(mt, value);
     setKey(key->ctx->client, key->db, key->key, &o, SETKEY_NO_SIGNAL | SETKEY_DOESNT_EXIST);
     key->value = o;

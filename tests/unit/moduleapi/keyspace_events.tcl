@@ -83,6 +83,36 @@ tags "modules" {
             $rd1 close
         }
 
+        test {Test DeleteKey emits keyspace event} {
+            r set x 1
+            r set x_copy 1
+            assert_equal {OK} [r keyspace.delete_key x]
+            assert_equal {} [r get x]
+            assert_equal {} [r get x_copy]
+        }
+
+        test {Test UnlinkKey emits keyspace event} {
+            r set x 1
+            r set x_copy 1
+            assert_equal {OK} [r keyspace.unlink_key x]
+            assert_equal {} [r get x]
+            assert_equal {} [r get x_copy]
+        }
+
+        test "Keyspace notifications: DeleteKey and UnlinkKey publish keyspace notifications" {
+            r config set notify-keyspace-events Kg
+            r del x
+            set rd1 [valkey_deferring_client]
+            assert_equal {1} [psubscribe $rd1 *]
+            r set x 1
+            assert_equal {OK} [r keyspace.delete_key x]
+            assert_equal {pmessage * __keyspace@9__:x del} [$rd1 read]
+            r set x 1
+            assert_equal {OK} [r keyspace.unlink_key x]
+            assert_equal {pmessage * __keyspace@9__:x del} [$rd1 read]
+            $rd1 close
+        }
+
         test {Test expired key space event} {
             set prev_expired [s expired_keys]
             r set exp 1 PX 10

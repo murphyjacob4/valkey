@@ -618,6 +618,9 @@ proc start_server {options {code undefined}} {
     }
 
     set unixsocket [file normalize [format "%s/%s" [dict get $config "dir"] "socket"]]
+    if {[string length $unixsocket] > 100} {
+        set unixsocket [format "/tmp/vk_%s.sock" $port]
+    }
     dict set config "unixsocket" $unixsocket
 
     # apply overrides from global space and arguments

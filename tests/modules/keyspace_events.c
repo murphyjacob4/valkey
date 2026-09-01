@@ -310,6 +310,40 @@ static int cmdIncrDels(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc
     return ValkeyModule_ReplyWithSimpleString(ctx, "OK");
 }
 
+static int cmdDeleteKey(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    if (argc != 2)
+        return ValkeyModule_WrongArity(ctx);
+
+    ValkeyModuleKey *key = ValkeyModule_OpenKey(ctx, argv[1], VALKEYMODULE_WRITE);
+    if (!key) {
+        return ValkeyModule_ReplyWithError(ctx, "ERR OpenKey failed");
+    }
+
+    if (ValkeyModule_DeleteKey(key) != VALKEYMODULE_OK) {
+        ValkeyModule_CloseKey(key);
+        return ValkeyModule_ReplyWithError(ctx, "ERR DeleteKey failed");
+    }
+    ValkeyModule_CloseKey(key);
+    return ValkeyModule_ReplyWithSimpleString(ctx, "OK");
+}
+
+static int cmdUnlinkKey(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    if (argc != 2)
+        return ValkeyModule_WrongArity(ctx);
+
+    ValkeyModuleKey *key = ValkeyModule_OpenKey(ctx, argv[1], VALKEYMODULE_WRITE);
+    if (!key) {
+        return ValkeyModule_ReplyWithError(ctx, "ERR OpenKey failed");
+    }
+
+    if (ValkeyModule_UnlinkKey(key) != VALKEYMODULE_OK) {
+        ValkeyModule_CloseKey(key);
+        return ValkeyModule_ReplyWithError(ctx, "ERR UnlinkKey failed");
+    }
+    ValkeyModule_CloseKey(key);
+    return ValkeyModule_ReplyWithSimpleString(ctx, "OK");
+}
+
 static int cmdGetDels(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
     VALKEYMODULE_NOT_USED(argv);
     VALKEYMODULE_NOT_USED(argc);
@@ -400,6 +434,16 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
 
     if (ValkeyModule_CreateCommand(ctx, "keyspace.get_dels", cmdGetDels,
                                   "readonly", 0, 0, 0) == VALKEYMODULE_ERR){
+        return VALKEYMODULE_ERR;
+    }
+
+    if (ValkeyModule_CreateCommand(ctx, "keyspace.delete_key", cmdDeleteKey,
+                                  "write", 0, 0, 0) == VALKEYMODULE_ERR){
+        return VALKEYMODULE_ERR;
+    }
+
+    if (ValkeyModule_CreateCommand(ctx, "keyspace.unlink_key", cmdUnlinkKey,
+                                  "write", 0, 0, 0) == VALKEYMODULE_ERR){
         return VALKEYMODULE_ERR;
     }
 
