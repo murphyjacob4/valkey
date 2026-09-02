@@ -76,12 +76,15 @@ typedef long long ustime_t;
 #define VALKEYMODULE_OPEN_KEY_NOEXPIRE (1 << 19)
 /* Avoid any effects from fetching the key */
 #define VALKEYMODULE_OPEN_KEY_NOEFFECTS (1 << 20)
+/* Don't trigger keyspace events when modifying the key. */
+#define VALKEYMODULE_OPEN_KEY_NO_KEYSPACE_EVENTS (1 << 21)
 /* Mask of all VALKEYMODULE_OPEN_KEY_* values. Any new mode should be added to this list.
  * Should not be used directly by the module, use RM_GetOpenKeyModesAll instead.
  * Located here so when we will add new modes we will not forget to update it. */
 #define _VALKEYMODULE_OPEN_KEY_ALL                                                                            \
     VALKEYMODULE_READ | VALKEYMODULE_WRITE | VALKEYMODULE_OPEN_KEY_NOTOUCH | VALKEYMODULE_OPEN_KEY_NONOTIFY | \
-        VALKEYMODULE_OPEN_KEY_NOSTATS | VALKEYMODULE_OPEN_KEY_NOEXPIRE | VALKEYMODULE_OPEN_KEY_NOEFFECTS
+        VALKEYMODULE_OPEN_KEY_NOSTATS | VALKEYMODULE_OPEN_KEY_NOEXPIRE | VALKEYMODULE_OPEN_KEY_NOEFFECTS |    \
+        VALKEYMODULE_OPEN_KEY_NO_KEYSPACE_EVENTS
 
 /* List push and pop */
 #define VALKEYMODULE_LIST_HEAD 0
@@ -342,10 +345,14 @@ typedef uint64_t ValkeyModuleTimerID;
  * slot migration must be used. */
 #define VALKEYMODULE_OPTIONS_HANDLE_ATOMIC_SLOT_MIGRATION (1 << 5)
 
+/* When set, Valkey will not emit keyspace notifications implicitly for low-level
+ * key modification functions like ValkeyModule_DeleteKey(). */
+#define VALKEYMODULE_OPTION_NO_IMPLICIT_KEYSPACE_EVENTS (1 << 6)
+
 /* Next option flag, must be updated when adding new module flags above!
  * This flag should not be used directly by the module.
  * Use ValkeyModule_GetModuleOptionsAll instead. */
-#define _VALKEYMODULE_OPTIONS_FLAGS_NEXT (1 << 6)
+#define _VALKEYMODULE_OPTIONS_FLAGS_NEXT (1 << 7)
 
 /* Definitions for ValkeyModule_SetCommandInfo. */
 

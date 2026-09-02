@@ -83,6 +83,96 @@ tags "modules" {
             $rd1 close
         }
 
+        test "Keyspace notifications: low-level VM_DeleteKey and VM_UnlinkKey" {
+            r config set notify-keyspace-events KEA
+            r set mykey "hello"
+            set rd1 [valkey_deferring_client]
+            assert_equal {1} [psubscribe $rd1 *]
+
+            # VM_DeleteKey should emit del notification
+            assert_equal {OK} [r keyspace.del_key mykey]
+            assert_equal {pmessage * __keyspace@9__:mykey del} [$rd1 read]
+            assert_equal {pmessage * __keyevent@9__:del mykey} [$rd1 read]
+
+            # VM_UnlinkKey should emit del notification
+            r set mykey2 "world"
+            assert_equal {pmessage * __keyspace@9__:mykey2 set} [$rd1 read]
+            assert_equal {pmessage * __keyevent@9__:set mykey2} [$rd1 read]
+
+            assert_equal {OK} [r keyspace.unlink_key mykey2]
+            assert_equal {pmessage * __keyspace@9__:mykey2 del} [$rd1 read]
+            assert_equal {pmessage * __keyevent@9__:del mykey2} [$rd1 read]
+
+            $rd1 close
+        }
+
+        test "Keyspace notifications: low-level VM_StringSet does not emit del on overwrite" {
+            r config set notify-keyspace-events KEA
+            r set mykey "hello"
+            set rd1 [valkey_deferring_client]
+            assert_equal {1} [psubscribe $rd1 *]
+
+            # Overwriting via VM_StringSet should emit 'set', not 'del'
+            assert_equal {OK} [r keyspace.string_set mykey "updated"]
+            assert_equal {pmessage * __keyspace@9__:mykey set} [$rd1 read]
+            assert_equal {pmessage * __keyevent@9__:set mykey} [$rd1 read]
+
+            $rd1 close
+        }
+
+        test "Keyspace notifications: VALKEYMODULE_OPEN_KEY_NO_KEYSPACE_EVENTS suppresses events" {
+            r config set notify-keyspace-events KEA
+            r set mykey "hello"
+            set rd1 [valkey_deferring_client]
+            assert_equal {1} [psubscribe $rd1 *]
+
+            # Deleting with NO_KEYSPACE_EVENTS should not emit any keyspace events
+            assert_equal {OK} [r keyspace.del_key_nonotify mykey]
+
+            # Trigger a known event to ensure channel is flushed and verify no del was sent
+            r set probe "value"
+            assert_equal {pmessage * __keyspace@9__:probe set} [$rd1 read]
+            assert_equal {pmessage * __keyevent@9__:set probe} [$rd1 read]
+
+            $rd1 close
+        }
+
+        test "Keyspace notifications: VALKEYMODULE_OPTION_NO_IMPLICIT_KEYSPACE_EVENTS suppresses events" {
+            r config set notify-keyspace-events KEA
+            assert_equal {OK} [r keyspace.set_no_implicit_keyspace_events]
+
+            r set mykey "hello"
+            set rd1 [valkey_deferring_client]
+            assert_equal {1} [psubscribe $rd1 *]
+
+            assert_equal {OK} [r keyspace.del_key mykey]
+
+            # Trigger a known event to ensure channel is flushed and verify no del was sent
+            r set probe "value"
+            assert_equal {pmessage * __keyspace@9__:probe set} [$rd1 read]
+            assert_equal {pmessage * __keyevent@9__:set probe} [$rd1 read]
+
+            $rd1 close
+            assert_equal {OK} [r keyspace.clear_no_implicit_keyspace_events]
+        }
+
+        test "Keyspace notifications: low-level VM_SetExpire emits expire and persist" {
+            r config set notify-keyspace-events KEA
+            r set mykey "hello"
+            set rd1 [valkey_deferring_client]
+            assert_equal {1} [psubscribe $rd1 *]
+
+            assert_equal {OK} [r keyspace.set_expire mykey 100000]
+            assert_equal {pmessage * __keyspace@9__:mykey expire} [$rd1 read]
+            assert_equal {pmessage * __keyevent@9__:expire mykey} [$rd1 read]
+
+            assert_equal {OK} [r keyspace.set_expire mykey -1]
+            assert_equal {pmessage * __keyspace@9__:mykey persist} [$rd1 read]
+            assert_equal {pmessage * __keyevent@9__:persist mykey} [$rd1 read]
+
+            $rd1 close
+        }
+
         test {Test expired key space event} {
             set prev_expired [s expired_keys]
             r set exp 1 PX 10

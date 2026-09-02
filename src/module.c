@@ -409,6 +409,15 @@ typedef struct ValkeyModuleServerInfoData {
 #define SHOULD_SIGNAL_MODIFIED_KEYS(ctx) \
     ((ctx)->module ? !((ctx)->module->options & VALKEYMODULE_OPTION_NO_IMPLICIT_SIGNAL_MODIFIED) : 1)
 
+/* Determine whether the server should emit keyspace events implicitly.
+ * In case 'ctx' has no 'module' member (and therefore no module->options),
+ * we assume default behavior, that is, the server emits keyspace events. */
+#define SHOULD_NOTIFY_KEYSPACE_EVENTS(ctx) \
+    ((ctx) && (ctx)->module ? !((ctx)->module->options & VALKEYMODULE_OPTION_NO_IMPLICIT_KEYSPACE_EVENTS) : 1)
+
+#define SHOULD_KEY_NOTIFY_KEYSPACE_EVENTS(key) \
+    (!(key->mode & VALKEYMODULE_OPEN_KEY_NO_KEYSPACE_EVENTS) && SHOULD_NOTIFY_KEYSPACE_EVENTS(key->ctx))
+
 /* Server events hooks data structures and defines: this modules API
  * allow modules to subscribe to certain events in the server, such as
  * the start and end of an RDB or AOF save, the change of role in replication,
@@ -4408,17 +4417,26 @@ size_t VM_ValueLength(ValkeyModuleKey *key) {
     }
 }
 
+static int moduleDeleteKey(ValkeyModuleKey *key, bool async, bool notify) {
+    if (!(key->mode & VALKEYMODULE_WRITE)) return VALKEYMODULE_ERR;
+    if (key->value) {
+        if (notify && SHOULD_KEY_NOTIFY_KEYSPACE_EVENTS(key))
+            notifyKeyspaceEvent(NOTIFY_GENERIC, "del", key->key, key->db->id);
+        if (async)
+            dbAsyncDelete(key->db, key->key);
+        else
+            dbDelete(key->db, key->key);
+        key->value = NULL;
+    }
+    return VALKEYMODULE_OK;
+}
+
 /* If the key is open for writing, remove it, and set up the key to
  * accept new writes as an empty key (that will be created on demand).
  * On success VALKEYMODULE_OK is returned. If the key is not open for
  * writing VALKEYMODULE_ERR is returned. */
 int VM_DeleteKey(ValkeyModuleKey *key) {
-    if (!(key->mode & VALKEYMODULE_WRITE)) return VALKEYMODULE_ERR;
-    if (key->value) {
-        dbDelete(key->db, key->key);
-        key->value = NULL;
-    }
-    return VALKEYMODULE_OK;
+    return moduleDeleteKey(key, false, true);
 }
 
 /* If the key is open for writing, unlink it (that is delete it in a
@@ -4427,12 +4445,7 @@ int VM_DeleteKey(ValkeyModuleKey *key) {
  * On success VALKEYMODULE_OK is returned. If the key is not open for
  * writing VALKEYMODULE_ERR is returned. */
 int VM_UnlinkKey(ValkeyModuleKey *key) {
-    if (!(key->mode & VALKEYMODULE_WRITE)) return VALKEYMODULE_ERR;
-    if (key->value) {
-        dbAsyncDelete(key->db, key->key);
-        key->value = NULL;
-    }
-    return VALKEYMODULE_OK;
+    return moduleDeleteKey(key, true, true);
 }
 
 /* Return the key expire value, as milliseconds of remaining TTL.
@@ -4460,8 +4473,12 @@ int VM_SetExpire(ValkeyModuleKey *key, mstime_t expire) {
     if (expire != VALKEYMODULE_NO_EXPIRE) {
         expire += commandTimeSnapshot();
         key->value = setExpire(key->ctx->client, key->db, key->key, expire);
+        if (SHOULD_KEY_NOTIFY_KEYSPACE_EVENTS(key))
+            notifyKeyspaceEvent(NOTIFY_GENERIC, "expire", key->key, key->db->id);
     } else {
         removeExpire(key->db, key->key);
+        if (SHOULD_KEY_NOTIFY_KEYSPACE_EVENTS(key))
+            notifyKeyspaceEvent(NOTIFY_GENERIC, "persist", key->key, key->db->id);
     }
     return VALKEYMODULE_OK;
 }
@@ -4489,8 +4506,12 @@ int VM_SetAbsExpire(ValkeyModuleKey *key, mstime_t expire) {
         return VALKEYMODULE_ERR;
     if (expire != VALKEYMODULE_NO_EXPIRE) {
         key->value = setExpire(key->ctx->client, key->db, key->key, expire);
+        if (SHOULD_KEY_NOTIFY_KEYSPACE_EVENTS(key))
+            notifyKeyspaceEvent(NOTIFY_GENERIC, "expire", key->key, key->db->id);
     } else {
         removeExpire(key->db, key->key);
+        if (SHOULD_KEY_NOTIFY_KEYSPACE_EVENTS(key))
+            notifyKeyspaceEvent(NOTIFY_GENERIC, "persist", key->key, key->db->id);
     }
     return VALKEYMODULE_OK;
 }
@@ -4548,11 +4569,13 @@ int VM_GetToDbIdFromOptCtx(ValkeyModuleKeyOptCtx *ctx) {
  * writing or there is an active iterator, VALKEYMODULE_ERR is returned. */
 int VM_StringSet(ValkeyModuleKey *key, ValkeyModuleString *str) {
     if (!(key->mode & VALKEYMODULE_WRITE) || key->iter) return VALKEYMODULE_ERR;
-    VM_DeleteKey(key);
+    moduleDeleteKey(key, false, false);
     /* Retain str so setKey copies it to db rather than reallocating it. */
     incrRefCount(str);
     setKey(key->ctx->client, key->db, key->key, &str, SETKEY_NO_SIGNAL | SETKEY_DOESNT_EXIST);
     key->value = str;
+    if (SHOULD_KEY_NOTIFY_KEYSPACE_EVENTS(key))
+        notifyKeyspaceEvent(NOTIFY_STRING, "set", key->key, key->db->id);
     return VALKEYMODULE_OK;
 }
 
@@ -7568,7 +7591,7 @@ moduleType *VM_CreateDataType(ValkeyModuleCtx *ctx, const char *name, int encver
  * writing or there is an active iterator, VALKEYMODULE_ERR is returned. */
 int VM_ModuleTypeSetValue(ValkeyModuleKey *key, moduleType *mt, void *value) {
     if (!(key->mode & VALKEYMODULE_WRITE) || key->iter) return VALKEYMODULE_ERR;
-    VM_DeleteKey(key);
+    moduleDeleteKey(key, false, false);
     robj *o = createModuleObject(mt, value);
     setKey(key->ctx->client, key->db, key->key, &o, SETKEY_NO_SIGNAL | SETKEY_DOESNT_EXIST);
     key->value = o;

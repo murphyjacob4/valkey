@@ -256,6 +256,63 @@ static int cmdDelKeyCopy(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int ar
     return VALKEYMODULE_OK;
 }
 
+static int cmdDeleteKey(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    if (argc != 2) return ValkeyModule_WrongArity(ctx);
+    ValkeyModuleKey *key = ValkeyModule_OpenKey(ctx, argv[1], VALKEYMODULE_WRITE);
+    int res = ValkeyModule_DeleteKey(key);
+    ValkeyModule_CloseKey(key);
+    return ValkeyModule_ReplyWithSimpleString(ctx, res == VALKEYMODULE_OK ? "OK" : "ERR");
+}
+
+static int cmdUnlinkKey(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    if (argc != 2) return ValkeyModule_WrongArity(ctx);
+    ValkeyModuleKey *key = ValkeyModule_OpenKey(ctx, argv[1], VALKEYMODULE_WRITE);
+    int res = ValkeyModule_UnlinkKey(key);
+    ValkeyModule_CloseKey(key);
+    return ValkeyModule_ReplyWithSimpleString(ctx, res == VALKEYMODULE_OK ? "OK" : "ERR");
+}
+
+static int cmdStringSet(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    if (argc != 3) return ValkeyModule_WrongArity(ctx);
+    ValkeyModuleKey *key = ValkeyModule_OpenKey(ctx, argv[1], VALKEYMODULE_WRITE);
+    int res = ValkeyModule_StringSet(key, argv[2]);
+    ValkeyModule_CloseKey(key);
+    return ValkeyModule_ReplyWithSimpleString(ctx, res == VALKEYMODULE_OK ? "OK" : "ERR");
+}
+
+static int cmdDeleteKeyNoNotify(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    if (argc != 2) return ValkeyModule_WrongArity(ctx);
+    ValkeyModuleKey *key = ValkeyModule_OpenKey(ctx, argv[1], VALKEYMODULE_WRITE | VALKEYMODULE_OPEN_KEY_NO_KEYSPACE_EVENTS);
+    int res = ValkeyModule_DeleteKey(key);
+    ValkeyModule_CloseKey(key);
+    return ValkeyModule_ReplyWithSimpleString(ctx, res == VALKEYMODULE_OK ? "OK" : "ERR");
+}
+
+static int cmdSetExpire(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    if (argc != 3) return ValkeyModule_WrongArity(ctx);
+    long long expire;
+    if (ValkeyModule_StringToLongLong(argv[2], &expire) != VALKEYMODULE_OK)
+        return ValkeyModule_ReplyWithError(ctx, "ERR invalid expire");
+    ValkeyModuleKey *key = ValkeyModule_OpenKey(ctx, argv[1], VALKEYMODULE_WRITE);
+    int res = ValkeyModule_SetExpire(key, expire);
+    ValkeyModule_CloseKey(key);
+    return ValkeyModule_ReplyWithSimpleString(ctx, res == VALKEYMODULE_OK ? "OK" : "ERR");
+}
+
+static int cmdSetNoImplicitKeyspaceEvents(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    VALKEYMODULE_NOT_USED(argv);
+    if (argc != 1) return ValkeyModule_WrongArity(ctx);
+    ValkeyModule_SetModuleOptions(ctx, VALKEYMODULE_OPTION_NO_IMPLICIT_KEYSPACE_EVENTS);
+    return ValkeyModule_ReplyWithSimpleString(ctx, "OK");
+}
+
+static int cmdClearNoImplicitKeyspaceEvents(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    VALKEYMODULE_NOT_USED(argv);
+    if (argc != 1) return ValkeyModule_WrongArity(ctx);
+    ValkeyModule_SetModuleOptions(ctx, 0);
+    return ValkeyModule_ReplyWithSimpleString(ctx, "OK");
+}
+
 /* Call INCR and propagate using RM_Call with `!`. */
 static int cmdIncrCase1(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
     if (argc != 2)
@@ -400,6 +457,35 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
 
     if (ValkeyModule_CreateCommand(ctx, "keyspace.get_dels", cmdGetDels,
                                   "readonly", 0, 0, 0) == VALKEYMODULE_ERR){
+        return VALKEYMODULE_ERR;
+    }
+
+    if (ValkeyModule_CreateCommand(ctx, "keyspace.del_key", cmdDeleteKey,
+                                  "write", 0, 0, 0) == VALKEYMODULE_ERR){
+        return VALKEYMODULE_ERR;
+    }
+    if (ValkeyModule_CreateCommand(ctx, "keyspace.unlink_key", cmdUnlinkKey,
+                                  "write", 0, 0, 0) == VALKEYMODULE_ERR){
+        return VALKEYMODULE_ERR;
+    }
+    if (ValkeyModule_CreateCommand(ctx, "keyspace.string_set", cmdStringSet,
+                                  "write", 0, 0, 0) == VALKEYMODULE_ERR){
+        return VALKEYMODULE_ERR;
+    }
+    if (ValkeyModule_CreateCommand(ctx, "keyspace.del_key_nonotify", cmdDeleteKeyNoNotify,
+                                  "write", 0, 0, 0) == VALKEYMODULE_ERR){
+        return VALKEYMODULE_ERR;
+    }
+    if (ValkeyModule_CreateCommand(ctx, "keyspace.set_expire", cmdSetExpire,
+                                  "write", 0, 0, 0) == VALKEYMODULE_ERR){
+        return VALKEYMODULE_ERR;
+    }
+    if (ValkeyModule_CreateCommand(ctx, "keyspace.set_no_implicit_keyspace_events", cmdSetNoImplicitKeyspaceEvents,
+                                  "write", 0, 0, 0) == VALKEYMODULE_ERR){
+        return VALKEYMODULE_ERR;
+    }
+    if (ValkeyModule_CreateCommand(ctx, "keyspace.clear_no_implicit_keyspace_events", cmdClearNoImplicitKeyspaceEvents,
+                                  "write", 0, 0, 0) == VALKEYMODULE_ERR){
         return VALKEYMODULE_ERR;
     }
 
