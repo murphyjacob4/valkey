@@ -770,6 +770,9 @@ void incrRefCount(robj *o) {
 }
 
 void decrRefCount(robj *o) {
+    if (objectGetRefcount(o) >= OBJ_FIRST_SPECIAL_REFCOUNT) {
+        return;
+    }
     if (objectGetRefcount(o) == 1) {
         if (objectGetVal(o) != NULL) {
             switch (objectGetType(o)) {

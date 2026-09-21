@@ -163,6 +163,7 @@ static long long throttlerTimeProc(struct aeEventLoop *eventLoop, long long id, 
 }
 
 static void throttlerAddClient(throttler *t, client *c) {
+    clientPromoteArgv(c);
     serverAssert(c->throttler == NULL);
     serverAssert(!c->flag.throttled);
     elapsedStart(&c->throttle_start);

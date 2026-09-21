@@ -1268,6 +1268,7 @@ typedef struct ClientFlags {
     uint64_t keyspace_notified : 1;        /* Indicates that a keyspace notification was triggered during the execution of the
                                               current command. */
     uint64_t argv_borrowed : 1;            /* The argv array and its elements are borrowed from the caller (VM_CallArgv) and must not be freed. */
+    uint64_t argv_sliced : 1;              /* Current argv elements are borrowed slices and must not be retained via incrRefCount. */
     uint64_t throttled : 1;                /* Currently queued in a throttler */
     uint64_t throttle_checked : 1;         /* Already passed throttle check for this command */
     uint64_t throttle_multi : 1;           /* Matches multiple throttlers */
@@ -1390,6 +1391,9 @@ typedef struct LastWrittenBuf {
 typedef struct slotMigrationJob slotMigrationJob;
 
 #define ARGV_INLINE_MAX 12 /* covers SET k v EX n XX GET, HSET h f v, ZADD z s m, ... */
+#define ARGV_SLICES_DEBUG_NONE 0
+#define ARGV_SLICES_DEBUG_POISON 1
+#define ARGV_SLICES_DEBUG_HEAP_PER_SLICE 2
 
 typedef struct client {
     /* Basic client information and connection. */
@@ -1407,6 +1411,10 @@ typedef struct client {
     int argv_len;        /* Size of argv array (may be more than argc) */
     size_t argv_len_sum; /* Sum of lengths of objects in argv list. */
     robj *argv_inline[ARGV_INLINE_MAX]; /* Inline argv pointer array to avoid zmalloc */
+    robj argv_slice[ARGV_INLINE_MAX];   /* borrowed robj headers, 16 B each */
+    sds argv_slice_sds[ARGV_INLINE_MAX]; /* allocated sds if heap-per-slice, or NULL */
+    uint32_t argv_slice_mask;           /* bit i: argv[i] is a slice, not owned */
+    uint32_t argv_slices_live;          /* invariant counter; see §6 */
     int reqtype;         /* Request protocol type: PROTO_REQ_* */
     int multibulklen;    /* Number of multi bulk arguments left to read. */
     long bulklen;        /* Length of bulk argument in multi bulk request. */
@@ -1957,6 +1965,8 @@ struct valkeyServer {
     int enable_debug_cmd;                     /* Enable DEBUG commands, see PROTECTED_ACTION_ALLOWED_* */
     int enable_module_cmd;                    /* Enable MODULE commands, see PROTECTED_ACTION_ALLOWED_* */
     int enable_debug_assert;                  /* Enable debug asserts */
+    int argv_slices_enabled;                  /* Master switch for argv slicing */
+    int argv_slices_debug;                    /* Debug mode: 0=no, 1=poison, 2=heap-per-slice */
     int debug_client_enforce_reply_list;      /* Force client to always use the reply list */
     int debug_force_free_primary_async;       /* Force freeClient on primary to use async path */
     /* Reply construction copy avoidance */
@@ -2043,6 +2053,10 @@ struct valkeyServer {
     long long stat_io_writes_processed;                /* Number of write events processed by IO threads */
     long long stat_io_writes_pending;                  /* Number of write events pending in IO threads */
     long long stat_io_freed_objects;                   /* Number of objects freed by IO threads */
+    atomic_ullong argv_slices_total;                   /* Total slices emitted */
+    atomic_ullong argv_promotions_total;               /* Total slice promotions */
+    atomic_ullong argv_alloc_avoided_total;           /* Total heap allocations avoided */
+    atomic_ullong argv_shared_qb_pin_conflicts;       /* Pin conflicts avoided by fallback */
     long long stat_io_accept_offloaded;                /* Number of offloaded accepts */
     long long stat_poll_processed_by_io_threads;       /* Total number of poll jobs processed by IO */
     long long stat_total_reads_processed;              /* Total number of read events processed */
@@ -3016,6 +3030,7 @@ extern hashtableType kvstoreChannelHashtableType;
 extern hashtableType sdsReplyHashtableType;
 extern dictType keylistDictType;
 extern list *modules;
+extern _Thread_local client *thread_shared_qb_pinned_by;
 
 /*-----------------------------------------------------------------------------
  * Functions prototypes
@@ -3173,6 +3188,8 @@ sds catClientInfoShortString(sds s, client *client, int hide_user_data);
 sds getAllClientsInfoString(int type, int hide_user_data);
 int clientSetName(client *c, robj *name, const char **err);
 bool clientCommandArgShouldBeRedacted(client *c, int arg_index);
+robj *clientRetainArg(client *c, int i);
+void clientPromoteArgv(client *c);
 void rewriteClientCommandVector(client *c, int argc, ...);
 void rewriteClientCommandArgument(client *c, int i, robj *newval);
 void replaceClientCommandVector(client *c, int argc, robj **argv);

@@ -162,6 +162,7 @@ static int parseMultibulk(client *c,
 
 int ProcessingEventsWhileBlocked = 0; /* See processEventsWhileBlocked(). */
 _Thread_local sds thread_shared_qb = NULL;
+_Thread_local client *thread_shared_qb_pinned_by = NULL;
 
 typedef enum {
     PARSE_OK = 0,
@@ -365,6 +366,9 @@ client *createClient(connection *conn) {
     c->argv = NULL;
     c->argv_len = 0;
     c->argv_len_sum = 0;
+    c->argv_slice_mask = 0;
+    c->argv_slices_live = 0;
+    for (int i = 0; i < ARGV_INLINE_MAX; i++) c->argv_slice_sds[i] = NULL;
     c->original_argc = 0;
     c->original_argv = NULL;
     c->redact_arg_bitmap = 0;
@@ -2167,6 +2171,29 @@ void freeClientArgv(client *c) {
         goto clear;
     }
 
+    if (c->flag.argv_sliced) {
+        serverAssert(c->original_argv == NULL);
+        for (int j = 0; j < c->argc; j++) {
+            if (c->argv_slice_mask & (1U << j)) {
+                if (c->argv_slice_sds[j]) {
+                    sdsfree(c->argv_slice_sds[j]);
+                    c->argv_slice_sds[j] = NULL;
+                }
+                c->argv_slices_live--;
+            } else {
+                decrRefCount(c->argv[j]);
+            }
+        }
+        if (c->argv != c->argv_inline) zfree(c->argv);
+        c->argv_slice_mask = 0;
+        serverAssert(c->argv_slices_live == 0);
+        c->flag.argv_sliced = 0;
+        if (thread_shared_qb_pinned_by == c) {
+            thread_shared_qb_pinned_by = NULL;
+        }
+        goto clear;
+    }
+
     /* If original_argv exists, 'c->argv' was allocated by the main thread,
      * so it's more efficient to free it directly here rather than offloading to IO threads */
     if (c->argv != c->argv_inline) {
@@ -3794,6 +3821,10 @@ void resetClient(client *c) {
 
     freeClientArgv(c);
     freeClientOriginalArgv(c);
+    if (server.argv_slices_debug == ARGV_SLICES_DEBUG_POISON) {
+        memset(c->argv_slice, 0xA5, sizeof(c->argv_slice));
+    }
+    serverAssert(c->argv_slices_live == 0);
     c->redact_arg_bitmap = 0;
     c->cur_script = NULL;
     c->net_input_bytes_curr_cmd = 0;
@@ -4289,6 +4320,18 @@ static int parseMultibulk(client *c,
                  * likely... */
                 c->querybuf = sdsnewlen(SDS_NOINIT, c->bulklen + 2);
                 sdsclear(c->querybuf);
+            } else if (server.argv_slices_enabled && argv == &c->argv && *argc == 0) {
+                /* Phase 2: slice argv[0] only (command name) */
+                sds val_sds = sdsnewlen(c->querybuf + c->qb_pos, c->bulklen);
+                initStaticStringObject(c->argv_slice[0], val_sds);
+                c->argv_slice_sds[0] = val_sds;
+                c->argv_slice_mask |= (1U << 0);
+                c->argv_slices_live++;
+                c->flag.argv_sliced = 1;
+                atomic_fetch_add_explicit(&server.argv_slices_total, 1, memory_order_relaxed);
+                (*argv)[(*argc)++] = &c->argv_slice[0];
+                *argv_len_sum += c->bulklen;
+                c->qb_pos += c->bulklen + 2;
             } else {
                 (*argv)[(*argc)++] = createStringObject(c->querybuf + c->qb_pos, c->bulklen);
                 *argv_len_sum += c->bulklen;
@@ -6461,6 +6504,68 @@ void securityWarningCommand(client *c) {
     freeClientAsync(c);
 }
 
+/* Return a heap-owned robj for argument i, with a reference held by the caller.
+ *   - sliced   : materialize a real object; caller owns it; c->argv[i] is left alone.
+ *   - borrowed : incrRefCount(c->argv[i]) and return it
+ *   - owned    : incrRefCount and return it.
+ */
+robj *clientRetainArg(client *c, int i) {
+    serverAssert(i >= 0 && i < c->argc);
+    if (c->argv_slice_mask & (1U << i)) {
+        robj *slice = c->argv[i];
+        robj *owned = createRawStringObject(objectGetVal(slice), sdslen(objectGetVal(slice)));
+        atomic_fetch_add_explicit(&server.argv_promotions_total, 1, memory_order_relaxed);
+        return owned;
+    }
+    incrRefCount(c->argv[i]);
+    return c->argv[i];
+}
+
+/* Promote all slices in client to heap objects, ensuring no slices remain. */
+void clientPromoteArgv(client *c) {
+    if (c->flag.argv_sliced) {
+        for (int i = 0; i < c->argc; i++) {
+            if (c->argv_slice_mask & (1U << i)) {
+                robj *slice = c->argv[i];
+                robj *promoted = createRawStringObject(objectGetVal(slice), sdslen(objectGetVal(slice)));
+                c->argv[i] = promoted;
+                if (c->argv_slice_sds[i]) {
+                    sdsfree(c->argv_slice_sds[i]);
+                    c->argv_slice_sds[i] = NULL;
+                }
+                c->argv_slice_mask &= ~(1U << i);
+                c->argv_slices_live--;
+                atomic_fetch_add_explicit(&server.argv_promotions_total, 1, memory_order_relaxed);
+            }
+        }
+        serverAssert(c->argv_slices_live == 0);
+        c->flag.argv_sliced = 0;
+    }
+
+    if (c->argv == c->argv_inline) {
+        robj **heap_argv = zmalloc(sizeof(robj *) * c->argv_len);
+        memcpy(heap_argv, c->argv_inline, sizeof(robj *) * c->argc);
+        c->argv = heap_argv;
+    }
+
+    /* Walk cmd_queue and promote any queued sliced commands */
+    cmdQueue *queue = &c->cmd_queue;
+    for (int i = queue->off; i < queue->len; i++) {
+        parsedCommand *p = &queue->cmds[i];
+        for (int j = 0; j < p->argc; j++) {
+            if (p->argv[j]->refcount >= OBJ_FIRST_SPECIAL_REFCOUNT) {
+                robj *old = p->argv[j];
+                p->argv[j] = createRawStringObject(objectGetVal(old), sdslen(objectGetVal(old)));
+                atomic_fetch_add_explicit(&server.argv_promotions_total, 1, memory_order_relaxed);
+            }
+        }
+    }
+
+    if (thread_shared_qb_pinned_by == c) {
+        thread_shared_qb_pinned_by = NULL;
+    }
+}
+
 /* This function preserves the original command arguments for accurate commandlog recording.
  *
  * It performs the following operations:
@@ -6472,6 +6577,7 @@ void securityWarningCommand(client *c) {
  *                allocated for new_argc arguments, preserving the existing arguments.
  */
 static void backupAndUpdateClientArgv(client *c, int new_argc, robj **new_argv) {
+    clientPromoteArgv(c);
     robj **old_argv = c->argv;
     int old_argc = c->argc;
 
@@ -6523,6 +6629,7 @@ bool clientCommandArgShouldBeRedacted(client *c, int arg_index) {
  * For indices >= 32, bit 0 is set as a sentinel to indicate that all
  * arguments beyond the bitmap range should also be redacted. */
 void redactClientCommandArgument(client *c, int argc) {
+    clientPromoteArgv(c);
     serverAssert(argc >= 1);
     if (argc < 32) {
         c->redact_arg_bitmap |= (1U << argc);

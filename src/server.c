@@ -982,6 +982,7 @@ long long getInstantaneousMetric(int metric) {
  *
  * The function always returns 0 as it never terminates the client. */
 int clientsCronResizeQueryBuffer(client *c) {
+    clientPromoteArgv(c);
     /* If the client query buffer is NULL, it is using the shared query buffer and there is nothing to do. */
     if (c->querybuf == NULL) return 0;
     size_t querybuf_size = sdsalloc(c->querybuf);
@@ -2558,6 +2559,8 @@ void initServerConfig(void) {
 
     /* Debugging */
     server.watchdog_period = 0;
+    server.argv_slices_enabled = 0;
+    server.argv_slices_debug = ARGV_SLICES_DEBUG_NONE;
 }
 
 extern char **environ;
@@ -3232,6 +3235,10 @@ void initServer(void) {
     server.aof_last_write_errno = 0;
     server.repl_good_replicas_count = 0;
     server.last_sig_received = 0;
+    atomic_init(&server.argv_slices_total, 0);
+    atomic_init(&server.argv_promotions_total, 0);
+    atomic_init(&server.argv_alloc_avoided_total, 0);
+    atomic_init(&server.argv_shared_qb_pin_conflicts, 0);
 
     /* Create the timer callback, this is our way to process many background
      * operations incrementally, like eviction of unaccessed expired keys, etc. */
@@ -4212,11 +4219,15 @@ void call(client *c, int flags) {
      * modifications. */
     robj **debug_argv_clone = NULL;
     int debug_argc_clone = 0;
-    int *debug_argv_refcount = NULL;
-    if (c->flag.argv_borrowed && server.enable_debug_assert) {
+    uint32_t *debug_argv_refcount = NULL;
+    uint32_t debug_slice_mask = 0;
+    int debug_argv_borrowed = c->flag.argv_borrowed;
+    int debug_argv_sliced = c->flag.argv_sliced;
+    if ((debug_argv_borrowed || debug_argv_sliced) && server.enable_debug_assert) {
         debug_argc_clone = c->original_argv ? c->original_argc : c->argc;
         debug_argv_clone = zmalloc(sizeof(robj *) * debug_argc_clone);
-        debug_argv_refcount = zmalloc(sizeof(int) * debug_argc_clone);
+        debug_argv_refcount = zmalloc(sizeof(uint32_t) * debug_argc_clone);
+        debug_slice_mask = c->argv_slice_mask;
         for (int i = 0; i < debug_argc_clone; i++) {
             debug_argv_clone[i] = c->original_argv ? c->original_argv[i] : c->argv[i];
             debug_argv_refcount[i] = c->original_argv ? c->original_argv[i]->refcount : c->argv[i]->refcount;
@@ -4225,7 +4236,7 @@ void call(client *c, int flags) {
 
     c->cmd->proc(c);
 
-    if (c->flag.argv_borrowed && server.enable_debug_assert) {
+    if ((debug_argv_borrowed || debug_argv_sliced) && server.enable_debug_assert) {
         robj **argv = c->original_argv ? c->original_argv : c->argv;
         int argc = c->original_argv ? c->original_argc : c->argc;
         if (argc != debug_argc_clone) {
@@ -4234,15 +4245,18 @@ void call(client *c, int flags) {
         }
         serverAssert(argc == debug_argc_clone);
         for (int i = 0; i < debug_argc_clone; i++) {
-            if (argv[i] != debug_argv_clone[i]) {
-                serverLog(LL_WARNING, "Debug: command %s modified argv[%d]", c->cmd->current_name, i);
+            int should_check = debug_argv_borrowed || (c->flag.argv_sliced && (debug_slice_mask & (1U << i)));
+            if (should_check) {
+                if (argv[i] != debug_argv_clone[i]) {
+                    serverLog(LL_WARNING, "Debug: command %s modified argv[%d]", c->cmd->current_name, i);
+                }
+                serverAssert(debug_argv_clone[i] == argv[i]);
+                if (argv[i]->refcount < debug_argv_refcount[i]) {
+                    serverLog(LL_WARNING, "Debug: command %s modified argv[%d] refcount, original value: %u, new value: %u",
+                              c->cmd->current_name, i, (unsigned)debug_argv_refcount[i], (unsigned)argv[i]->refcount);
+                }
+                serverAssert(argv[i]->refcount >= debug_argv_refcount[i]);
             }
-            serverAssert(debug_argv_clone[i] == argv[i]);
-            if (argv[i]->refcount < debug_argv_refcount[i]) {
-                serverLog(LL_WARNING, "Debug: command %s modified argv[%d] refcount, original value: %d, new value: %d",
-                          c->cmd->current_name, i, debug_argv_refcount[i], argv[i]->refcount);
-            }
-            serverAssert(argv[i]->refcount >= debug_argv_refcount[i]);
         }
         zfree(debug_argv_clone);
         zfree(debug_argv_refcount);
@@ -4370,7 +4384,10 @@ void call(client *c, int flags) {
 
         /* Call alsoPropagate() only if at least one of AOF / replication
          * propagation is needed. */
-        if (propagate_flags != PROPAGATE_NONE) alsoPropagate(c->db->id, c->argv, c->argc, propagate_flags, c->slot);
+        if (propagate_flags != PROPAGATE_NONE) {
+            clientPromoteArgv(c);
+            alsoPropagate(c->db->id, c->argv, c->argc, propagate_flags, c->slot);
+        }
     }
 
     /* Restore the old replication flags, since call() can be executed
@@ -6915,7 +6932,11 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "instantaneous_eventloop_duration_usec:%llu\r\n", getInstantaneousMetric(STATS_METRIC_EL_DURATION),
                 "eventloop_priority_cycles:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_PRIORITY_EL].cnt,
                 "eventloop_priority_duration_sum:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_PRIORITY_EL].sum,
-                "eventloop_priority_duration_cmd_sum:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_PRIORITY_CMD].sum));
+                "eventloop_priority_duration_cmd_sum:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_PRIORITY_CMD].sum,
+                "argv_slices_total:%llu\r\n", (unsigned long long)atomic_load_explicit(&server.argv_slices_total, memory_order_relaxed),
+                "argv_promotions_total:%llu\r\n", (unsigned long long)atomic_load_explicit(&server.argv_promotions_total, memory_order_relaxed),
+                "argv_alloc_avoided_total:%llu\r\n", (unsigned long long)atomic_load_explicit(&server.argv_alloc_avoided_total, memory_order_relaxed),
+                "argv_shared_qb_pin_conflicts:%llu\r\n", (unsigned long long)atomic_load_explicit(&server.argv_shared_qb_pin_conflicts, memory_order_relaxed)));
         info = genValkeyInfoStringACLStats(info);
     }
 

@@ -89,6 +89,7 @@ void resetClientMultiState(client *c) {
 
 /* Add a new command into the MULTI commands queue */
 void queueMultiCommand(client *c, uint64_t cmd_flags) {
+    clientPromoteArgv(c);
     multiCmd *mc;
 
     /* No sense to waste memory if the transaction is already aborted.
@@ -317,6 +318,7 @@ static int checkExecConditions(client *c) {
 }
 
 void execCommand(client *c) {
+    clientPromoteArgv(c);
     int j;
     robj **orig_argv;
     int orig_argc, orig_argv_len;
