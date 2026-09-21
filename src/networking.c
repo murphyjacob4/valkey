@@ -2148,9 +2148,13 @@ void freeClientOriginalArgv(client *c) {
         return;
     }
 
-    if (tryOffloadFreeArgvToIOThreads(c, c->original_argc, c->original_argv) == C_ERR) {
+    if (c->original_argv != c->argv_inline) {
+        if (tryOffloadFreeArgvToIOThreads(c, c->original_argc, c->original_argv) == C_ERR) {
+            for (int j = 0; j < c->original_argc; j++) decrRefCount(c->original_argv[j]);
+            zfree(c->original_argv);
+        }
+    } else {
         for (int j = 0; j < c->original_argc; j++) decrRefCount(c->original_argv[j]);
-        zfree(c->original_argv);
     }
 
     c->original_argv = NULL;
@@ -2165,9 +2169,13 @@ void freeClientArgv(client *c) {
 
     /* If original_argv exists, 'c->argv' was allocated by the main thread,
      * so it's more efficient to free it directly here rather than offloading to IO threads */
-    if (c->original_argv || tryOffloadFreeArgvToIOThreads(c, c->argc, c->argv) == C_ERR) {
+    if (c->argv != c->argv_inline) {
+        if (c->original_argv || tryOffloadFreeArgvToIOThreads(c, c->argc, c->argv) == C_ERR) {
+            for (int j = 0; j < c->argc; j++) decrRefCount(c->argv[j]);
+            zfree(c->argv);
+        }
+    } else {
         for (int j = 0; j < c->argc; j++) decrRefCount(c->argv[j]);
-        zfree(c->argv);
     }
 clear:
     c->argc = 0;
@@ -3941,7 +3949,7 @@ void parseInlineBuffer(client *c) {
 
     /* Set up argv array on client structure */
     if (argc) {
-        if (c->argv) zfree(c->argv);
+        if (c->argv && c->argv != c->argv_inline) zfree(c->argv);
         c->argv_len = argc;
         c->argv = zmalloc(sizeof(robj *) * c->argv_len);
         c->argv_len_sum = 0;
@@ -4133,9 +4141,14 @@ static int parseMultibulk(client *c,
         c->bulklen = -1;
 
         /* Set up argv array */
-        if (*argv) zfree(*argv);
-        *argv_len = min(c->multibulklen, 1024);
-        *argv = zmalloc(sizeof(robj *) * *argv_len);
+        if (*argv && *argv != c->argv_inline) zfree(*argv);
+        if (argv == &c->argv && c->multibulklen <= ARGV_INLINE_MAX) {
+            *argv = c->argv_inline;
+            *argv_len = ARGV_INLINE_MAX;
+        } else {
+            *argv_len = min(c->multibulklen, 1024);
+            *argv = zmalloc(sizeof(robj *) * *argv_len);
+        }
         *argv_len_sum = 0;
 
         /* Per-slot network bytes-in calculation.
@@ -4249,7 +4262,13 @@ static int parseMultibulk(client *c,
             if (*argc >= *argv_len) {
                 *argv_len = min(*argv_len < INT_MAX / 2 ? (*argv_len) * 2 : INT_MAX,
                                 *argc + c->multibulklen);
-                *argv = zrealloc(*argv, sizeof(robj *) * (*argv_len));
+                if (*argv == c->argv_inline) {
+                    robj **new_argv = zmalloc(sizeof(robj *) * (*argv_len));
+                    memcpy(new_argv, c->argv_inline, sizeof(robj *) * (*argc));
+                    *argv = new_argv;
+                } else {
+                    *argv = zrealloc(*argv, sizeof(robj *) * (*argv_len));
+                }
             }
 
             /* Check that what follows argv is a real \r\n */
@@ -6488,7 +6507,7 @@ static void backupAndUpdateClientArgv(client *c, int new_argc, robj **new_argv) 
         for (int i = 0; i < old_argc; i++) {
             if (old_argv[i]) decrRefCount(old_argv[i]);
         }
-        zfree(old_argv);
+        if (old_argv != c->argv_inline) zfree(old_argv);
     }
 }
 

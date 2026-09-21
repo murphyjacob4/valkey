@@ -1389,6 +1389,8 @@ typedef struct LastWrittenBuf {
 /* Forward declaration of slotMigrationJob */
 typedef struct slotMigrationJob slotMigrationJob;
 
+#define ARGV_INLINE_MAX 12 /* covers SET k v EX n XX GET, HSET h f v, ZADD z s m, ... */
+
 typedef struct client {
     /* Basic client information and connection. */
     uint64_t id; /* Client incremental unique ID. */
@@ -1404,6 +1406,7 @@ typedef struct client {
     int argc;            /* Num of arguments of current command. */
     int argv_len;        /* Size of argv array (may be more than argc) */
     size_t argv_len_sum; /* Sum of lengths of objects in argv list. */
+    robj *argv_inline[ARGV_INLINE_MAX]; /* Inline argv pointer array to avoid zmalloc */
     int reqtype;         /* Request protocol type: PROTO_REQ_* */
     int multibulklen;    /* Number of multi bulk arguments left to read. */
     long bulklen;        /* Length of bulk argument in multi bulk request. */

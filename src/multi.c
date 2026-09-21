@@ -110,8 +110,14 @@ void queueMultiCommand(client *c, uint64_t cmd_flags) {
     mc = c->mstate->commands + c->mstate->count;
     mc->cmd = c->cmd;
     mc->argc = c->argc;
-    mc->argv = c->argv;
-    mc->argv_len = c->argv_len;
+    if (c->argv == c->argv_inline) {
+        mc->argv = zmalloc(sizeof(robj *) * c->argc);
+        memcpy(mc->argv, c->argv_inline, sizeof(robj *) * c->argc);
+        mc->argv_len = c->argc;
+    } else {
+        mc->argv = c->argv;
+        mc->argv_len = c->argv_len;
+    }
     mc->slot = c->slot;
 
     if (mc->cmd->get_dbid_args && mc->cmd->proc == selectCommand) {
