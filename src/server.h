@@ -1268,7 +1268,6 @@ typedef struct ClientFlags {
     uint64_t keyspace_notified : 1;        /* Indicates that a keyspace notification was triggered during the execution of the
                                               current command. */
     uint64_t argv_borrowed : 1;            /* The argv array and its elements are borrowed from the caller (VM_CallArgv) and must not be freed. */
-    uint64_t argv_sliced : 1;              /* Current argv elements are borrowed slices and must not be retained via incrRefCount. */
     uint64_t throttled : 1;                /* Currently queued in a throttler */
     uint64_t throttle_checked : 1;         /* Already passed throttle check for this command */
     uint64_t throttle_multi : 1;           /* Matches multiple throttlers */
@@ -1360,6 +1359,8 @@ typedef struct ClientModuleData {
 } ClientModuleData;
 
 #define ARGV_INLINE_MAX 12 /* covers SET k v EX n XX GET, HSET h f v, ZADD z s m, ... */
+static_assert(sizeof(struct sdshdr8) == 3, "sdshdr8 size mismatch");
+static_assert(sizeof(struct sdshdr16) == 5, "sdshdr16 size mismatch");
 
 /* Parser state and parse result of a command from a client's input buffer. */
 typedef struct parsedCommand {

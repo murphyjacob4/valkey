@@ -3858,7 +3858,7 @@ int VM_Replicate(ValkeyModuleCtx *ctx, const char *cmdname, const char *fmt, ...
  *
  * The function always returns VALKEYMODULE_OK. */
 int VM_ReplicateVerbatim(ValkeyModuleCtx *ctx) {
-    if (ctx->client->flag.argv_sliced) clientPromoteArgv(ctx->client);
+    if (ctx->client->argv_slice_mask) clientPromoteArgv(ctx->client);
     alsoPropagate(ctx->client->db->id, ctx->client->argv, ctx->client->argc, PROPAGATE_AOF | PROPAGATE_REPL, ctx->client->slot);
     server.dirty++;
     return VALKEYMODULE_OK;

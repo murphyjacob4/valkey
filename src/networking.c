@@ -2150,13 +2150,9 @@ void freeClientOriginalArgv(client *c) {
         return;
     }
 
-    if (c->original_argv != c->argv_inline) {
-        if (tryOffloadFreeArgvToIOThreads(c, c->original_argc, c->original_argv) == C_ERR) {
-            for (int j = 0; j < c->original_argc; j++) decrRefCount(c->original_argv[j]);
-            zfree(c->original_argv);
-        }
-    } else {
+    if (c->original_argv == c->argv_inline || tryOffloadFreeArgvToIOThreads(c, c->original_argc, c->original_argv) == C_ERR) {
         for (int j = 0; j < c->original_argc; j++) decrRefCount(c->original_argv[j]);
+        if (c->original_argv != c->argv_inline) zfree(c->original_argv);
     }
 
     c->original_argv = NULL;
@@ -2169,7 +2165,7 @@ void freeClientArgv(client *c) {
         goto clear;
     }
 
-    if (c->flag.argv_sliced) {
+    if (c->argv_slice_mask) {
         for (int j = 0; j < c->argc; j++) {
             if (c->argv_slice_mask & (1U << j)) {
                 if (c->argv_slice_sds[j]) {
@@ -2183,19 +2179,14 @@ void freeClientArgv(client *c) {
         }
         serverAssert(c->argv_slice_mask == 0);
         if (c->argv != c->argv_inline) zfree(c->argv);
-        c->flag.argv_sliced = 0;
         goto clear;
     }
 
     /* If original_argv exists, 'c->argv' was allocated by the main thread,
      * so it's more efficient to free it directly here rather than offloading to IO threads */
-    if (c->argv != c->argv_inline) {
-        if (c->original_argv || tryOffloadFreeArgvToIOThreads(c, c->argc, c->argv) == C_ERR) {
-            for (int j = 0; j < c->argc; j++) decrRefCount(c->argv[j]);
-            zfree(c->argv);
-        }
-    } else {
+    if (c->argv == c->argv_inline || c->original_argv || tryOffloadFreeArgvToIOThreads(c, c->argc, c->argv) == C_ERR) {
         for (int j = 0; j < c->argc; j++) decrRefCount(c->argv[j]);
+        if (c->argv != c->argv_inline) zfree(c->argv);
     }
 clear:
     c->argc = 0;
@@ -2606,9 +2597,6 @@ void beforeNextClient(client *c) {
             c->repl_data->repl_applied = 0;
         }
     }
-    /* Note: For regular clients, trimming is performed on-demand in readToQueryBuf()
-     * before reading the next chunk of network data. This avoids costly memory moves
-     * on the main thread during request processing. */
     /* Handle async frees */
     /* Note: this doesn't make the server.clients_to_close list redundant because of
      * cases where we want an async free of a client other than myself. For example
@@ -3796,6 +3784,8 @@ void resetClient(client *c) {
 
     freeClientArgv(c);
     freeClientOriginalArgv(c);
+    /* When debug assert is enabled, poison the argv slices and the consumed querybuf
+     * to quickly catch bugs where slices are used beyond their lifecycle. */
     if (server.enable_debug_assert) {
         memset(c->argv_slice, 0xA5, sizeof(c->argv_slice));
     }
@@ -4020,6 +4010,11 @@ static void setProtocolError(const char *errstr, client *c) {
     c->flag.protocol_error = 1;
 }
 
+/* When the command queue is reallocated, internal pointers within parsedCommand
+ * structures (specifically cmd->argv pointing to cmd->argv_inline, and cmd->argv[j]
+ * pointing to cmd->argv_slice[j]) will still point to the old buffer location.
+ * This function fixes up those self-referential pointers to point to the newly
+ * allocated parsedCommand array. */
 static void fixupCommandQueuePointers(cmdQueue *queue, parsedCommand *old_cmds) {
     if (old_cmds == NULL || queue->cmds == old_cmds) return;
     for (int i = 0; i < queue->len; i++) {
@@ -4033,6 +4028,17 @@ static void fixupCommandQueuePointers(cmdQueue *queue, parsedCommand *old_cmds) 
             }
         }
     }
+}
+
+/* Reallocates the command queue array and updates internal pointers.
+ * When we realloc the command queue, argv slices and inline argv pointers
+ * will still point to the old command queue elements from the previous
+ * allocation. Fix those now. */
+static void reallocCommandQueue(cmdQueue *queue, uint16_t new_cap) {
+    queue->cap = new_cap;
+    parsedCommand *old_cmds = queue->cmds;
+    queue->cmds = zrealloc(queue->cmds, new_cap * sizeof(parsedCommand));
+    fixupCommandQueuePointers(queue, old_cmds);
 }
 
 /* Process the query buffer for client 'c', setting up the client argument
@@ -4074,9 +4080,7 @@ void parseMultibulkBuffer(client *c) {
             } else {
                 break; /* Limit the length of the command queue. */
             }
-            parsedCommand *old_cmds = queue->cmds;
-            queue->cmds = zrealloc(queue->cmds, queue->cap * sizeof(parsedCommand));
-            fixupCommandQueuePointers(queue, old_cmds);
+            reallocCommandQueue(queue, queue->cap);
         }
         parsedCommand *p = &queue->cmds[queue->len++];
         memset(p, 0, sizeof(*p));
@@ -4103,10 +4107,6 @@ void parseMultibulkBuffer(client *c) {
  * command. If non-zero is returned, the returned value is a read flag, either
  * READ_FLAGS_PARSING_COMPLETED on success or one of the READ_FLAGS_ERROR_(...)
  * values on parse error. */
-static_assert(sizeof(struct sdshdr8) == 3, "sdshdr8 size mismatch");
-static_assert(sizeof(struct sdshdr16) == 5, "sdshdr16 size mismatch");
-
-
 static int parseMultibulk(client *c,
                           int *argc,
                           robj ***argv,
@@ -4339,9 +4339,6 @@ static int parseMultibulk(client *c,
                 slice_sds_arr[slice_idx] = NULL;
                 initStaticStringObject(slice_arr[slice_idx], val_sds);
                 *slice_mask_ptr |= (1U << slice_idx);
-                if (p == NULL) {
-                    c->flag.argv_sliced = 1;
-                }
                 (*argv)[(*argc)++] = &slice_arr[slice_idx];
                 *argv_len_sum += c->bulklen;
                 c->qb_pos += c->bulklen + 2;
@@ -4538,10 +4535,7 @@ void trimCommandQueue(client *c) {
             serverAssert(cap >= queue->len);
             cap = max(cap, COMMAND_QUEUE_MIN_CAPACITY);
             if (cap < queue->cap) {
-                queue->cap = cap;
-                parsedCommand *old_cmds = queue->cmds;
-                queue->cmds = zrealloc(queue->cmds, cap * sizeof(parsedCommand));
-                fixupCommandQueuePointers(queue, old_cmds);
+                reallocCommandQueue(queue, cap);
             }
         }
     }
@@ -4607,14 +4601,12 @@ static bool consumeCommandQueue(client *c) {
     }
 
     if (p->argv_slice_mask != 0) {
-        c->flag.argv_sliced = 1;
         c->argv_slice_mask = p->argv_slice_mask;
         for (int j = 0; j < ARGV_INLINE_MAX; j++) {
             c->argv_slice_sds[j] = p->argv_slice_sds[j];
             p->argv_slice_sds[j] = NULL;
         }
     } else {
-        c->flag.argv_sliced = 0;
         c->argv_slice_mask = 0;
     }
 
@@ -4777,7 +4769,7 @@ int processInputBuffer(client *c) {
             continue;
         } else if (res != PARSE_OK) {
             /* Parse error or partial command. */
-            if (c->flag.argv_sliced) clientPromoteArgv(c);
+            if (c->argv_slice_mask) clientPromoteArgv(c);
             break;
         }
 
@@ -6570,7 +6562,7 @@ robj *clientRetainArg(client *c, int i) {
 
 /* Promote all slices in client to heap objects, ensuring no slices remain. */
 void clientPromoteArgv(client *c) {
-    if (c->flag.argv_sliced) {
+    if (c->argv_slice_mask) {
         for (int i = 0; i < c->argc; i++) {
             if (c->argv_slice_mask & (1U << i)) {
                 robj *slice = c->argv[i];
@@ -6584,7 +6576,6 @@ void clientPromoteArgv(client *c) {
             }
         }
         serverAssert(c->argv_slice_mask == 0);
-        c->flag.argv_sliced = 0;
     }
 
     if (c->argv == c->argv_inline) {
@@ -6647,7 +6638,7 @@ static void backupAndUpdateClientArgv(client *c, int new_argc, robj **new_argv) 
 
         for (int i = 0; i < old_argc && i < new_argc; i++) {
             c->argv[i] = old_argv[i];
-            if (!c->flag.argv_sliced || !(c->argv_slice_mask & (1U << i))) {
+            if (!(c->argv_slice_mask & (1U << i))) {
                 incrRefCount(c->argv[i]);
             }
         }
@@ -6665,7 +6656,7 @@ static void backupAndUpdateClientArgv(client *c, int new_argc, robj **new_argv) 
     if (c->argv != old_argv && c->original_argv != old_argv) {
         for (int i = 0; i < old_argc; i++) {
             if (old_argv[i]) {
-                if (!c->flag.argv_sliced || !(c->argv_slice_mask & (1U << i))) {
+                if (!(c->argv_slice_mask & (1U << i))) {
                     decrRefCount(old_argv[i]);
                 }
             }
@@ -6721,7 +6712,7 @@ void rewriteClientCommandVector(client *c, int argc, ...) {
 
 /* Completely replace the client command vector with the provided one. */
 void replaceClientCommandVector(client *c, int argc, robj **argv) {
-    if (c->flag.argv_sliced) clientPromoteArgv(c);
+    if (c->argv_slice_mask) clientPromoteArgv(c);
     backupAndUpdateClientArgv(c, argc, argv);
     c->argv_len_sum = 0;
     c->flag.buffered_reply = 0;
@@ -6759,13 +6750,12 @@ void rewriteClientCommandArgument(client *c, int i, robj *newval) {
     }
     c->argv[i] = newval;
     if (oldval) {
-        if (c->flag.argv_sliced && (c->argv_slice_mask & (1U << i))) {
+        if (c->argv_slice_mask & (1U << i)) {
             c->argv_slice_mask &= ~(1U << i);
             if (c->argv_slice_sds[i]) {
                 sdsfree(c->argv_slice_sds[i]);
                 c->argv_slice_sds[i] = NULL;
             }
-            if (c->argv_slice_mask == 0) c->flag.argv_sliced = 0;
         } else {
             decrRefCount(oldval);
         }

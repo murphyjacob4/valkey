@@ -4218,7 +4218,7 @@ void call(client *c, int flags) {
     uint32_t *debug_argv_refcount = NULL;
     uint32_t debug_slice_mask = 0;
     int debug_argv_borrowed = c->flag.argv_borrowed;
-    int debug_argv_sliced = c->flag.argv_sliced;
+    int debug_argv_sliced = (c->argv_slice_mask != 0);
     if ((debug_argv_borrowed || debug_argv_sliced) && server.enable_debug_assert) {
         debug_argc_clone = c->original_argv ? c->original_argc : c->argc;
         debug_argv_clone = zmalloc(sizeof(robj *) * debug_argc_clone);
@@ -4241,7 +4241,7 @@ void call(client *c, int flags) {
         }
         serverAssert(argc == debug_argc_clone);
         for (int i = 0; i < debug_argc_clone; i++) {
-            int should_check = debug_argv_borrowed || (c->flag.argv_sliced && (debug_slice_mask & (1U << i)));
+            int should_check = debug_argv_borrowed || (c->argv_slice_mask && (debug_slice_mask & (1U << i)));
             if (should_check) {
                 if (argv[i] != debug_argv_clone[i]) {
                     serverLog(LL_WARNING, "Debug: command %s modified argv[%d]", c->cmd->current_name, i);
@@ -4627,7 +4627,6 @@ static void prepareCommandGeneric(robj **argv, int argc, int *read_flags, struct
 void prepareCommand(client *c) {
     prepareCommandGeneric(c->argv, c->argc, &c->read_flags, &c->parsed_cmd, &c->slot,
                           &c->argv_slice_mask, c->argv_slice_sds);
-    if (c->argv_slice_mask == 0) c->flag.argv_sliced = 0;
 }
 
 /* Prepare all parsed commands in the client's queue. See prepareCommand(). */

@@ -2072,7 +2072,7 @@ void streamRewriteStripLimit(client *c, int limit_idx) {
     c->argv_len_sum -= getStringObjectLen(limit_tok);
     c->argv_len_sum -= getStringObjectLen(limit_val);
 
-    if (c->flag.argv_sliced) {
+    if (c->argv_slice_mask) {
         if (c->argv_slice_mask & (1U << limit_idx)) {
             if (c->argv_slice_sds[limit_idx]) {
                 sdsfree(c->argv_slice_sds[limit_idx]);
@@ -2101,20 +2101,19 @@ void streamRewriteStripLimit(client *c, int limit_idx) {
         memmove(&c->argv[limit_idx],
                 &c->argv[limit_idx + 2],
                 sizeof(robj *) * tail);
-        if (c->flag.argv_sliced) {
+        if (c->argv_slice_mask) {
             memmove(&c->argv_slice_sds[limit_idx],
                     &c->argv_slice_sds[limit_idx + 2],
                     sizeof(sds) * tail);
         }
     }
 
-    if (c->flag.argv_sliced) {
+    if (c->argv_slice_mask) {
         uint32_t low_mask = c->argv_slice_mask & ((1U << limit_idx) - 1);
         uint32_t high_mask = (c->argv_slice_mask >> (limit_idx + 2)) << limit_idx;
         c->argv_slice_mask = low_mask | high_mask;
         c->argv_slice_sds[c->argc - 2] = NULL;
         c->argv_slice_sds[c->argc - 1] = NULL;
-        if (c->argv_slice_mask == 0) c->flag.argv_sliced = 0;
     }
 
     c->argc -= 2;
