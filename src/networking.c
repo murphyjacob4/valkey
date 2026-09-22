@@ -2190,6 +2190,7 @@ void freeClientArgv(client *c) {
         c->flag.argv_sliced = 0;
         if (thread_shared_qb_pinned_by == c) {
             thread_shared_qb_pinned_by = NULL;
+            sdsclear(thread_shared_qb);
         }
         goto clear;
     }
@@ -2569,6 +2570,9 @@ void resetSharedQueryBuf(client *c) {
     if (remaining > 0) {
         /* Let the client take ownership of the shared buffer. */
         initSharedQueryBuf();
+        if (thread_shared_qb_pinned_by == c) {
+            thread_shared_qb_pinned_by = NULL;
+        }
         return;
     }
 
@@ -2580,6 +2584,7 @@ void resetSharedQueryBuf(client *c) {
 
 /* Trims the client query buffer to the current position. */
 void trimClientQueryBuffer(client *c) {
+    serverAssert(c->argv_slices_live == 0);
     if (c->querybuf == thread_shared_qb) {
         resetSharedQueryBuf(c);
     }
@@ -3825,6 +3830,12 @@ void resetClient(client *c) {
         memset(c->argv_slice, 0xA5, sizeof(c->argv_slice));
     }
     serverAssert(c->argv_slices_live == 0);
+    if (server.argv_slices_debug == ARGV_SLICES_DEBUG_POISON && c->querybuf && c->qb_pos > 0) {
+        memset(c->querybuf, 0xA5, c->qb_pos);
+    }
+    if (c->querybuf == thread_shared_qb && thread_shared_qb_pinned_by == NULL) {
+        resetSharedQueryBuf(c);
+    }
     c->redact_arg_bitmap = 0;
     c->cur_script = NULL;
     c->net_input_bytes_curr_cmd = 0;
@@ -4118,6 +4129,43 @@ void parseMultibulkBuffer(client *c) {
  * command. If non-zero is returned, the returned value is a read flag, either
  * READ_FLAGS_PARSING_COMPLETED on success or one of the READ_FLAGS_ERROR_(...)
  * values on parse error. */
+static_assert(sizeof(struct sdshdr8) == 3, "sdshdr8 size mismatch");
+static_assert(sizeof(struct sdshdr16) == 5, "sdshdr16 size mismatch");
+
+static int isCommandAllowlistedForSlicing(const char *name, size_t len) {
+    switch (len) {
+    case 3:
+        if (!strncasecmp(name, "get", 3) ||
+            !strncasecmp(name, "set", 3) ||
+            !strncasecmp(name, "del", 3) ||
+            !strncasecmp(name, "ttl", 3)) return 1;
+        break;
+    case 4:
+        if (!strncasecmp(name, "incr", 4) ||
+            !strncasecmp(name, "decr", 4) ||
+            !strncasecmp(name, "type", 4) ||
+            !strncasecmp(name, "mget", 4) ||
+            !strncasecmp(name, "hget", 4) ||
+            !strncasecmp(name, "hset", 4) ||
+            !strncasecmp(name, "sadd", 4) ||
+            !strncasecmp(name, "zadd", 4)) return 1;
+        break;
+    case 5:
+        if (!strncasecmp(name, "lpush", 5) ||
+            !strncasecmp(name, "rpush", 5)) return 1;
+        break;
+    case 6:
+        if (!strncasecmp(name, "exists", 6) ||
+            !strncasecmp(name, "expire", 6) ||
+            !strncasecmp(name, "zscore", 6)) return 1;
+        break;
+    case 9:
+        if (!strncasecmp(name, "sismember", 9)) return 1;
+        break;
+    }
+    return 0;
+}
+
 static int parseMultibulk(client *c,
                           int *argc,
                           robj ***argv,
@@ -4264,6 +4312,7 @@ static int parseMultibulk(client *c,
                  * ll+2, trimming querybuf is just a waste of time, because
                  * at this time the querybuf contains not only our bulk. */
                 if (sdslen(c->querybuf) - c->qb_pos <= (size_t)ll + 2) {
+                    clientPromoteArgv(c);
                     if (c->querybuf == thread_shared_qb) {
                         /* Let the client take the ownership of the shared buffer. */
                         initSharedQueryBuf();
@@ -4308,6 +4357,20 @@ static int parseMultibulk(client *c,
                 return READ_FLAGS_ERROR_INVALID_CRLF;
             }
 
+            /* Check slicing eligibility for this argument */
+            size_t hdr_size = (c->bulklen <= 255) ? sizeof(struct sdshdr8) : sizeof(struct sdshdr16);
+            int can_slice = 0;
+            if (server.argv_slices_enabled && inMainThread() && argv == &c->argv &&
+                !is_replicated && c->id != CLIENT_ID_AOF && !c->flag.multi &&
+                *argc < ARGV_INLINE_MAX && (size_t)c->bulklen < PROTO_MBULK_BIG_ARG &&
+                c->qb_pos >= hdr_size) {
+                if (*argc == 0) {
+                    can_slice = 1;
+                } else if (isCommandAllowlistedForSlicing(objectGetVal((*argv)[0]), sdslen(objectGetVal((*argv)[0])))) {
+                    can_slice = 1;
+                }
+            }
+
             /* Optimization: if a non-replicated client's buffer contains JUST our bulk element
              * instead of creating a new object by *copying* the sds we
              * just use the current sds string. */
@@ -4320,16 +4383,41 @@ static int parseMultibulk(client *c,
                  * likely... */
                 c->querybuf = sdsnewlen(SDS_NOINIT, c->bulklen + 2);
                 sdsclear(c->querybuf);
-            } else if (server.argv_slices_enabled && argv == &c->argv && *argc == 0) {
-                /* Phase 2: slice argv[0] only (command name) */
-                sds val_sds = sdsnewlen(c->querybuf + c->qb_pos, c->bulklen);
-                initStaticStringObject(c->argv_slice[0], val_sds);
-                c->argv_slice_sds[0] = val_sds;
-                c->argv_slice_mask |= (1U << 0);
+            } else if (can_slice) {
+                int slice_idx = *argc;
+                char *payload = c->querybuf + c->qb_pos;
+                sds val_sds;
+                if (server.argv_slices_debug == ARGV_SLICES_DEBUG_HEAP_PER_SLICE) {
+                    val_sds = sdsnewlen(payload, c->bulklen);
+                    c->argv_slice_sds[slice_idx] = val_sds;
+                } else {
+                    if (c->bulklen <= 255) {
+                        struct sdshdr8 *sh = (struct sdshdr8 *)(payload - sizeof(struct sdshdr8));
+                        sh->len = c->bulklen;
+                        sh->alloc = c->bulklen;
+                        sh->flags = SDS_TYPE_8;
+                        payload[c->bulklen] = '\0';
+                        val_sds = payload;
+                    } else {
+                        struct sdshdr16 *sh = (struct sdshdr16 *)(payload - sizeof(struct sdshdr16));
+                        sh->len = c->bulklen;
+                        sh->alloc = c->bulklen;
+                        sh->flags = SDS_TYPE_16;
+                        payload[c->bulklen] = '\0';
+                        val_sds = payload;
+                    }
+                    c->argv_slice_sds[slice_idx] = NULL;
+                }
+                initStaticStringObject(c->argv_slice[slice_idx], val_sds);
+                c->argv_slice_mask |= (1U << slice_idx);
                 c->argv_slices_live++;
                 c->flag.argv_sliced = 1;
+                if (c->querybuf == thread_shared_qb) {
+                    thread_shared_qb_pinned_by = c;
+                }
                 atomic_fetch_add_explicit(&server.argv_slices_total, 1, memory_order_relaxed);
-                (*argv)[(*argc)++] = &c->argv_slice[0];
+                atomic_fetch_add_explicit(&server.argv_alloc_avoided_total, 1, memory_order_relaxed);
+                (*argv)[(*argc)++] = &c->argv_slice[slice_idx];
                 *argv_len_sum += c->bulklen;
                 c->qb_pos += c->bulklen + 2;
             } else {
@@ -4727,6 +4815,7 @@ int processInputBuffer(client *c) {
             continue;
         } else if (res != PARSE_OK) {
             /* Parse error or partial command. */
+            if (c->flag.argv_sliced) clientPromoteArgv(c);
             break;
         }
 
@@ -4794,8 +4883,15 @@ static bool readToQueryBuf(client *c) {
     }
 
     if (c->querybuf == NULL) {
-        serverAssert(sdslen(thread_shared_qb) == 0);
-        c->querybuf = big_arg ? sdsempty() : thread_shared_qb;
+        if (!big_arg && (thread_shared_qb_pinned_by == NULL || thread_shared_qb_pinned_by == c)) {
+            serverAssert(sdslen(thread_shared_qb) == 0);
+            c->querybuf = thread_shared_qb;
+        } else {
+            if (!big_arg && thread_shared_qb_pinned_by != NULL && thread_shared_qb_pinned_by != c) {
+                atomic_fetch_add_explicit(&server.argv_shared_qb_pin_conflicts, 1, memory_order_relaxed);
+            }
+            c->querybuf = sdsempty();
+        }
         qblen = sdslen(c->querybuf);
     }
 
@@ -4820,7 +4916,10 @@ static bool readToQueryBuf(client *c) {
         /* Read as much as possible from the socket to save read(2) system calls. */
         readlen = sdsavail(c->querybuf);
     }
-    if (use_thread_shared_qb) serverAssert(c->querybuf == thread_shared_qb);
+    if (use_thread_shared_qb) {
+        serverAssert(c->querybuf == thread_shared_qb);
+        serverAssert(thread_shared_qb_pinned_by == NULL || thread_shared_qb_pinned_by == c);
+    }
 
     c->nread = connRead(c->conn, c->querybuf + qblen, readlen);
     if (c->nread <= 0) {
@@ -5047,8 +5146,8 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
             " ssub=%i", client->pubsub_data ? (int)hashtableSize(client->pubsub_data->pubsubshard_channels) : 0,
             " multi=%i", client->mstate ? client->mstate->count : -1,
             " watch=%i", client->mstate ? (int)listLength(&client->mstate->watched_keys) : 0,
-            " qbuf=%U", client->querybuf ? (unsigned long long)sdslen(client->querybuf) : 0,
-            " qbuf-free=%U", client->querybuf ? (unsigned long long)sdsavail(client->querybuf) : 0,
+            " qbuf=%U", (client->querybuf && client->querybuf != thread_shared_qb) ? (unsigned long long)sdslen(client->querybuf) : 0,
+            " qbuf-free=%U", (client->querybuf && client->querybuf != thread_shared_qb) ? (unsigned long long)sdsavail(client->querybuf) : 0,
             " argv-mem=%U", (unsigned long long)client->argv_len_sum,
             " multi-mem=%U", client->mstate ? (unsigned long long)client->mstate->argv_len_sums : 0,
             " rbs=%U", (unsigned long long)client->buf_usable_size,
@@ -6553,7 +6652,7 @@ void clientPromoteArgv(client *c) {
     for (int i = queue->off; i < queue->len; i++) {
         parsedCommand *p = &queue->cmds[i];
         for (int j = 0; j < p->argc; j++) {
-            if (p->argv[j]->refcount >= OBJ_FIRST_SPECIAL_REFCOUNT) {
+            if (p->argv[j]->refcount == OBJ_STATIC_REFCOUNT) {
                 robj *old = p->argv[j];
                 p->argv[j] = createRawStringObject(objectGetVal(old), sdslen(objectGetVal(old)));
                 atomic_fetch_add_explicit(&server.argv_promotions_total, 1, memory_order_relaxed);
@@ -6652,8 +6751,12 @@ void rewriteClientCommandVector(client *c, int argc, ...) {
         robj *a;
 
         a = va_arg(ap, robj *);
+        if (a->refcount == OBJ_STATIC_REFCOUNT) {
+            a = createRawStringObject(objectGetVal(a), sdslen(objectGetVal(a)));
+        } else {
+            incrRefCount(a);
+        }
         argv[j] = a;
-        incrRefCount(a);
     }
     replaceClientCommandVector(c, argc, argv);
     va_end(ap);
@@ -6688,9 +6791,15 @@ void rewriteClientCommandArgument(client *c, int i, robj *newval) {
 
     oldval = c->argv[i];
     if (oldval) c->argv_len_sum -= getStringObjectLen(oldval);
-    if (newval) c->argv_len_sum += getStringObjectLen(newval);
+    if (newval) {
+        c->argv_len_sum += getStringObjectLen(newval);
+        if (newval->refcount == OBJ_STATIC_REFCOUNT) {
+            newval = createRawStringObject(objectGetVal(newval), sdslen(objectGetVal(newval)));
+        } else {
+            incrRefCount(newval);
+        }
+    }
     c->argv[i] = newval;
-    incrRefCount(newval);
     if (oldval) decrRefCount(oldval);
 
     /* If this is the command name make sure to fix c->cmd. */

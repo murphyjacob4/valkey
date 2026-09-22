@@ -154,6 +154,9 @@ void setGenericCommand(client *c,
     if (is_sliced || c->flag.argv_borrowed) {
         val = clientRetainArg(c, val_idx);
     }
+    if (is_sliced) {
+        val = tryObjectEncoding(val);
+    }
     setKey(c, c->db, key, &val, setkey_flags);
     if (expire) val = setExpire(c, c->db, key, milliseconds);
 
@@ -454,6 +457,7 @@ void getsetCommand(client *c) {
     int is_sliced = (c->argv_slice_mask & (1U << 2)) != 0;
     if (is_sliced) {
         val = clientRetainArg(c, 2);
+        val = tryObjectEncoding(val);
         setKey(c, c->db, c->argv[1], &val, 0);
     } else if (c->flag.argv_borrowed) {
         /* If the client does not own the argv, we need to ensure that the value
@@ -616,6 +620,7 @@ void msetGenericCommand(client *c, int nx) {
         int is_sliced = (c->argv_slice_mask & (1U << (j + 1))) != 0;
         if (is_sliced) {
             val = clientRetainArg(c, j + 1);
+            val = tryObjectEncoding(val);
             setKey(c, c->db, c->argv[j], &val, setkey_flags);
         } else if (c->flag.argv_borrowed) {
             /* If the client does not own the argv, we need to ensure that the value
@@ -715,6 +720,7 @@ void msetexCommand(client *c) {
         int is_sliced = (c->argv_slice_mask & (1U << (j + 1))) != 0;
         if (is_sliced) {
             val = clientRetainArg(c, j + 1);
+            val = tryObjectEncoding(val);
             setKey(c, c->db, key, &val, setkey_flags);
             if (expire) val = setExpire(c, c->db, key, milliseconds);
         } else if (c->flag.argv_borrowed) {
@@ -1019,6 +1025,7 @@ void appendCommand(client *c) {
         int is_sliced = (c->argv_slice_mask & (1U << 2)) != 0;
         if (is_sliced) {
             val = clientRetainArg(c, 2);
+            val = tryObjectEncoding(val);
             dbAdd(c->db, c->argv[1], &val);
             totlen = stringObjectLen(val);
         } else if (c->flag.argv_borrowed) {

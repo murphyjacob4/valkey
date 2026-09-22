@@ -564,15 +564,17 @@ static void signalKeyAsReadyLogic(serverDb *db, robj *key, int type, int deleted
         if (dictFind(db->blocking_keys, key) == NULL) return;
     }
 
+    if (key->refcount == OBJ_STATIC_REFCOUNT) {
+        key = createRawStringObject(objectGetVal(key), sdslen(objectGetVal(key)));
+    } else {
+        incrRefCount(key);
+    }
+
     dictEntry *de, *existing;
     de = dictAddRaw(db->ready_keys, key, &existing);
-    if (de) {
-        /* We add the key in the db->ready_keys dictionary in order
-         * to avoid adding it multiple times into a list with a simple O(1)
-         * check. */
-        incrRefCount(key);
-    } else {
+    if (!de) {
         /* Key was already signaled? No need to queue it again. */
+        decrRefCount(key);
         return;
     }
 
