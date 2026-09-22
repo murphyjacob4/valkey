@@ -4307,17 +4307,6 @@ static int parseMultibulk(client *c,
                              *argc < ARGV_INLINE_MAX && (size_t)c->bulklen < PROTO_MBULK_BIG_ARG &&
                              c->qb_pos >= hdr_size);
 
-            /* Command-aware optimization: for SET, the value argument (argc == 2)
-             * will be retained into the database. Constructing an owned heap robj
-             * directly during parsing allows IO threads to offload this allocation
-             * and avoids slice-then-retain overhead on the main thread. */
-            if (can_slice && *argc == 2 && (*argv)[0] != NULL) {
-                sds cmdname = objectGetVal((*argv)[0]);
-                if (sdslen(cmdname) == 3 && !strcasecmp(cmdname, "set")) {
-                    can_slice = 0;
-                }
-            }
-
             /* Optimization: if a non-replicated client's buffer contains JUST our bulk element
              * instead of creating a new object by *copying* the sds we
              * just use the current sds string. */

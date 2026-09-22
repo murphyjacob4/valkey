@@ -39,6 +39,11 @@
                 }
             }
         ],
+        "retained_args": {
+            "first": 2,
+            "last": -1,
+            "step": 2
+        },
         "reply_schema": {
             "const": "OK"
         },

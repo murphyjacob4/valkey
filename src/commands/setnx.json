@@ -36,6 +36,11 @@
                 }
             }
         ],
+        "retained_args": {
+            "first": 2,
+            "last": 2,
+            "step": 1
+        },
         "reply_schema": {
             "oneOf": [
                 {

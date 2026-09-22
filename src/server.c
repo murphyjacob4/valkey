@@ -4581,7 +4581,8 @@ uint64_t getCommandFlags(client *c) {
  * processing, including looking up the command, checking arity and calculating
  * cluster slot. This should be done before calling processCommand() and can be
  * done by I/O threads to offload the main-thread. */
-static void prepareCommandGeneric(robj **argv, int argc, int *read_flags, struct serverCommand **cmd, int *slot) {
+static void prepareCommandGeneric(robj **argv, int argc, int *read_flags, struct serverCommand **cmd, int *slot,
+                                  uint32_t *slice_mask, uint32_t *slices_live, sds *slice_sds) {
     if (!(*read_flags & READ_FLAGS_PARSING_COMPLETED) || argc == 0) return;
     /* Make sure we don't do this twice. */
     debugServerAssert(*cmd == NULL && !(*read_flags & READ_FLAGS_COMMAND_NOT_FOUND));
@@ -4590,17 +4591,42 @@ static void prepareCommandGeneric(robj **argv, int argc, int *read_flags, struct
         *read_flags |= READ_FLAGS_COMMAND_NOT_FOUND;
     } else if (!commandCheckArity(*cmd, argc, NULL)) {
         *read_flags |= READ_FLAGS_BAD_ARITY;
-    } else if (server.cluster_enabled) {
-        debugServerAssert(*slot == -1 &&
-                          !(*read_flags & READ_FLAGS_CROSSSLOT) &&
-                          !(*read_flags & READ_FLAGS_NO_KEYS));
-        *slot = clusterSlotByCommand(*cmd, argv, argc, read_flags);
+    } else {
+        /* If the command has retained argument hints and arguments were sliced,
+         * promote those specific arguments from ephemeral stack slices to owned heap robjs.
+         * Doing this during prepareCommand offloads allocation to worker IO threads and
+         * avoids slice-then-retain overhead on the main thread. */
+        if ((*cmd)->retained_first > 0 && slices_live && *slices_live > 0 && slice_mask) {
+            int first = (*cmd)->retained_first;
+            int last = ((*cmd)->retained_last < 0) ? (argc - 1) : (*cmd)->retained_last;
+            int step = (*cmd)->retained_step > 0 ? (*cmd)->retained_step : 1;
+            for (int i = first; i <= last && i < argc; i += step) {
+                if (*slice_mask & (1U << i)) {
+                    robj *slice = argv[i];
+                    argv[i] = createStringObject(objectGetVal(slice), sdslen(objectGetVal(slice)));
+                    if (slice_sds && slice_sds[i]) {
+                        sdsfree(slice_sds[i]);
+                        slice_sds[i] = NULL;
+                    }
+                    *slice_mask &= ~(1U << i);
+                    (*slices_live)--;
+                }
+            }
+        }
+        if (server.cluster_enabled) {
+            debugServerAssert(*slot == -1 &&
+                              !(*read_flags & READ_FLAGS_CROSSSLOT) &&
+                              !(*read_flags & READ_FLAGS_NO_KEYS));
+            *slot = clusterSlotByCommand(*cmd, argv, argc, read_flags);
+        }
     }
 }
 
 /* Prepare the client's current command. See prepareCommandGeneric(). */
 void prepareCommand(client *c) {
-    prepareCommandGeneric(c->argv, c->argc, &c->read_flags, &c->parsed_cmd, &c->slot);
+    prepareCommandGeneric(c->argv, c->argc, &c->read_flags, &c->parsed_cmd, &c->slot,
+                          &c->argv_slice_mask, &c->argv_slices_live, c->argv_slice_sds);
+    if (c->argv_slices_live == 0) c->flag.argv_sliced = 0;
 }
 
 /* Prepare all parsed commands in the client's queue. See prepareCommand(). */
@@ -4611,7 +4637,8 @@ void prepareCommandQueue(client *c) {
     /* Commands in client's command queue. */
     for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
         parsedCommand *p = &c->cmd_queue.cmds[i];
-        prepareCommandGeneric(p->argv, p->argc, &p->read_flags, &p->cmd, &p->slot);
+        prepareCommandGeneric(p->argv, p->argc, &p->read_flags, &p->cmd, &p->slot,
+                              &p->argv_slice_mask, &p->argv_slices_live, p->argv_slice_sds);
     }
 }
 

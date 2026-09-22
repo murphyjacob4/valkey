@@ -111,6 +111,14 @@ following keys. To be safe, assume all of them are optional.
   * `"RESPONSE_POLICY:ONE_SUCCEEDED"`
   * `"RESPONSE_POLICY:SPECIAL"`
 * `"key_specs"`: An array of key specifications. See below.
+* `"retained_args"`: Optional. An object specifying command arguments that are
+  retained as long-lived database objects (e.g., values stored via `setKey`).
+  This serves as an optimization hint for IO threads and command preparation to
+  pre-allocate owned heap objects instead of ephemeral query buffer slices.
+  Contains three keys:
+  * `"first"`: The first argument index in `argv` (1-based, e.g. 2 for `SET`).
+  * `"last"`: The last argument index in `argv`, or -1 if repeating until the end of `argv` (e.g. `MSET`).
+  * `"step"`: The step size between retained arguments (1 for contiguous, 2 for key-value pairs).
 * `"reply_schema"`: A [JSON Schema](https://json-schema.org/) that describes the
   reply of the command. This isn't complete. For example, JSON Schema can't
   distinguish arrays from sets, commands returning a set are declared to return
