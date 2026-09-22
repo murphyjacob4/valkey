@@ -1359,6 +1359,11 @@ typedef struct ClientModuleData {
                                                 * unloaded for cleanup. Opaque for the Server Core.*/
 } ClientModuleData;
 
+#define ARGV_INLINE_MAX 12 /* covers SET k v EX n XX GET, HSET h f v, ZADD z s m, ... */
+#define ARGV_SLICES_DEBUG_NONE 0
+#define ARGV_SLICES_DEBUG_POISON 1
+#define ARGV_SLICES_DEBUG_HEAP_PER_SLICE 2
+
 /* Parser state and parse result of a command from a client's input buffer. */
 typedef struct parsedCommand {
     int read_flags; /* complete, error or 0 (parsing not complete) */
@@ -1369,6 +1374,11 @@ typedef struct parsedCommand {
     size_t argv_len_sum;
     unsigned long long input_bytes;
     struct serverCommand *cmd;
+    robj *argv_inline[ARGV_INLINE_MAX];
+    robj argv_slice[ARGV_INLINE_MAX];
+    sds argv_slice_sds[ARGV_INLINE_MAX];
+    uint32_t argv_slice_mask;
+    uint32_t argv_slices_live;
 } parsedCommand;
 
 /* Queue of parsed commands. */
@@ -1389,11 +1399,6 @@ typedef struct LastWrittenBuf {
 
 /* Forward declaration of slotMigrationJob */
 typedef struct slotMigrationJob slotMigrationJob;
-
-#define ARGV_INLINE_MAX 12 /* covers SET k v EX n XX GET, HSET h f v, ZADD z s m, ... */
-#define ARGV_SLICES_DEBUG_NONE 0
-#define ARGV_SLICES_DEBUG_POISON 1
-#define ARGV_SLICES_DEBUG_HEAP_PER_SLICE 2
 
 typedef struct client {
     /* Basic client information and connection. */

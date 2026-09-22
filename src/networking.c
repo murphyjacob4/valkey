@@ -158,7 +158,8 @@ static int parseMultibulk(client *c,
                           robj ***argv,
                           int *argv_len,
                           size_t *argv_len_sum,
-                          unsigned long long *net_input_bytes_curr_cmd);
+                          unsigned long long *net_input_bytes_curr_cmd,
+                          parsedCommand *p);
 
 int ProcessingEventsWhileBlocked = 0; /* See processEventsWhileBlocked(). */
 _Thread_local sds thread_shared_qb = NULL;
@@ -2189,8 +2190,10 @@ void freeClientArgv(client *c) {
         serverAssert(c->argv_slices_live == 0);
         c->flag.argv_sliced = 0;
         if (thread_shared_qb_pinned_by == c) {
-            thread_shared_qb_pinned_by = NULL;
-            sdsclear(thread_shared_qb);
+            if (c->cmd_queue.off == c->cmd_queue.len) {
+                thread_shared_qb_pinned_by = NULL;
+                sdsclear(thread_shared_qb);
+            }
         }
         goto clear;
     }
@@ -4065,6 +4068,21 @@ static void setProtocolError(const char *errstr, client *c) {
     c->flag.protocol_error = 1;
 }
 
+static void fixupCommandQueuePointers(cmdQueue *queue, parsedCommand *old_cmds) {
+    if (old_cmds == NULL || queue->cmds == old_cmds) return;
+    for (int i = 0; i < queue->len; i++) {
+        parsedCommand *cmd = &queue->cmds[i];
+        if (cmd->argv == old_cmds[i].argv_inline) {
+            cmd->argv = cmd->argv_inline;
+        }
+        for (int j = 0; j < cmd->argc; j++) {
+            if (cmd->argv[j] == &old_cmds[i].argv_slice[j]) {
+                cmd->argv[j] = &cmd->argv_slice[j];
+            }
+        }
+    }
+}
+
 /* Process the query buffer for client 'c', setting up the client argument
  * vector for command execution and parses additional commands into a queue.
  * Sets the client's read_flags to indicate the parsing outcome.
@@ -4074,7 +4092,7 @@ static void setProtocolError(const char *errstr, client *c) {
  * to be '*'. Otherwise, for inline commands parseInlineBuffer() is called. */
 void parseMultibulkBuffer(client *c) {
     int flag = parseMultibulk(c, &c->argc, &c->argv, &c->argv_len,
-                              &c->argv_len_sum, &c->net_input_bytes_curr_cmd);
+                              &c->argv_len_sum, &c->net_input_bytes_curr_cmd, NULL);
     c->read_flags |= flag;
 
     /* Record qb_pos for commandProcessed(). Written unconditionally because a
@@ -4104,12 +4122,16 @@ void parseMultibulkBuffer(client *c) {
             } else {
                 break; /* Limit the length of the command queue. */
             }
+            parsedCommand *old_cmds = queue->cmds;
             queue->cmds = zrealloc(queue->cmds, queue->cap * sizeof(parsedCommand));
+            fixupCommandQueuePointers(queue, old_cmds);
         }
         parsedCommand *p = &queue->cmds[queue->len++];
         memset(p, 0, sizeof(*p));
+        p->argv = p->argv_inline;
+        p->argv_len = ARGV_INLINE_MAX;
         flag = parseMultibulk(c, &p->argc, &p->argv, &p->argv_len,
-                              &p->argv_len_sum, &p->input_bytes);
+                              &p->argv_len_sum, &p->input_bytes, p);
         p->read_flags = flag;
         p->slot = -1;
     }
@@ -4171,12 +4193,18 @@ static int parseMultibulk(client *c,
                           robj ***argv,
                           int *argv_len,
                           size_t *argv_len_sum,
-                          unsigned long long *net_input_bytes_curr_cmd) {
+                          unsigned long long *net_input_bytes_curr_cmd,
+                          parsedCommand *p) {
     char *newline = NULL;
     int ok;
     long long ll;
     int is_replicated = c->read_flags & READ_FLAGS_REPLICATED;
     int auth_required = c->read_flags & READ_FLAGS_AUTH_REQUIRED;
+    robj **argv_inline = (p ? p->argv_inline : c->argv_inline);
+    robj *slice_arr = (p ? p->argv_slice : c->argv_slice);
+    sds *slice_sds_arr = (p ? p->argv_slice_sds : c->argv_slice_sds);
+    uint32_t *slice_mask_ptr = (p ? &p->argv_slice_mask : &c->argv_slice_mask);
+    uint32_t *slices_live_ptr = (p ? &p->argv_slices_live : &c->argv_slices_live);
 
     if (c->multibulklen == 0) {
         /* The client (argc) should have been reset */
@@ -4220,9 +4248,9 @@ static int parseMultibulk(client *c,
         c->bulklen = -1;
 
         /* Set up argv array */
-        if (*argv && *argv != c->argv_inline) zfree(*argv);
-        if (argv == &c->argv && c->multibulklen <= ARGV_INLINE_MAX) {
-            *argv = c->argv_inline;
+        if (*argv && *argv != argv_inline) zfree(*argv);
+        if (c->multibulklen <= ARGV_INLINE_MAX) {
+            *argv = argv_inline;
             *argv_len = ARGV_INLINE_MAX;
         } else {
             *argv_len = min(c->multibulklen, 1024);
@@ -4342,9 +4370,9 @@ static int parseMultibulk(client *c,
             if (*argc >= *argv_len) {
                 *argv_len = min(*argv_len < INT_MAX / 2 ? (*argv_len) * 2 : INT_MAX,
                                 *argc + c->multibulklen);
-                if (*argv == c->argv_inline) {
+                if (*argv == argv_inline) {
                     robj **new_argv = zmalloc(sizeof(robj *) * (*argv_len));
-                    memcpy(new_argv, c->argv_inline, sizeof(robj *) * (*argc));
+                    memcpy(new_argv, argv_inline, sizeof(robj *) * (*argc));
                     *argv = new_argv;
                 } else {
                     *argv = zrealloc(*argv, sizeof(robj *) * (*argv_len));
@@ -4360,7 +4388,7 @@ static int parseMultibulk(client *c,
             /* Check slicing eligibility for this argument */
             size_t hdr_size = (c->bulklen <= 255) ? sizeof(struct sdshdr8) : sizeof(struct sdshdr16);
             int can_slice = 0;
-            if (server.argv_slices_enabled && inMainThread() && argv == &c->argv &&
+            if (server.argv_slices_enabled && inMainThread() &&
                 !is_replicated && c->id != CLIENT_ID_AOF && !c->flag.multi &&
                 *argc < ARGV_INLINE_MAX && (size_t)c->bulklen < PROTO_MBULK_BIG_ARG &&
                 c->qb_pos >= hdr_size) {
@@ -4389,7 +4417,7 @@ static int parseMultibulk(client *c,
                 sds val_sds;
                 if (server.argv_slices_debug == ARGV_SLICES_DEBUG_HEAP_PER_SLICE) {
                     val_sds = sdsnewlen(payload, c->bulklen);
-                    c->argv_slice_sds[slice_idx] = val_sds;
+                    slice_sds_arr[slice_idx] = val_sds;
                 } else {
                     if (c->bulklen <= 255) {
                         struct sdshdr8 *sh = (struct sdshdr8 *)(payload - sizeof(struct sdshdr8));
@@ -4406,18 +4434,20 @@ static int parseMultibulk(client *c,
                         payload[c->bulklen] = '\0';
                         val_sds = payload;
                     }
-                    c->argv_slice_sds[slice_idx] = NULL;
+                    slice_sds_arr[slice_idx] = NULL;
                 }
-                initStaticStringObject(c->argv_slice[slice_idx], val_sds);
-                c->argv_slice_mask |= (1U << slice_idx);
-                c->argv_slices_live++;
-                c->flag.argv_sliced = 1;
+                initStaticStringObject(slice_arr[slice_idx], val_sds);
+                *slice_mask_ptr |= (1U << slice_idx);
+                (*slices_live_ptr)++;
+                if (p == NULL) {
+                    c->flag.argv_sliced = 1;
+                }
                 if (c->querybuf == thread_shared_qb) {
                     thread_shared_qb_pinned_by = c;
                 }
                 atomic_fetch_add_explicit(&server.argv_slices_total, 1, memory_order_relaxed);
                 atomic_fetch_add_explicit(&server.argv_alloc_avoided_total, 1, memory_order_relaxed);
-                (*argv)[(*argc)++] = &c->argv_slice[slice_idx];
+                (*argv)[(*argc)++] = &slice_arr[slice_idx];
                 *argv_len_sum += c->bulklen;
                 c->qb_pos += c->bulklen + 2;
             } else {
@@ -4614,7 +4644,9 @@ void trimCommandQueue(client *c) {
             cap = max(cap, COMMAND_QUEUE_MIN_CAPACITY);
             if (cap < queue->cap) {
                 queue->cap = cap;
+                parsedCommand *old_cmds = queue->cmds;
                 queue->cmds = zrealloc(queue->cmds, cap * sizeof(parsedCommand));
+                fixupCommandQueuePointers(queue, old_cmds);
             }
         }
     }
@@ -4657,13 +4689,45 @@ static bool consumeCommandQueue(client *c) {
      * command parsing outcome (PARSING_COMPLETED). */
     c->read_flags |= p->read_flags;
     c->argc = p->argc;
-    c->argv = p->argv;
-    c->argv_len = p->argv_len;
     c->argv_len_sum = p->argv_len_sum;
     c->net_input_bytes_curr_cmd = p->input_bytes;
     c->parsed_cmd = p->cmd;
     c->slot = p->slot;
     c->qb_applied += p->input_bytes;
+
+    if (p->argv == p->argv_inline) {
+        c->argv = c->argv_inline;
+        c->argv_len = ARGV_INLINE_MAX;
+        for (int j = 0; j < p->argc; j++) {
+            if (p->argv_slice_mask & (1U << j)) {
+                c->argv_slice[j] = p->argv_slice[j];
+                c->argv_inline[j] = &c->argv_slice[j];
+            } else {
+                c->argv_inline[j] = p->argv_inline[j];
+            }
+        }
+    } else {
+        c->argv = p->argv;
+        c->argv_len = p->argv_len;
+    }
+
+    if (p->argv_slices_live > 0) {
+        c->flag.argv_sliced = 1;
+        c->argv_slice_mask = p->argv_slice_mask;
+        c->argv_slices_live = p->argv_slices_live;
+        for (int j = 0; j < ARGV_INLINE_MAX; j++) {
+            c->argv_slice_sds[j] = p->argv_slice_sds[j];
+            p->argv_slice_sds[j] = NULL;
+        }
+        if (c->querybuf == thread_shared_qb) {
+            thread_shared_qb_pinned_by = c;
+        }
+    } else {
+        c->flag.argv_sliced = 0;
+        c->argv_slice_mask = 0;
+        c->argv_slices_live = 0;
+    }
+
     if (queue->off == queue->len) {
         /* The queue is empty. Don't free it here, because if parsing is done in
          * I/O threads, we want to free it in I/O threads too, to avoid
@@ -4678,13 +4742,25 @@ void discardCommandQueue(client *c) {
     while (queue->off < queue->len) {
         parsedCommand *p = &queue->cmds[queue->off++];
         for (int j = 0; j < p->argc; j++) {
-            decrRefCount(p->argv[j]);
+            if (!(p->argv_slice_mask & (1U << j))) {
+                decrRefCount(p->argv[j]);
+            }
+            if (p->argv_slice_sds[j]) {
+                sdsfree(p->argv_slice_sds[j]);
+                p->argv_slice_sds[j] = NULL;
+            }
         }
-        zfree(p->argv);
+        if (p->argv != p->argv_inline) {
+            zfree(p->argv);
+        }
     }
     zfree(queue->cmds);
     queue->cmds = NULL;
     queue->off = queue->len = queue->cap = 0;
+    if (thread_shared_qb_pinned_by == c) {
+        thread_shared_qb_pinned_by = NULL;
+        sdsclear(thread_shared_qb);
+    }
 }
 
 /* Returns the number of keys in the the incr_states array after adding keys. */
@@ -6651,12 +6727,25 @@ void clientPromoteArgv(client *c) {
     cmdQueue *queue = &c->cmd_queue;
     for (int i = queue->off; i < queue->len; i++) {
         parsedCommand *p = &queue->cmds[i];
-        for (int j = 0; j < p->argc; j++) {
-            if (p->argv[j]->refcount == OBJ_STATIC_REFCOUNT) {
-                robj *old = p->argv[j];
-                p->argv[j] = createRawStringObject(objectGetVal(old), sdslen(objectGetVal(old)));
-                atomic_fetch_add_explicit(&server.argv_promotions_total, 1, memory_order_relaxed);
+        if (p->argv_slices_live > 0) {
+            for (int j = 0; j < p->argc; j++) {
+                if (p->argv_slice_mask & (1U << j)) {
+                    robj *old = p->argv[j];
+                    p->argv[j] = createRawStringObject(objectGetVal(old), sdslen(objectGetVal(old)));
+                    if (p->argv_slice_sds[j]) {
+                        sdsfree(p->argv_slice_sds[j]);
+                        p->argv_slice_sds[j] = NULL;
+                    }
+                    atomic_fetch_add_explicit(&server.argv_promotions_total, 1, memory_order_relaxed);
+                }
             }
+            p->argv_slice_mask = 0;
+            p->argv_slices_live = 0;
+        }
+        if (p->argv == p->argv_inline) {
+            robj **heap_argv = zmalloc(sizeof(robj *) * p->argv_len);
+            memcpy(heap_argv, p->argv_inline, sizeof(robj *) * p->argc);
+            p->argv = heap_argv;
         }
     }
 

@@ -2559,7 +2559,7 @@ void initServerConfig(void) {
 
     /* Debugging */
     server.watchdog_period = 0;
-    server.argv_slices_enabled = 0;
+    server.argv_slices_enabled = 1;
     server.argv_slices_debug = ARGV_SLICES_DEBUG_NONE;
 }
 
