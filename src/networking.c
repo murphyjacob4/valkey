@@ -3799,11 +3799,11 @@ void resetClient(client *c) {
 
     freeClientArgv(c);
     freeClientOriginalArgv(c);
-    if (server.argv_slices_debug == ARGV_SLICES_DEBUG_POISON) {
+    if (server.enable_debug_assert) {
         memset(c->argv_slice, 0xA5, sizeof(c->argv_slice));
     }
     serverAssert(c->argv_slices_live == 0);
-    if (server.argv_slices_debug == ARGV_SLICES_DEBUG_POISON && c->querybuf && c->qb_pos > 0) {
+    if (server.enable_debug_assert && c->querybuf && c->qb_pos > 0) {
         memset(c->querybuf, 0xA5, c->qb_pos);
     }
     c->redact_arg_bitmap = 0;
@@ -4325,27 +4325,22 @@ static int parseMultibulk(client *c,
                 int slice_idx = *argc;
                 char *payload = c->querybuf + c->qb_pos;
                 sds val_sds;
-                if (server.argv_slices_debug == ARGV_SLICES_DEBUG_HEAP_PER_SLICE) {
-                    val_sds = sdsnewlen(payload, c->bulklen);
-                    slice_sds_arr[slice_idx] = val_sds;
+                if (c->bulklen <= 255) {
+                    struct sdshdr8 *sh = (struct sdshdr8 *)(payload - sizeof(struct sdshdr8));
+                    sh->len = c->bulklen;
+                    sh->alloc = c->bulklen;
+                    sh->flags = SDS_TYPE_8;
+                    payload[c->bulklen] = '\0';
+                    val_sds = payload;
                 } else {
-                    if (c->bulklen <= 255) {
-                        struct sdshdr8 *sh = (struct sdshdr8 *)(payload - sizeof(struct sdshdr8));
-                        sh->len = c->bulklen;
-                        sh->alloc = c->bulklen;
-                        sh->flags = SDS_TYPE_8;
-                        payload[c->bulklen] = '\0';
-                        val_sds = payload;
-                    } else {
-                        struct sdshdr16 *sh = (struct sdshdr16 *)(payload - sizeof(struct sdshdr16));
-                        sh->len = c->bulklen;
-                        sh->alloc = c->bulklen;
-                        sh->flags = SDS_TYPE_16;
-                        payload[c->bulklen] = '\0';
-                        val_sds = payload;
-                    }
-                    slice_sds_arr[slice_idx] = NULL;
+                    struct sdshdr16 *sh = (struct sdshdr16 *)(payload - sizeof(struct sdshdr16));
+                    sh->len = c->bulklen;
+                    sh->alloc = c->bulklen;
+                    sh->flags = SDS_TYPE_16;
+                    payload[c->bulklen] = '\0';
+                    val_sds = payload;
                 }
+                slice_sds_arr[slice_idx] = NULL;
                 initStaticStringObject(slice_arr[slice_idx], val_sds);
                 *slice_mask_ptr |= (1U << slice_idx);
                 (*slices_live_ptr)++;

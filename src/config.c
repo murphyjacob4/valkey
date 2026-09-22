@@ -198,11 +198,6 @@ configEnum repl_compression_enum[] = {{"no", REPL_COMPRESSION_NO},
                                       {"lz4", REPL_COMPRESSION_LZ4},
                                       {NULL, 0}};
 
-configEnum argv_slices_debug_enum[] = {
-    {"no", ARGV_SLICES_DEBUG_NONE},
-    {"poison", ARGV_SLICES_DEBUG_POISON},
-    {"heap-per-slice", ARGV_SLICES_DEBUG_HEAP_PER_SLICE},
-    {NULL, 0}};
 
 /* Output buffer limits presets. */
 clientBufferLimitsConfig clientBufferLimitsDefaults[CLIENT_TYPE_OBUF_COUNT] = {
@@ -3544,7 +3539,6 @@ standardConfig static_configs[] = {
     createEnumConfig("rdbcompression", NULL, MODIFIABLE_CONFIG, rdb_compression_enum, server.rdb_compression, RDB_COMPRESSION_YES, NULL, NULL),
     createEnumConfig("cluster-replica-no-failover", "cluster-slave-no-failover", MODIFIABLE_CONFIG, cluster_replica_no_failover_enum, server.cluster_replica_no_failover, CLUSTER_REPLICA_NO_FAILOVER_NO, NULL, updateClusterFlags), /* Failover by default. */
     createEnumConfig("repl-compression", NULL, MODIFIABLE_CONFIG, repl_compression_enum, server.repl_compression, REPL_COMPRESSION_NO, NULL, NULL),
-    createEnumConfig("argv-slices-debug", NULL, MODIFIABLE_CONFIG, argv_slices_debug_enum, server.argv_slices_debug, ARGV_SLICES_DEBUG_NONE, NULL, NULL),
 
     /* Integer configs */
     createIntConfig("databases", NULL, IMMUTABLE_CONFIG, 1, INT_MAX, server.config_databases, 16, INTEGER_CONFIG, NULL, NULL),

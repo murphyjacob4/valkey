@@ -409,8 +409,6 @@ void debugCommand(client *c) {
         const char *help[] = {
             "AOF-FLUSH-SLEEP <microsec>",
             "    Server will sleep before flushing the AOF, this is used for testing.",
-            "ARGV-SLICES [<client-id>]",
-            "    Display argv slicing stats and client slice state.",
             "ASSERT",
             "    Crash by assertion failed.",
             "CHANGE-REPL-ID",
@@ -1164,40 +1162,6 @@ void debugCommand(client *c) {
         }
         bioDrainWorker(type);
         addReply(c, shared.ok);
-    } else if (!strcasecmp(objectGetVal(c->argv[1]), "argv-slices")) {
-        client *target = c;
-        if (c->argc == 3) {
-            char *endptr;
-            errno = 0;
-            uint64_t id = strtoull(objectGetVal(c->argv[2]), &endptr, 10);
-            if (errno == ERANGE || endptr == objectGetVal(c->argv[2]) || *endptr != '\0') {
-                addReplyError(c, "Invalid client ID");
-                return;
-            }
-            target = lookupClientByID(id);
-            if (!target) {
-                addReplyError(c, "No such client");
-                return;
-            }
-        } else if (c->argc > 3) {
-            addReplySubcommandSyntaxError(c);
-            return;
-        }
-
-        sds out = sdsempty();
-        out = sdscatprintf(out,
-            "argv_slices_debug:%d\r\n"
-            "client_id:%llu\r\n"
-            "client_argv_sliced:%d\r\n"
-            "client_argv_slice_mask:0x%x\r\n"
-            "client_argv_slices_live:%d\r\n",
-            server.argv_slices_debug,
-            (unsigned long long)target->id,
-            target->flag.argv_sliced,
-            target->argv_slice_mask,
-            target->argv_slices_live);
-        addReplyVerbatim(c, out, sdslen(out), "txt");
-        sdsfree(out);
     } else if (!handleDebugClusterCommand(c)) {
         addReplySubcommandSyntaxError(c);
         return;

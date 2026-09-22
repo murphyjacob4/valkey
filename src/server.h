@@ -1360,9 +1360,6 @@ typedef struct ClientModuleData {
 } ClientModuleData;
 
 #define ARGV_INLINE_MAX 12 /* covers SET k v EX n XX GET, HSET h f v, ZADD z s m, ... */
-#define ARGV_SLICES_DEBUG_NONE 0
-#define ARGV_SLICES_DEBUG_POISON 1
-#define ARGV_SLICES_DEBUG_HEAP_PER_SLICE 2
 
 /* Parser state and parse result of a command from a client's input buffer. */
 typedef struct parsedCommand {
@@ -1970,7 +1967,6 @@ struct valkeyServer {
     int enable_debug_cmd;                     /* Enable DEBUG commands, see PROTECTED_ACTION_ALLOWED_* */
     int enable_module_cmd;                    /* Enable MODULE commands, see PROTECTED_ACTION_ALLOWED_* */
     int enable_debug_assert;                  /* Enable debug asserts */
-    int argv_slices_debug;                    /* Debug mode: 0=no, 1=poison, 2=heap-per-slice */
     int debug_client_enforce_reply_list;      /* Force client to always use the reply list */
     int debug_force_free_primary_async;       /* Force freeClient on primary to use async path */
     /* Reply construction copy avoidance */
