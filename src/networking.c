@@ -162,8 +162,6 @@ static int parseMultibulk(client *c,
                           parsedCommand *p);
 
 int ProcessingEventsWhileBlocked = 0; /* See processEventsWhileBlocked(). */
-_Thread_local sds thread_shared_qb = NULL;
-_Thread_local client *thread_shared_qb_pinned_by = NULL;
 
 typedef enum {
     PARSE_OK = 0,
@@ -2189,12 +2187,6 @@ void freeClientArgv(client *c) {
         c->argv_slice_mask = 0;
         serverAssert(c->argv_slices_live == 0);
         c->flag.argv_sliced = 0;
-        if (thread_shared_qb_pinned_by == c) {
-            if (c->cmd_queue.off == c->cmd_queue.len) {
-                thread_shared_qb_pinned_by = NULL;
-                sdsclear(thread_shared_qb);
-            }
-        }
         goto clear;
     }
 
@@ -2449,11 +2441,7 @@ int freeClient(client *c) {
     }
 
     /* Free the query buffer */
-    if (c->querybuf && c->querybuf == thread_shared_qb) {
-        sdsclear(c->querybuf);
-    } else {
-        sdsfree(c->querybuf);
-    }
+    sdsfree(c->querybuf);
     c->querybuf = NULL;
 
     /* Deallocate structures used to block on blocking ops. */
@@ -2563,28 +2551,6 @@ void logInvalidUseAndFreeClientAsync(client *c, const char *fmt, ...) {
     freeClientAsync(c);
 }
 
-/* Resets the shared query buffer used by the given client.
- * If any data remained in the buffer, the client will take ownership of the buffer
- * and a new empty buffer will be allocated for the shared buffer. */
-void resetSharedQueryBuf(client *c) {
-    serverAssert(c->querybuf == thread_shared_qb);
-    size_t remaining = sdslen(c->querybuf) - c->qb_pos;
-
-    if (remaining > 0) {
-        /* Let the client take ownership of the shared buffer. */
-        initSharedQueryBuf();
-        if (thread_shared_qb_pinned_by == c) {
-            thread_shared_qb_pinned_by = NULL;
-        }
-        return;
-    }
-
-    c->querybuf = NULL;
-    sdsclear(thread_shared_qb);
-    c->qb_pos = 0;
-    c->qb_applied = 0;
-}
-
 /* Trims the client query buffer to the current position. */
 void trimClientQueryBuffer(client *c) {
     if (c->argv_slices_live > 0) return;
@@ -2592,9 +2558,6 @@ void trimClientQueryBuffer(client *c) {
         for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
             if (c->cmd_queue.cmds[i].argv_slices_live > 0) return;
         }
-    }
-    if (c->querybuf == thread_shared_qb) {
-        resetSharedQueryBuf(c);
     }
 
     if (c->querybuf == NULL) {
@@ -3841,9 +3804,6 @@ void resetClient(client *c) {
     if (server.argv_slices_debug == ARGV_SLICES_DEBUG_POISON && c->querybuf && c->qb_pos > 0) {
         memset(c->querybuf, 0xA5, c->qb_pos);
     }
-    if (c->querybuf == thread_shared_qb && thread_shared_qb_pinned_by == NULL) {
-        resetSharedQueryBuf(c);
-    }
     c->redact_arg_bitmap = 0;
     c->cur_script = NULL;
     c->net_input_bytes_curr_cmd = 0;
@@ -3897,18 +3857,6 @@ void resetClientIOState(client *c) {
     c->flag.pending_command = 0;
     c->io_last_bufpos = 0;
     c->io_last_reply_block = NULL;
-}
-
-/* Initializes the shared query buffer to a new sds with the default capacity.
- * Need to ensure the initlen is not less than readlen in readToQueryBuf. */
-void initSharedQueryBuf(void) {
-    thread_shared_qb = sdsnewlen(NULL, PROTO_IOBUF_LEN);
-    sdsclear(thread_shared_qb);
-}
-
-void freeSharedQueryBuf(void) {
-    sdsfree(thread_shared_qb);
-    thread_shared_qb = NULL;
 }
 
 /* This function is used when we want to re-enter the event loop but there
@@ -4313,10 +4261,6 @@ static int parseMultibulk(client *c,
                  * at this time the querybuf contains not only our bulk. */
                 if (sdslen(c->querybuf) - c->qb_pos <= (size_t)ll + 2) {
                     clientPromoteArgv(c);
-                    if (c->querybuf == thread_shared_qb) {
-                        /* Let the client take the ownership of the shared buffer. */
-                        initSharedQueryBuf();
-                    }
                     sdsrange(c->querybuf, c->qb_pos, -1);
                     c->qb_pos = 0;
                     c->qb_applied = 0;
@@ -4359,8 +4303,7 @@ static int parseMultibulk(client *c,
 
             /* Check slicing eligibility for this argument */
             size_t hdr_size = (c->bulklen <= 255) ? sizeof(struct sdshdr8) : sizeof(struct sdshdr16);
-            int can_slice = (server.argv_slices_enabled &&
-                             !is_replicated && c->id != CLIENT_ID_AOF && !c->flag.multi &&
+            int can_slice = (!is_replicated && c->id != CLIENT_ID_AOF && !c->flag.multi &&
                              *argc < ARGV_INLINE_MAX && (size_t)c->bulklen < PROTO_MBULK_BIG_ARG &&
                              c->qb_pos >= hdr_size);
 
@@ -4417,9 +4360,6 @@ static int parseMultibulk(client *c,
                 (*slices_live_ptr)++;
                 if (p == NULL) {
                     c->flag.argv_sliced = 1;
-                }
-                if (c->querybuf == thread_shared_qb) {
-                    thread_shared_qb_pinned_by = c;
                 }
                 (*argv)[(*argc)++] = &slice_arr[slice_idx];
                 *argv_len_sum += c->bulklen;
@@ -4693,9 +4633,6 @@ static bool consumeCommandQueue(client *c) {
             c->argv_slice_sds[j] = p->argv_slice_sds[j];
             p->argv_slice_sds[j] = NULL;
         }
-        if (c->querybuf == thread_shared_qb) {
-            thread_shared_qb_pinned_by = c;
-        }
     } else {
         c->flag.argv_sliced = 0;
         c->argv_slice_mask = 0;
@@ -4731,10 +4668,6 @@ void discardCommandQueue(client *c) {
     zfree(queue->cmds);
     queue->cmds = NULL;
     queue->off = queue->len = queue->cap = 0;
-    if (thread_shared_qb_pinned_by == c) {
-        thread_shared_qb_pinned_by = NULL;
-        sdsclear(thread_shared_qb);
-    }
 }
 
 /* Returns the number of keys in the the incr_states array after adding keys. */
@@ -4874,13 +4807,6 @@ int processInputBuffer(client *c) {
             continue;
         }
 
-        if (c->querybuf == thread_shared_qb) {
-            /* Before processing the command, reset the shared query buffer to its default state.
-             * This avoids unintentionally modifying the shared qb during processCommand as we may use
-             * the shared qb for other clients during processEventsWhileBlocked */
-            resetSharedQueryBuf(c);
-        }
-
         /* We are finally ready to execute the command. */
         c->flag.pending_command = 1;
         if (processCommandAndResetClient(c) == C_ERR) {
@@ -4933,22 +4859,10 @@ static bool readToQueryBuf(client *c) {
     }
 
     if (c->querybuf == NULL) {
-        if (!big_arg && (thread_shared_qb_pinned_by == NULL || thread_shared_qb_pinned_by == c)) {
-            serverAssert(sdslen(thread_shared_qb) == 0);
-            c->querybuf = thread_shared_qb;
-        } else {
-            if (!big_arg && thread_shared_qb_pinned_by != NULL && thread_shared_qb_pinned_by != c) {
-                atomic_fetch_add_explicit(&server.argv_shared_qb_pin_conflicts, 1, memory_order_relaxed);
-            }
-            c->querybuf = sdsempty();
-        }
-        qblen = sdslen(c->querybuf);
+        c->querybuf = sdsempty();
+        qblen = 0;
     }
 
-    /* c->querybuf may be expanded. If so, the old thread_shared_qb will be released.
-     * Although we have ensured that c->querybuf will not be expanded in the current
-     * thread_shared_qb, we still add this check for code robustness. */
-    int use_thread_shared_qb = (c->querybuf == thread_shared_qb) ? 1 : 0;
     if (!is_replicated && // replicated clients' querybuf can grow greedy.
         (big_arg || sdsalloc(c->querybuf) < PROTO_IOBUF_LEN)) {
         /* When reading a BIG_ARG we won't be reading more than that one arg
@@ -4965,10 +4879,6 @@ static bool readToQueryBuf(client *c) {
 
         /* Read as much as possible from the socket to save read(2) system calls. */
         readlen = sdsavail(c->querybuf);
-    }
-    if (use_thread_shared_qb) {
-        serverAssert(c->querybuf == thread_shared_qb);
-        serverAssert(thread_shared_qb_pinned_by == NULL || thread_shared_qb_pinned_by == c);
     }
 
     c->nread = connRead(c->conn, c->querybuf + qblen, readlen);
@@ -5196,8 +5106,8 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
             " ssub=%i", client->pubsub_data ? (int)hashtableSize(client->pubsub_data->pubsubshard_channels) : 0,
             " multi=%i", client->mstate ? client->mstate->count : -1,
             " watch=%i", client->mstate ? (int)listLength(&client->mstate->watched_keys) : 0,
-            " qbuf=%U", (client->querybuf && client->querybuf != thread_shared_qb) ? (unsigned long long)sdslen(client->querybuf) : 0,
-            " qbuf-free=%U", (client->querybuf && client->querybuf != thread_shared_qb) ? (unsigned long long)sdsavail(client->querybuf) : 0,
+            " qbuf=%U", client->querybuf ? (unsigned long long)sdslen(client->querybuf) : 0,
+            " qbuf-free=%U", client->querybuf ? (unsigned long long)sdsavail(client->querybuf) : 0,
             " argv-mem=%U", (unsigned long long)client->argv_len_sum,
             " multi-mem=%U", client->mstate ? (unsigned long long)client->mstate->argv_len_sums : 0,
             " rbs=%U", (unsigned long long)client->buf_usable_size,
@@ -6719,10 +6629,6 @@ void clientPromoteArgv(client *c) {
             p->argv = heap_argv;
         }
     }
-
-    if (thread_shared_qb_pinned_by == c) {
-        thread_shared_qb_pinned_by = NULL;
-    }
 }
 
 /* This function preserves the original command arguments for accurate commandlog recording.
@@ -7499,7 +7405,7 @@ done:;
     /* Only trim query buffer for non-primary clients.
      * If the client or any queued commands have active slices referencing c->querybuf,
      * do NOT trim querybuf here; trimming will occur on the main thread in beforeNextClient()
-     * after execution. Also ensure client takes ownership of thread_shared_qb. */
+     * after execution. */
     int has_slices = (c->argv_slices_live > 0);
     if (!has_slices && c->cmd_queue.len > 0) {
         for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
@@ -7510,15 +7416,7 @@ done:;
         }
     }
 
-    if (has_slices) {
-        if (c->querybuf == thread_shared_qb) {
-            /* Client takes ownership of the shared query buffer */
-            initSharedQueryBuf();
-            if (thread_shared_qb_pinned_by == c) {
-                thread_shared_qb_pinned_by = NULL;
-            }
-        }
-    } else {
+    if (!has_slices) {
         if (!(c->read_flags & READ_FLAGS_REPLICATED)) {
             trimClientQueryBuffer(c);
         }

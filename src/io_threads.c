@@ -306,9 +306,6 @@ void cleanupThreadResources(void *dummy) {
 
     /* Blocking flush: ensure all pending jobs are sent before thread dies */
     flushPendingIOResponses(1);
-
-    /* Free the shared query buffer */
-    freeSharedQueryBuf();
 }
 
 static inline void processTaggedSPMCJob(void *tagged_job) {
@@ -354,7 +351,6 @@ static void *IOThreadMain(void *myid) {
     snprintf(thdname, sizeof(thdname), "io_thd_%ld", id);
     valkey_set_thread_title(thdname);
     serverSetCpuAffinity(server.server_cpulist);
-    initSharedQueryBuf();
     pthread_cleanup_push(cleanupThreadResources, NULL);
 
     thread_id = (int)id;

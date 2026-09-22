@@ -1970,7 +1970,6 @@ struct valkeyServer {
     int enable_debug_cmd;                     /* Enable DEBUG commands, see PROTECTED_ACTION_ALLOWED_* */
     int enable_module_cmd;                    /* Enable MODULE commands, see PROTECTED_ACTION_ALLOWED_* */
     int enable_debug_assert;                  /* Enable debug asserts */
-    int argv_slices_enabled;                  /* Master switch for argv slicing */
     int argv_slices_debug;                    /* Debug mode: 0=no, 1=poison, 2=heap-per-slice */
     int debug_client_enforce_reply_list;      /* Force client to always use the reply list */
     int debug_force_free_primary_async;       /* Force freeClient on primary to use async path */
@@ -2058,10 +2057,6 @@ struct valkeyServer {
     long long stat_io_writes_processed;                /* Number of write events processed by IO threads */
     long long stat_io_writes_pending;                  /* Number of write events pending in IO threads */
     long long stat_io_freed_objects;                   /* Number of objects freed by IO threads */
-    atomic_ullong argv_slices_total;                   /* Total slices emitted */
-    atomic_ullong argv_promotions_total;               /* Total slice promotions */
-    atomic_ullong argv_alloc_avoided_total;           /* Total heap allocations avoided */
-    atomic_ullong argv_shared_qb_pin_conflicts;       /* Pin conflicts avoided by fallback */
     long long stat_io_accept_offloaded;                /* Number of offloaded accepts */
     long long stat_poll_processed_by_io_threads;       /* Total number of poll jobs processed by IO */
     long long stat_total_reads_processed;              /* Total number of read events processed */
@@ -3035,7 +3030,6 @@ extern hashtableType kvstoreChannelHashtableType;
 extern hashtableType sdsReplyHashtableType;
 extern dictType keylistDictType;
 extern list *modules;
-extern _Thread_local client *thread_shared_qb_pinned_by;
 
 /*-----------------------------------------------------------------------------
  * Functions prototypes
@@ -3234,8 +3228,6 @@ int writeToClient(client *c);
 void linkClient(client *c);
 void protectClient(client *c);
 void unprotectClient(client *c);
-void initSharedQueryBuf(void);
-void freeSharedQueryBuf(void);
 client *lookupClientByID(uint64_t id);
 int authRequired(client *c);
 void clientSetUser(client *c, user *u, int authenticated);

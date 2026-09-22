@@ -2559,7 +2559,6 @@ void initServerConfig(void) {
 
     /* Debugging */
     server.watchdog_period = 0;
-    server.argv_slices_enabled = 1;
     server.argv_slices_debug = ARGV_SLICES_DEBUG_NONE;
 }
 
@@ -3235,10 +3234,6 @@ void initServer(void) {
     server.aof_last_write_errno = 0;
     server.repl_good_replicas_count = 0;
     server.last_sig_received = 0;
-    atomic_init(&server.argv_slices_total, 0);
-    atomic_init(&server.argv_promotions_total, 0);
-    atomic_init(&server.argv_alloc_avoided_total, 0);
-    atomic_init(&server.argv_shared_qb_pin_conflicts, 0);
 
     /* Create the timer callback, this is our way to process many background
      * operations incrementally, like eviction of unaccessed expired keys, etc. */
@@ -3286,7 +3281,6 @@ void initServer(void) {
     commandlogInit();
     latencyMonitorInit();
     throttle_init();
-    initSharedQueryBuf();
     bgIteration_init();
 
     /* Initialize ACL default password if it exists */
@@ -6932,11 +6926,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "instantaneous_eventloop_duration_usec:%llu\r\n", getInstantaneousMetric(STATS_METRIC_EL_DURATION),
                 "eventloop_priority_cycles:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_PRIORITY_EL].cnt,
                 "eventloop_priority_duration_sum:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_PRIORITY_EL].sum,
-                "eventloop_priority_duration_cmd_sum:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_PRIORITY_CMD].sum,
-                "argv_slices_total:%llu\r\n", (unsigned long long)atomic_load_explicit(&server.argv_slices_total, memory_order_relaxed),
-                "argv_promotions_total:%llu\r\n", (unsigned long long)atomic_load_explicit(&server.argv_promotions_total, memory_order_relaxed),
-                "argv_alloc_avoided_total:%llu\r\n", (unsigned long long)atomic_load_explicit(&server.argv_alloc_avoided_total, memory_order_relaxed),
-                "argv_shared_qb_pin_conflicts:%llu\r\n", (unsigned long long)atomic_load_explicit(&server.argv_shared_qb_pin_conflicts, memory_order_relaxed)));
+                "eventloop_priority_duration_cmd_sum:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_PRIORITY_CMD].sum));
         info = genValkeyInfoStringACLStats(info);
     }
 

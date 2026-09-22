@@ -1186,22 +1186,12 @@ void debugCommand(client *c) {
 
         sds out = sdsempty();
         out = sdscatprintf(out,
-            "argv_slices_enabled:%d\r\n"
             "argv_slices_debug:%d\r\n"
-            "argv_slices_total:%llu\r\n"
-            "argv_promotions_total:%llu\r\n"
-            "argv_alloc_avoided_total:%llu\r\n"
-            "argv_shared_qb_pin_conflicts:%llu\r\n"
             "client_id:%llu\r\n"
             "client_argv_sliced:%d\r\n"
             "client_argv_slice_mask:0x%x\r\n"
             "client_argv_slices_live:%d\r\n",
-            server.argv_slices_enabled,
             server.argv_slices_debug,
-            (unsigned long long)atomic_load_explicit(&server.argv_slices_total, memory_order_relaxed),
-            (unsigned long long)atomic_load_explicit(&server.argv_promotions_total, memory_order_relaxed),
-            (unsigned long long)atomic_load_explicit(&server.argv_alloc_avoided_total, memory_order_relaxed),
-            (unsigned long long)atomic_load_explicit(&server.argv_shared_qb_pin_conflicts, memory_order_relaxed),
             (unsigned long long)target->id,
             target->flag.argv_sliced,
             target->argv_slice_mask,
