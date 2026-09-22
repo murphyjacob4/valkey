@@ -2171,7 +2171,6 @@ void freeClientArgv(client *c) {
     }
 
     if (c->flag.argv_sliced) {
-        serverAssert(c->original_argv == NULL);
         for (int j = 0; j < c->argc; j++) {
             if (c->argv_slice_mask & (1U << j)) {
                 if (c->argv_slice_sds[j]) {
@@ -2183,9 +2182,9 @@ void freeClientArgv(client *c) {
                 decrRefCount(c->argv[j]);
             }
         }
+        serverAssert(c->argv_slices_live == 0);
         if (c->argv != c->argv_inline) zfree(c->argv);
         c->argv_slice_mask = 0;
-        serverAssert(c->argv_slices_live == 0);
         c->flag.argv_sliced = 0;
         goto clear;
     }
@@ -6638,7 +6637,6 @@ void clientPromoteArgv(client *c) {
  *                allocated for new_argc arguments, preserving the existing arguments.
  */
 static void backupAndUpdateClientArgv(client *c, int new_argc, robj **new_argv) {
-    clientPromoteArgv(c);
     robj **old_argv = c->argv;
     int old_argc = c->argc;
 
@@ -6657,7 +6655,9 @@ static void backupAndUpdateClientArgv(client *c, int new_argc, robj **new_argv) 
 
         for (int i = 0; i < old_argc && i < new_argc; i++) {
             c->argv[i] = old_argv[i];
-            incrRefCount(c->argv[i]);
+            if (!c->flag.argv_sliced || !(c->argv_slice_mask & (1U << i))) {
+                incrRefCount(c->argv[i]);
+            }
         }
 
         /* Initialize new argument slots to NULL */
@@ -6672,7 +6672,11 @@ static void backupAndUpdateClientArgv(client *c, int new_argc, robj **new_argv) 
     /* Clean up old argv if necessary */
     if (c->argv != old_argv && c->original_argv != old_argv) {
         for (int i = 0; i < old_argc; i++) {
-            if (old_argv[i]) decrRefCount(old_argv[i]);
+            if (old_argv[i]) {
+                if (!c->flag.argv_sliced || !(c->argv_slice_mask & (1U << i))) {
+                    decrRefCount(old_argv[i]);
+                }
+            }
         }
         if (old_argv != c->argv_inline) zfree(old_argv);
     }
@@ -6725,6 +6729,7 @@ void rewriteClientCommandVector(client *c, int argc, ...) {
 
 /* Completely replace the client command vector with the provided one. */
 void replaceClientCommandVector(client *c, int argc, robj **argv) {
+    if (c->flag.argv_sliced) clientPromoteArgv(c);
     backupAndUpdateClientArgv(c, argc, argv);
     c->argv_len_sum = 0;
     c->flag.buffered_reply = 0;
@@ -6761,7 +6766,19 @@ void rewriteClientCommandArgument(client *c, int i, robj *newval) {
         }
     }
     c->argv[i] = newval;
-    if (oldval) decrRefCount(oldval);
+    if (oldval) {
+        if (c->flag.argv_sliced && (c->argv_slice_mask & (1U << i))) {
+            c->argv_slice_mask &= ~(1U << i);
+            c->argv_slices_live--;
+            if (c->argv_slice_sds[i]) {
+                sdsfree(c->argv_slice_sds[i]);
+                c->argv_slice_sds[i] = NULL;
+            }
+            if (c->argv_slices_live == 0) c->flag.argv_sliced = 0;
+        } else {
+            decrRefCount(oldval);
+        }
+    }
 
     /* If this is the command name make sure to fix c->cmd. */
     if (i == 0) {

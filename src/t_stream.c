@@ -2072,6 +2072,30 @@ void streamRewriteStripLimit(client *c, int limit_idx) {
     c->argv_len_sum -= getStringObjectLen(limit_tok);
     c->argv_len_sum -= getStringObjectLen(limit_val);
 
+    if (c->flag.argv_sliced) {
+        if (c->argv_slice_mask & (1U << limit_idx)) {
+            c->argv_slices_live--;
+            if (c->argv_slice_sds[limit_idx]) {
+                sdsfree(c->argv_slice_sds[limit_idx]);
+                c->argv_slice_sds[limit_idx] = NULL;
+            }
+        } else {
+            decrRefCount(limit_tok);
+        }
+        if (c->argv_slice_mask & (1U << (limit_idx + 1))) {
+            c->argv_slices_live--;
+            if (c->argv_slice_sds[limit_idx + 1]) {
+                sdsfree(c->argv_slice_sds[limit_idx + 1]);
+                c->argv_slice_sds[limit_idx + 1] = NULL;
+            }
+        } else {
+            decrRefCount(limit_val);
+        }
+    } else {
+        decrRefCount(limit_tok);
+        decrRefCount(limit_val);
+    }
+
     /* Intentionally shrink the argv vector by dropping the two "LIMIT <count>" slots,
      * shifting the tail (everything after them) two slots left. */
     int tail = c->argc - (limit_idx + 2);
@@ -2079,14 +2103,25 @@ void streamRewriteStripLimit(client *c, int limit_idx) {
         memmove(&c->argv[limit_idx],
                 &c->argv[limit_idx + 2],
                 sizeof(robj *) * tail);
+        if (c->flag.argv_sliced) {
+            memmove(&c->argv_slice_sds[limit_idx],
+                    &c->argv_slice_sds[limit_idx + 2],
+                    sizeof(sds) * tail);
+        }
+    }
+
+    if (c->flag.argv_sliced) {
+        uint32_t low_mask = c->argv_slice_mask & ((1U << limit_idx) - 1);
+        uint32_t high_mask = (c->argv_slice_mask >> (limit_idx + 2)) << limit_idx;
+        c->argv_slice_mask = low_mask | high_mask;
+        c->argv_slice_sds[c->argc - 2] = NULL;
+        c->argv_slice_sds[c->argc - 1] = NULL;
+        if (c->argv_slices_live == 0) c->flag.argv_sliced = 0;
     }
 
     c->argc -= 2;
     c->argv[c->argc] = NULL;
     c->argv[c->argc + 1] = NULL;
-
-    decrRefCount(limit_tok);
-    decrRefCount(limit_val);
 }
 
 /* XADD key [(MAXLEN [~|=] <count> | MINID [~|=] <id>) [LIMIT <entries>]] [NOMKSTREAM] <ID or *> [field value] [field
