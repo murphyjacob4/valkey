@@ -600,6 +600,7 @@ void subscribeCommand(client *c) {
         addReplyError(c, "SUBSCRIBE isn't allowed for a DENY BLOCKING client");
         return;
     }
+    clientPromoteArgv(c);
     for (j = 1; j < c->argc; j++) pubsubSubscribeChannel(c, c->argv[j], pubSubType);
     markClientAsPubSub(c);
 }
@@ -635,6 +636,7 @@ void psubscribeCommand(client *c) {
         return;
     }
 
+    clientPromoteArgv(c);
     for (j = 1; j < c->argc; j++) pubsubSubscribePattern(c, c->argv[j]);
     markClientAsPubSub(c);
 }
@@ -772,6 +774,7 @@ void ssubscribeCommand(client *c) {
         return;
     }
 
+    clientPromoteArgv(c);
     for (int j = 1; j < c->argc; j++) {
         pubsubSubscribeChannel(c, c->argv[j], pubSubShardType);
     }

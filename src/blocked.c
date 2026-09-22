@@ -455,6 +455,7 @@ void blockForKeys(client *c, int btype, robj **keys, int numkeys, mstime_t timeo
     list *l;
     int j;
 
+    clientPromoteArgv(c);
     initClientBlockingState(c);
 
     if (!c->flag.reexecuting_command) {

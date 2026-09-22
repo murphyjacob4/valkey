@@ -4154,39 +4154,6 @@ void parseMultibulkBuffer(client *c) {
 static_assert(sizeof(struct sdshdr8) == 3, "sdshdr8 size mismatch");
 static_assert(sizeof(struct sdshdr16) == 5, "sdshdr16 size mismatch");
 
-static int isCommandAllowlistedForSlicing(const char *name, size_t len) {
-    switch (len) {
-    case 3:
-        if (!strncasecmp(name, "get", 3) ||
-            !strncasecmp(name, "set", 3) ||
-            !strncasecmp(name, "del", 3) ||
-            !strncasecmp(name, "ttl", 3)) return 1;
-        break;
-    case 4:
-        if (!strncasecmp(name, "incr", 4) ||
-            !strncasecmp(name, "decr", 4) ||
-            !strncasecmp(name, "type", 4) ||
-            !strncasecmp(name, "mget", 4) ||
-            !strncasecmp(name, "hget", 4) ||
-            !strncasecmp(name, "hset", 4) ||
-            !strncasecmp(name, "sadd", 4) ||
-            !strncasecmp(name, "zadd", 4)) return 1;
-        break;
-    case 5:
-        if (!strncasecmp(name, "lpush", 5) ||
-            !strncasecmp(name, "rpush", 5)) return 1;
-        break;
-    case 6:
-        if (!strncasecmp(name, "exists", 6) ||
-            !strncasecmp(name, "expire", 6) ||
-            !strncasecmp(name, "zscore", 6)) return 1;
-        break;
-    case 9:
-        if (!strncasecmp(name, "sismember", 9)) return 1;
-        break;
-    }
-    return 0;
-}
 
 static int parseMultibulk(client *c,
                           int *argc,
@@ -4387,17 +4354,10 @@ static int parseMultibulk(client *c,
 
             /* Check slicing eligibility for this argument */
             size_t hdr_size = (c->bulklen <= 255) ? sizeof(struct sdshdr8) : sizeof(struct sdshdr16);
-            int can_slice = 0;
-            if (server.argv_slices_enabled && inMainThread() &&
-                !is_replicated && c->id != CLIENT_ID_AOF && !c->flag.multi &&
-                *argc < ARGV_INLINE_MAX && (size_t)c->bulklen < PROTO_MBULK_BIG_ARG &&
-                c->qb_pos >= hdr_size) {
-                if (*argc == 0) {
-                    can_slice = 1;
-                } else if (isCommandAllowlistedForSlicing(objectGetVal((*argv)[0]), sdslen(objectGetVal((*argv)[0])))) {
-                    can_slice = 1;
-                }
-            }
+            int can_slice = (server.argv_slices_enabled && inMainThread() &&
+                             !is_replicated && c->id != CLIENT_ID_AOF && !c->flag.multi &&
+                             *argc < ARGV_INLINE_MAX && (size_t)c->bulklen < PROTO_MBULK_BIG_ARG &&
+                             c->qb_pos >= hdr_size);
 
             /* Optimization: if a non-replicated client's buffer contains JUST our bulk element
              * instead of creating a new object by *copying* the sds we
@@ -4445,8 +4405,6 @@ static int parseMultibulk(client *c,
                 if (c->querybuf == thread_shared_qb) {
                     thread_shared_qb_pinned_by = c;
                 }
-                atomic_fetch_add_explicit(&server.argv_slices_total, 1, memory_order_relaxed);
-                atomic_fetch_add_explicit(&server.argv_alloc_avoided_total, 1, memory_order_relaxed);
                 (*argv)[(*argc)++] = &slice_arr[slice_idx];
                 *argv_len_sum += c->bulklen;
                 c->qb_pos += c->bulklen + 2;
@@ -6688,8 +6646,7 @@ robj *clientRetainArg(client *c, int i) {
     serverAssert(i >= 0 && i < c->argc);
     if (c->argv_slice_mask & (1U << i)) {
         robj *slice = c->argv[i];
-        robj *owned = createRawStringObject(objectGetVal(slice), sdslen(objectGetVal(slice)));
-        atomic_fetch_add_explicit(&server.argv_promotions_total, 1, memory_order_relaxed);
+        robj *owned = createStringObject(objectGetVal(slice), sdslen(objectGetVal(slice)));
         return owned;
     }
     incrRefCount(c->argv[i]);
@@ -6702,7 +6659,7 @@ void clientPromoteArgv(client *c) {
         for (int i = 0; i < c->argc; i++) {
             if (c->argv_slice_mask & (1U << i)) {
                 robj *slice = c->argv[i];
-                robj *promoted = createRawStringObject(objectGetVal(slice), sdslen(objectGetVal(slice)));
+                robj *promoted = createStringObject(objectGetVal(slice), sdslen(objectGetVal(slice)));
                 c->argv[i] = promoted;
                 if (c->argv_slice_sds[i]) {
                     sdsfree(c->argv_slice_sds[i]);
@@ -6710,7 +6667,6 @@ void clientPromoteArgv(client *c) {
                 }
                 c->argv_slice_mask &= ~(1U << i);
                 c->argv_slices_live--;
-                atomic_fetch_add_explicit(&server.argv_promotions_total, 1, memory_order_relaxed);
             }
         }
         serverAssert(c->argv_slices_live == 0);
@@ -6731,12 +6687,11 @@ void clientPromoteArgv(client *c) {
             for (int j = 0; j < p->argc; j++) {
                 if (p->argv_slice_mask & (1U << j)) {
                     robj *old = p->argv[j];
-                    p->argv[j] = createRawStringObject(objectGetVal(old), sdslen(objectGetVal(old)));
+                    p->argv[j] = createStringObject(objectGetVal(old), sdslen(objectGetVal(old)));
                     if (p->argv_slice_sds[j]) {
                         sdsfree(p->argv_slice_sds[j]);
                         p->argv_slice_sds[j] = NULL;
                     }
-                    atomic_fetch_add_explicit(&server.argv_promotions_total, 1, memory_order_relaxed);
                 }
             }
             p->argv_slice_mask = 0;
@@ -6840,7 +6795,7 @@ void rewriteClientCommandVector(client *c, int argc, ...) {
 
         a = va_arg(ap, robj *);
         if (a->refcount == OBJ_STATIC_REFCOUNT) {
-            a = createRawStringObject(objectGetVal(a), sdslen(objectGetVal(a)));
+            a = createStringObject(objectGetVal(a), sdslen(objectGetVal(a)));
         } else {
             incrRefCount(a);
         }
@@ -6882,7 +6837,7 @@ void rewriteClientCommandArgument(client *c, int i, robj *newval) {
     if (newval) {
         c->argv_len_sum += getStringObjectLen(newval);
         if (newval->refcount == OBJ_STATIC_REFCOUNT) {
-            newval = createRawStringObject(objectGetVal(newval), sdslen(objectGetVal(newval)));
+            newval = createStringObject(objectGetVal(newval), sdslen(objectGetVal(newval)));
         } else {
             incrRefCount(newval);
         }
