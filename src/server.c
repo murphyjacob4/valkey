@@ -4384,7 +4384,7 @@ void call(client *c, int flags) {
 
         /* Call alsoPropagate() only if at least one of AOF / replication
          * propagation is needed. */
-        if (propagate_flags != PROPAGATE_NONE) {
+        if (propagate_flags != PROPAGATE_NONE && shouldPropagate(propagate_flags)) {
             clientPromoteArgv(c);
             alsoPropagate(c->db->id, c->argv, c->argc, propagate_flags, c->slot);
         }
