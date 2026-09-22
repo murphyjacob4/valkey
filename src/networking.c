@@ -2587,7 +2587,12 @@ void resetSharedQueryBuf(client *c) {
 
 /* Trims the client query buffer to the current position. */
 void trimClientQueryBuffer(client *c) {
-    serverAssert(c->argv_slices_live == 0);
+    if (c->argv_slices_live > 0) return;
+    if (c->cmd_queue.len > 0) {
+        for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
+            if (c->cmd_queue.cmds[i].argv_slices_live > 0) return;
+        }
+    }
     if (c->querybuf == thread_shared_qb) {
         resetSharedQueryBuf(c);
     }
@@ -4354,10 +4359,21 @@ static int parseMultibulk(client *c,
 
             /* Check slicing eligibility for this argument */
             size_t hdr_size = (c->bulklen <= 255) ? sizeof(struct sdshdr8) : sizeof(struct sdshdr16);
-            int can_slice = (server.argv_slices_enabled && inMainThread() &&
+            int can_slice = (server.argv_slices_enabled &&
                              !is_replicated && c->id != CLIENT_ID_AOF && !c->flag.multi &&
                              *argc < ARGV_INLINE_MAX && (size_t)c->bulklen < PROTO_MBULK_BIG_ARG &&
                              c->qb_pos >= hdr_size);
+
+            /* Command-aware optimization: for SET, the value argument (argc == 2)
+             * will be retained into the database. Constructing an owned heap robj
+             * directly during parsing allows IO threads to offload this allocation
+             * and avoids slice-then-retain overhead on the main thread. */
+            if (can_slice && *argc == 2 && (*argv)[0] != NULL) {
+                sds cmdname = objectGetVal((*argv)[0]);
+                if (sdslen(cmdname) == 3 && !strcasecmp(cmdname, "set")) {
+                    can_slice = 0;
+                }
+            }
 
             /* Optimization: if a non-replicated client's buffer contains JUST our bulk element
              * instead of creating a new object by *copying* the sds we
@@ -7479,11 +7495,33 @@ void ioThreadReadQueryFromClient(client *c) {
         goto done;
     }
 
-done:
-    /* Only trim query buffer for non-primary clients
-     * Primary client's buffer is handled by main thread using repl_applied position */
-    if (!(c->read_flags & READ_FLAGS_REPLICATED)) {
-        trimClientQueryBuffer(c);
+done:;
+    /* Only trim query buffer for non-primary clients.
+     * If the client or any queued commands have active slices referencing c->querybuf,
+     * do NOT trim querybuf here; trimming will occur on the main thread in beforeNextClient()
+     * after execution. Also ensure client takes ownership of thread_shared_qb. */
+    int has_slices = (c->argv_slices_live > 0);
+    if (!has_slices && c->cmd_queue.len > 0) {
+        for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
+            if (c->cmd_queue.cmds[i].argv_slices_live > 0) {
+                has_slices = 1;
+                break;
+            }
+        }
+    }
+
+    if (has_slices) {
+        if (c->querybuf == thread_shared_qb) {
+            /* Client takes ownership of the shared query buffer */
+            initSharedQueryBuf();
+            if (thread_shared_qb_pinned_by == c) {
+                thread_shared_qb_pinned_by = NULL;
+            }
+        }
+    } else {
+        if (!(c->read_flags & READ_FLAGS_REPLICATED)) {
+            trimClientQueryBuffer(c);
+        }
     }
 
     c->io_read_state = CLIENT_COMPLETED_IO;
