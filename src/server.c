@@ -982,7 +982,6 @@ long long getInstantaneousMetric(int metric) {
  *
  * The function always returns 0 as it never terminates the client. */
 int clientsCronResizeQueryBuffer(client *c) {
-    clientPromoteArgv(c);
     /* If the client query buffer is NULL, it is using the shared query buffer and there is nothing to do. */
     if (c->querybuf == NULL) return 0;
     size_t querybuf_size = sdsalloc(c->querybuf);
@@ -991,6 +990,7 @@ int clientsCronResizeQueryBuffer(client *c) {
     /* Only resize the query buffer if the buffer is actually wasting at least a
      * few kbytes */
     if (sdsavail(c->querybuf) > 1024 * 4) {
+        clientPromoteArgv(c);
         /* There are two conditions to resize the query buffer: */
         if (idletime > 2) {
             /* 1) Query is idle for a long time. */

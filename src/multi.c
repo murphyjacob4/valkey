@@ -318,7 +318,6 @@ static int checkExecConditions(client *c) {
 }
 
 void execCommand(client *c) {
-    clientPromoteArgv(c);
     int j;
     robj **orig_argv;
     int orig_argc, orig_argv_len;

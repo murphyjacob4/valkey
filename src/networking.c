@@ -6817,7 +6817,6 @@ bool clientCommandArgShouldBeRedacted(client *c, int arg_index) {
  * For indices >= 32, bit 0 is set as a sentinel to indicate that all
  * arguments beyond the bitmap range should also be redacted. */
 void redactClientCommandArgument(client *c, int argc) {
-    clientPromoteArgv(c);
     serverAssert(argc >= 1);
     if (argc < 32) {
         c->redact_arg_bitmap |= (1U << argc);
