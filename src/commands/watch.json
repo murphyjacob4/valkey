@@ -18,6 +18,11 @@
             "FAST",
             "TRANSACTION"
         ],
+        "retained_args": {
+            "first": 1,
+            "last": -1,
+            "step": 1
+        },
         "key_specs": [
             {
                 "flags": [

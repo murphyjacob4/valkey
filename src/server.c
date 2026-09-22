@@ -991,6 +991,9 @@ int clientsCronResizeQueryBuffer(client *c) {
      * few kbytes */
     if (sdsavail(c->querybuf) > 1024 * 4) {
         clientPromoteArgv(c);
+        if (!isReplicatedClient(c)) {
+            trimClientQueryBuffer(c);
+        }
         /* There are two conditions to resize the query buffer: */
         if (idletime > 2) {
             /* 1) Query is idle for a long time. */

@@ -2553,6 +2553,7 @@ void logInvalidUseAndFreeClientAsync(client *c, const char *fmt, ...) {
 
 /* Trims the client query buffer to the current position. */
 void trimClientQueryBuffer(client *c) {
+    if (c->querybuf == NULL || c->qb_pos == 0) return;
     if (c->argv_slices_live > 0) return;
     if (c->cmd_queue.len > 0) {
         for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
@@ -2560,14 +2561,14 @@ void trimClientQueryBuffer(client *c) {
         }
     }
 
-    if (c->querybuf == NULL) {
-        return;
-    }
-
     serverAssert(c->qb_pos <= sdslen(c->querybuf));
 
     if (c->qb_pos > 0) {
-        sdsrange(c->querybuf, c->qb_pos, -1);
+        if (c->qb_pos == sdslen(c->querybuf)) {
+            sdsclear(c->querybuf);
+        } else {
+            sdsrange(c->querybuf, c->qb_pos, -1);
+        }
         c->qb_pos = 0;
         c->qb_applied = 0;
     }
@@ -2607,9 +2608,10 @@ void beforeNextClient(client *c) {
             c->qb_applied -= c->repl_data->repl_applied;
             c->repl_data->repl_applied = 0;
         }
-    } else {
-        trimClientQueryBuffer(c);
     }
+    /* Note: For regular clients, trimming is performed on-demand in readToQueryBuf()
+     * before reading the next chunk of network data. This avoids costly memory moves
+     * on the main thread during request processing. */
     /* Handle async frees */
     /* Note: this doesn't make the server.clients_to_close list redundant because of
      * cases where we want an async free of a client other than myself. For example
@@ -4825,6 +4827,12 @@ static bool readToQueryBuf(client *c) {
 
     int is_replicated = c->read_flags & READ_FLAGS_REPLICATED;
 
+    /* Trim any previously consumed buffer data prior to reading more data from the network.
+     * This reclaims query buffer space without reallocating, on whichever thread performs the read. */
+    if (!is_replicated) {
+        trimClientQueryBuffer(c);
+    }
+
     readlen = PROTO_IOBUF_LEN;
     qblen = c->querybuf ? sdslen(c->querybuf) : 0;
     /* If this is a multi bulk request, and we are processing a bulk reply
@@ -5214,8 +5222,12 @@ int clientSetName(client *c, robj *name, const char **err) {
         return C_OK;
     }
     if (c->name) decrRefCount(c->name);
-    c->name = name;
-    incrRefCount(name);
+    if (objectGetRefcount(name) == OBJ_STATIC_REFCOUNT) {
+        c->name = createStringObject(objectGetVal(name), len);
+    } else {
+        c->name = name;
+        incrRefCount(name);
+    }
     return C_OK;
 }
 
@@ -7391,26 +7403,6 @@ void ioThreadReadQueryFromClient(client *c) {
     }
 
 done:;
-    /* Only trim query buffer for non-primary clients.
-     * If the client or any queued commands have active slices referencing c->querybuf,
-     * do NOT trim querybuf here; trimming will occur on the main thread in beforeNextClient()
-     * after execution. */
-    int has_slices = (c->argv_slices_live > 0);
-    if (!has_slices && c->cmd_queue.len > 0) {
-        for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
-            if (c->cmd_queue.cmds[i].argv_slices_live > 0) {
-                has_slices = 1;
-                break;
-            }
-        }
-    }
-
-    if (!has_slices) {
-        if (!(c->read_flags & READ_FLAGS_REPLICATED)) {
-            trimClientQueryBuffer(c);
-        }
-    }
-
     c->io_read_state = CLIENT_COMPLETED_IO;
     c->cur_tid = getCurTid();
     sendToMainThread(c, JOB_RES_READ_CLIENT);
