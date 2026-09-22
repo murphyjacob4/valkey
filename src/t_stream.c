@@ -2074,7 +2074,6 @@ void streamRewriteStripLimit(client *c, int limit_idx) {
 
     if (c->flag.argv_sliced) {
         if (c->argv_slice_mask & (1U << limit_idx)) {
-            c->argv_slices_live--;
             if (c->argv_slice_sds[limit_idx]) {
                 sdsfree(c->argv_slice_sds[limit_idx]);
                 c->argv_slice_sds[limit_idx] = NULL;
@@ -2083,7 +2082,6 @@ void streamRewriteStripLimit(client *c, int limit_idx) {
             decrRefCount(limit_tok);
         }
         if (c->argv_slice_mask & (1U << (limit_idx + 1))) {
-            c->argv_slices_live--;
             if (c->argv_slice_sds[limit_idx + 1]) {
                 sdsfree(c->argv_slice_sds[limit_idx + 1]);
                 c->argv_slice_sds[limit_idx + 1] = NULL;
@@ -2116,7 +2114,7 @@ void streamRewriteStripLimit(client *c, int limit_idx) {
         c->argv_slice_mask = low_mask | high_mask;
         c->argv_slice_sds[c->argc - 2] = NULL;
         c->argv_slice_sds[c->argc - 1] = NULL;
-        if (c->argv_slices_live == 0) c->flag.argv_sliced = 0;
+        if (c->argv_slice_mask == 0) c->flag.argv_sliced = 0;
     }
 
     c->argc -= 2;

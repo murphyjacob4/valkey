@@ -366,7 +366,6 @@ client *createClient(connection *conn) {
     c->argv_len = 0;
     c->argv_len_sum = 0;
     c->argv_slice_mask = 0;
-    c->argv_slices_live = 0;
     for (int i = 0; i < ARGV_INLINE_MAX; i++) c->argv_slice_sds[i] = NULL;
     c->original_argc = 0;
     c->original_argv = NULL;
@@ -2177,14 +2176,13 @@ void freeClientArgv(client *c) {
                     sdsfree(c->argv_slice_sds[j]);
                     c->argv_slice_sds[j] = NULL;
                 }
-                c->argv_slices_live--;
+                c->argv_slice_mask &= ~(1U << j);
             } else {
                 decrRefCount(c->argv[j]);
             }
         }
-        serverAssert(c->argv_slices_live == 0);
+        serverAssert(c->argv_slice_mask == 0);
         if (c->argv != c->argv_inline) zfree(c->argv);
-        c->argv_slice_mask = 0;
         c->flag.argv_sliced = 0;
         goto clear;
     }
@@ -2553,10 +2551,10 @@ void logInvalidUseAndFreeClientAsync(client *c, const char *fmt, ...) {
 /* Trims the client query buffer to the current position. */
 void trimClientQueryBuffer(client *c) {
     if (c->querybuf == NULL || c->qb_pos == 0) return;
-    if (c->argv_slices_live > 0) return;
+    if (c->argv_slice_mask != 0) return;
     if (c->cmd_queue.len > 0) {
         for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
-            if (c->cmd_queue.cmds[i].argv_slices_live > 0) return;
+            if (c->cmd_queue.cmds[i].argv_slice_mask != 0) return;
         }
     }
 
@@ -3801,7 +3799,7 @@ void resetClient(client *c) {
     if (server.enable_debug_assert) {
         memset(c->argv_slice, 0xA5, sizeof(c->argv_slice));
     }
-    serverAssert(c->argv_slices_live == 0);
+    serverAssert(c->argv_slice_mask == 0);
     if (server.enable_debug_assert && c->querybuf && c->qb_pos > 0) {
         memset(c->querybuf, 0xA5, c->qb_pos);
     }
@@ -4125,7 +4123,6 @@ static int parseMultibulk(client *c,
     robj *slice_arr = (p ? p->argv_slice : c->argv_slice);
     sds *slice_sds_arr = (p ? p->argv_slice_sds : c->argv_slice_sds);
     uint32_t *slice_mask_ptr = (p ? &p->argv_slice_mask : &c->argv_slice_mask);
-    uint32_t *slices_live_ptr = (p ? &p->argv_slices_live : &c->argv_slices_live);
 
     if (c->multibulklen == 0) {
         /* The client (argc) should have been reset */
@@ -4342,7 +4339,6 @@ static int parseMultibulk(client *c,
                 slice_sds_arr[slice_idx] = NULL;
                 initStaticStringObject(slice_arr[slice_idx], val_sds);
                 *slice_mask_ptr |= (1U << slice_idx);
-                (*slices_live_ptr)++;
                 if (p == NULL) {
                     c->flag.argv_sliced = 1;
                 }
@@ -4610,10 +4606,9 @@ static bool consumeCommandQueue(client *c) {
         c->argv_len = p->argv_len;
     }
 
-    if (p->argv_slices_live > 0) {
+    if (p->argv_slice_mask != 0) {
         c->flag.argv_sliced = 1;
         c->argv_slice_mask = p->argv_slice_mask;
-        c->argv_slices_live = p->argv_slices_live;
         for (int j = 0; j < ARGV_INLINE_MAX; j++) {
             c->argv_slice_sds[j] = p->argv_slice_sds[j];
             p->argv_slice_sds[j] = NULL;
@@ -4621,7 +4616,6 @@ static bool consumeCommandQueue(client *c) {
     } else {
         c->flag.argv_sliced = 0;
         c->argv_slice_mask = 0;
-        c->argv_slices_live = 0;
     }
 
     if (queue->off == queue->len) {
@@ -6587,10 +6581,9 @@ void clientPromoteArgv(client *c) {
                     c->argv_slice_sds[i] = NULL;
                 }
                 c->argv_slice_mask &= ~(1U << i);
-                c->argv_slices_live--;
             }
         }
-        serverAssert(c->argv_slices_live == 0);
+        serverAssert(c->argv_slice_mask == 0);
         c->flag.argv_sliced = 0;
     }
 
@@ -6604,7 +6597,7 @@ void clientPromoteArgv(client *c) {
     cmdQueue *queue = &c->cmd_queue;
     for (int i = queue->off; i < queue->len; i++) {
         parsedCommand *p = &queue->cmds[i];
-        if (p->argv_slices_live > 0) {
+        if (p->argv_slice_mask != 0) {
             for (int j = 0; j < p->argc; j++) {
                 if (p->argv_slice_mask & (1U << j)) {
                     robj *old = p->argv[j];
@@ -6616,7 +6609,6 @@ void clientPromoteArgv(client *c) {
                 }
             }
             p->argv_slice_mask = 0;
-            p->argv_slices_live = 0;
         }
         if (p->argv == p->argv_inline) {
             robj **heap_argv = zmalloc(sizeof(robj *) * p->argv_len);
@@ -6769,12 +6761,11 @@ void rewriteClientCommandArgument(client *c, int i, robj *newval) {
     if (oldval) {
         if (c->flag.argv_sliced && (c->argv_slice_mask & (1U << i))) {
             c->argv_slice_mask &= ~(1U << i);
-            c->argv_slices_live--;
             if (c->argv_slice_sds[i]) {
                 sdsfree(c->argv_slice_sds[i]);
                 c->argv_slice_sds[i] = NULL;
             }
-            if (c->argv_slices_live == 0) c->flag.argv_sliced = 0;
+            if (c->argv_slice_mask == 0) c->flag.argv_sliced = 0;
         } else {
             decrRefCount(oldval);
         }

@@ -4584,7 +4584,7 @@ uint64_t getCommandFlags(client *c) {
  * cluster slot. This should be done before calling processCommand() and can be
  * done by I/O threads to offload the main-thread. */
 static void prepareCommandGeneric(robj **argv, int argc, int *read_flags, struct serverCommand **cmd, int *slot,
-                                  uint32_t *slice_mask, uint32_t *slices_live, sds *slice_sds) {
+                                  uint32_t *slice_mask, sds *slice_sds) {
     if (!(*read_flags & READ_FLAGS_PARSING_COMPLETED) || argc == 0) return;
     /* Make sure we don't do this twice. */
     debugServerAssert(*cmd == NULL && !(*read_flags & READ_FLAGS_COMMAND_NOT_FOUND));
@@ -4598,7 +4598,7 @@ static void prepareCommandGeneric(robj **argv, int argc, int *read_flags, struct
          * promote those specific arguments from ephemeral stack slices to owned heap robjs.
          * Doing this during prepareCommand offloads allocation to worker IO threads and
          * avoids slice-then-retain overhead on the main thread. */
-        if ((*cmd)->retained_first > 0 && slices_live && *slices_live > 0 && slice_mask) {
+        if ((*cmd)->retained_first > 0 && slice_mask && *slice_mask > 0) {
             int first = (*cmd)->retained_first;
             int last = ((*cmd)->retained_last < 0) ? (argc - 1) : (*cmd)->retained_last;
             int step = (*cmd)->retained_step > 0 ? (*cmd)->retained_step : 1;
@@ -4611,7 +4611,6 @@ static void prepareCommandGeneric(robj **argv, int argc, int *read_flags, struct
                         slice_sds[i] = NULL;
                     }
                     *slice_mask &= ~(1U << i);
-                    (*slices_live)--;
                 }
             }
         }
@@ -4627,8 +4626,8 @@ static void prepareCommandGeneric(robj **argv, int argc, int *read_flags, struct
 /* Prepare the client's current command. See prepareCommandGeneric(). */
 void prepareCommand(client *c) {
     prepareCommandGeneric(c->argv, c->argc, &c->read_flags, &c->parsed_cmd, &c->slot,
-                          &c->argv_slice_mask, &c->argv_slices_live, c->argv_slice_sds);
-    if (c->argv_slices_live == 0) c->flag.argv_sliced = 0;
+                          &c->argv_slice_mask, c->argv_slice_sds);
+    if (c->argv_slice_mask == 0) c->flag.argv_sliced = 0;
 }
 
 /* Prepare all parsed commands in the client's queue. See prepareCommand(). */
@@ -4640,7 +4639,7 @@ void prepareCommandQueue(client *c) {
     for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
         parsedCommand *p = &c->cmd_queue.cmds[i];
         prepareCommandGeneric(p->argv, p->argc, &p->read_flags, &p->cmd, &p->slot,
-                              &p->argv_slice_mask, &p->argv_slices_live, p->argv_slice_sds);
+                              &p->argv_slice_mask, p->argv_slice_sds);
     }
 }
 
