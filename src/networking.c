@@ -3784,15 +3784,12 @@ void resetClient(client *c) {
 
     freeClientArgv(c);
     freeClientOriginalArgv(c);
-    /* When debug assert is enabled, poison the argv slices and the consumed querybuf
-     * to quickly catch bugs where slices are used beyond their lifecycle. */
+    /* When debug assert is enabled, poison the argv slices to quickly catch
+     * bugs where slices are used beyond their lifecycle. */
     if (server.enable_debug_assert) {
         memset(c->argv_slice, 0xA5, sizeof(c->argv_slice));
     }
     serverAssert(c->argv_slice_mask == 0);
-    if (server.enable_debug_assert && c->querybuf && c->qb_pos > 0) {
-        memset(c->querybuf, 0xA5, c->qb_pos);
-    }
     c->redact_arg_bitmap = 0;
     c->cur_script = NULL;
     c->net_input_bytes_curr_cmd = 0;
@@ -4243,33 +4240,6 @@ static int parseMultibulk(client *c,
             }
 
             c->qb_pos = newline - c->querybuf + 2;
-            if (!(is_replicated) && ll >= PROTO_MBULK_BIG_ARG) {
-                /* When the client is not a replicated client (because replicated
-                 * client's querybuf can only be trimmed after data applied
-                 * and sent to replicas).
-                 *
-                 * If we are going to read a large object from network
-                 * try to make it likely that it will start at c->querybuf
-                 * boundary so that we can optimize object creation
-                 * avoiding a large copy of data.
-                 *
-                 * But only when the data we have not parsed is less than
-                 * or equal to ll+2. If the data length is greater than
-                 * ll+2, trimming querybuf is just a waste of time, because
-                 * at this time the querybuf contains not only our bulk. */
-                if (sdslen(c->querybuf) - c->qb_pos <= (size_t)ll + 2) {
-                    clientPromoteArgv(c);
-                    sdsrange(c->querybuf, c->qb_pos, -1);
-                    c->qb_pos = 0;
-                    c->qb_applied = 0;
-                    /* Hint the sds library about the amount of bytes this string is
-                     * going to contain. */
-                    c->querybuf = sdsMakeRoomForNonGreedy(c->querybuf, ll + 2 - sdslen(c->querybuf));
-                    /* We later set the peak to the used portion of the buffer, but here we over
-                     * allocated because we know what we need, make sure it'll not be shrunk before used. */
-                    if (c->querybuf_peak < (size_t)ll + 2) c->querybuf_peak = ll + 2;
-                }
-            }
             c->bulklen = ll;
             /* Per-slot network bytes-in calculation, 2nd component. */
             *net_input_bytes_curr_cmd += (bulklen_slen + 3);
@@ -4300,24 +4270,20 @@ static int parseMultibulk(client *c,
             }
 
             /* Check slicing eligibility for this argument */
-            size_t hdr_size = (c->bulklen <= 255) ? sizeof(struct sdshdr8) : sizeof(struct sdshdr16);
+            size_t hdr_size;
+            if (c->bulklen <= 255) {
+                hdr_size = sizeof(struct sdshdr8);
+            } else if (c->bulklen <= 65535) {
+                hdr_size = sizeof(struct sdshdr16);
+            } else if ((unsigned long long)c->bulklen <= 0xFFFFFFFFUL) {
+                hdr_size = sizeof(struct sdshdr32);
+            } else {
+                hdr_size = (size_t)-1;
+            }
             int can_slice = (!is_replicated && c->id != CLIENT_ID_AOF && !c->flag.multi &&
-                             *argc < ARGV_INLINE_MAX && (size_t)c->bulklen < PROTO_MBULK_BIG_ARG &&
-                             c->qb_pos >= hdr_size);
+                             *argc < ARGV_INLINE_MAX && c->qb_pos >= hdr_size);
 
-            /* Optimization: if a non-replicated client's buffer contains JUST our bulk element
-             * instead of creating a new object by *copying* the sds we
-             * just use the current sds string. */
-            if (!is_replicated && c->qb_pos == 0 && c->bulklen >= PROTO_MBULK_BIG_ARG &&
-                sdslen(c->querybuf) == (size_t)(c->bulklen + 2)) {
-                (*argv)[(*argc)++] = createObject(OBJ_STRING, c->querybuf);
-                *argv_len_sum += c->bulklen;
-                sdsIncrLen(c->querybuf, -2); /* remove CRLF */
-                /* Assume that if we saw a fat argument we'll see another one
-                 * likely... */
-                c->querybuf = sdsnewlen(SDS_NOINIT, c->bulklen + 2);
-                sdsclear(c->querybuf);
-            } else if (can_slice) {
+            if (can_slice) {
                 int slice_idx = *argc;
                 char *payload = c->querybuf + c->qb_pos;
                 sds val_sds;
@@ -4328,11 +4294,18 @@ static int parseMultibulk(client *c,
                     sh->flags = SDS_TYPE_8;
                     payload[c->bulklen] = '\0';
                     val_sds = payload;
-                } else {
+                } else if (c->bulklen <= 65535) {
                     struct sdshdr16 *sh = (struct sdshdr16 *)(payload - sizeof(struct sdshdr16));
                     sh->len = c->bulklen;
                     sh->alloc = c->bulklen;
                     sh->flags = SDS_TYPE_16;
+                    payload[c->bulklen] = '\0';
+                    val_sds = payload;
+                } else {
+                    struct sdshdr32 *sh = (struct sdshdr32 *)(payload - sizeof(struct sdshdr32));
+                    sh->len = c->bulklen;
+                    sh->alloc = c->bulklen;
+                    sh->flags = SDS_TYPE_32;
                     payload[c->bulklen] = '\0';
                     val_sds = payload;
                 }

@@ -1361,6 +1361,7 @@ typedef struct ClientModuleData {
 #define ARGV_INLINE_MAX 12 /* covers SET k v EX n XX GET, HSET h f v, ZADD z s m, ... */
 static_assert(sizeof(struct sdshdr8) == 3, "sdshdr8 size mismatch");
 static_assert(sizeof(struct sdshdr16) == 5, "sdshdr16 size mismatch");
+static_assert(sizeof(struct sdshdr32) == 9, "sdshdr32 size mismatch");
 
 /* Parser state and parse result of a command from a client's input buffer. */
 typedef struct parsedCommand {
