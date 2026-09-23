@@ -380,6 +380,8 @@ client *createClient(connection *conn) {
     c->cur_script = NULL;
     c->multibulklen = 0;
     c->bulklen = -1;
+    c->bulk_cutover_obj = NULL;
+    c->bulk_cutover_offset = 0;
     c->raw_flag1 = 0;
     c->raw_flag2 = 0;
     c->capa = 0;
@@ -2448,6 +2450,11 @@ int freeClient(client *c) {
     freeClientArgv(c);
     freeClientOriginalArgv(c);
     discardCommandQueue(c);
+    if (c->bulk_cutover_obj) {
+        decrRefCount(c->bulk_cutover_obj);
+        c->bulk_cutover_obj = NULL;
+    }
+    c->bulk_cutover_offset = 0;
     if (c->deferred_reply_errors) listRelease(c->deferred_reply_errors);
     c->deferred_reply_errors = NULL;
 #ifdef LOG_REQ_RES
@@ -3781,6 +3788,11 @@ void resetClient(client *c) {
 
     freeClientArgv(c);
     freeClientOriginalArgv(c);
+    if (c->bulk_cutover_obj) {
+        decrRefCount(c->bulk_cutover_obj);
+        c->bulk_cutover_obj = NULL;
+    }
+    c->bulk_cutover_offset = 0;
     /* When debug assert is enabled, poison the argv slices to quickly catch
      * bugs where slices are used beyond their lifecycle. */
     if (server.enable_debug_assert) {
@@ -4243,6 +4255,56 @@ static int parseMultibulk(client *c,
         }
 
         /* Read bulk argument */
+        if (c->bulk_cutover_obj == NULL && !is_replicated && c->id != CLIENT_ID_AOF &&
+            argv == &c->argv && c->bulklen >= PROTO_MBULK_BIG_ARG &&
+            sdslen(c->querybuf) - c->qb_pos < (size_t)(c->bulklen + 2)) {
+            c->bulk_cutover_obj = createRawStringObject(NULL, c->bulklen);
+            c->bulk_cutover_offset = 0;
+            size_t avail = sdslen(c->querybuf) - c->qb_pos;
+            size_t to_copy = min(avail, (size_t)c->bulklen);
+            if (to_copy > 0) {
+                memcpy(objectGetVal(c->bulk_cutover_obj), c->querybuf + c->qb_pos, to_copy);
+                c->bulk_cutover_offset = to_copy;
+                c->qb_pos += to_copy;
+            }
+            break;
+        }
+
+        if (c->bulk_cutover_obj != NULL) {
+            if (c->bulk_cutover_offset < (size_t)c->bulklen) {
+                break;
+            }
+            if (sdslen(c->querybuf) - c->qb_pos < 2) {
+                break;
+            }
+            if (unlikely(c->querybuf[c->qb_pos] != '\r' ||
+                         c->querybuf[c->qb_pos + 1] != '\n')) {
+                return READ_FLAGS_ERROR_INVALID_CRLF;
+            }
+            c->qb_pos += 2;
+
+            /* Check if we have space in argv, grow if needed */
+            if (*argc >= *argv_len) {
+                *argv_len = min(*argv_len < INT_MAX / 2 ? (*argv_len) * 2 : INT_MAX,
+                                *argc + c->multibulklen);
+                if (*argv == argv_inline) {
+                    robj **new_argv = zmalloc(sizeof(robj *) * (*argv_len));
+                    memcpy(new_argv, argv_inline, sizeof(robj *) * (*argc));
+                    *argv = new_argv;
+                } else {
+                    *argv = zrealloc(*argv, sizeof(robj *) * (*argv_len));
+                }
+            }
+
+            (*argv)[(*argc)++] = c->bulk_cutover_obj;
+            *argv_len_sum += c->bulklen;
+            c->bulk_cutover_obj = NULL;
+            c->bulk_cutover_offset = 0;
+            c->bulklen = -1;
+            c->multibulklen--;
+            continue;
+        }
+
         if (sdslen(c->querybuf) - c->qb_pos < (size_t)(c->bulklen + 2)) {
             /* Not enough data (+2 == trailing \r\n) */
             break;
@@ -4272,13 +4334,12 @@ static int parseMultibulk(client *c,
                 hdr_size = sizeof(struct sdshdr8);
             } else if (c->bulklen <= 65535) {
                 hdr_size = sizeof(struct sdshdr16);
-            } else if ((unsigned long long)c->bulklen <= 0xFFFFFFFFUL) {
-                hdr_size = sizeof(struct sdshdr32);
             } else {
                 hdr_size = (size_t)-1;
             }
             int can_slice = (!is_replicated && c->id != CLIENT_ID_AOF && !c->flag.multi &&
-                             *argc < ARGV_INLINE_MAX && c->qb_pos >= hdr_size);
+                             *argc < ARGV_INLINE_MAX && (size_t)c->bulklen < PROTO_MBULK_BIG_ARG &&
+                             c->qb_pos >= hdr_size);
 
             if (can_slice) {
                 int slice_idx = *argc;
@@ -4291,18 +4352,11 @@ static int parseMultibulk(client *c,
                     sh->flags = SDS_TYPE_8;
                     payload[c->bulklen] = '\0';
                     val_sds = payload;
-                } else if (c->bulklen <= 65535) {
+                } else {
                     struct sdshdr16 *sh = (struct sdshdr16 *)(payload - sizeof(struct sdshdr16));
                     sh->len = c->bulklen;
                     sh->alloc = c->bulklen;
                     sh->flags = SDS_TYPE_16;
-                    payload[c->bulklen] = '\0';
-                    val_sds = payload;
-                } else {
-                    struct sdshdr32 *sh = (struct sdshdr32 *)(payload - sizeof(struct sdshdr32));
-                    sh->len = c->bulklen;
-                    sh->alloc = c->bulklen;
-                    sh->flags = SDS_TYPE_32;
                     payload[c->bulklen] = '\0';
                     val_sds = payload;
                 }
@@ -4770,6 +4824,17 @@ static bool readToQueryBuf(client *c) {
         trimClientQueryBuffer(c);
     }
 
+    if (c->bulk_cutover_obj != NULL && c->bulk_cutover_offset < (size_t)c->bulklen) {
+        size_t remaining = (size_t)c->bulklen - c->bulk_cutover_offset;
+        size_t to_read = min(remaining, (size_t)1024 * 1024 * 16);
+        c->nread = connRead(c->conn, ((char *)objectGetVal(c->bulk_cutover_obj)) + c->bulk_cutover_offset, to_read);
+        if (c->nread <= 0) {
+            return false;
+        }
+        c->bulk_cutover_offset += c->nread;
+        return (size_t)c->nread == to_read;
+    }
+
     readlen = PROTO_IOBUF_LEN;
     qblen = c->querybuf ? sdslen(c->querybuf) : 0;
     /* If this is a multi bulk request, and we are processing a bulk reply
@@ -4779,7 +4844,8 @@ static bool readToQueryBuf(client *c) {
      * parseMultibulkBuffer() can avoid copying buffers to create the
      * robj representing the argument. */
 
-    if (c->reqtype == PROTO_REQ_MULTIBULK && c->multibulklen && c->bulklen != -1 && c->bulklen >= PROTO_MBULK_BIG_ARG) {
+    if (c->bulk_cutover_obj == NULL && c->reqtype == PROTO_REQ_MULTIBULK && c->multibulklen &&
+        c->bulklen != -1 && c->bulklen >= PROTO_MBULK_BIG_ARG) {
         ssize_t remaining = (size_t)(c->bulklen + 2) - (qblen - c->qb_pos);
         big_arg = 1;
 
@@ -4829,6 +4895,7 @@ static bool readToQueryBuf(client *c) {
          *
          * For unauthenticated clients, the query buffer cannot exceed 1MB at most. */
         size_t qb_memory = sdslen(c->querybuf) + (c->mstate ? c->mstate->argv_len_sums : 0);
+        if (c->bulk_cutover_obj) qb_memory += c->bulklen;
         if (qb_memory > server.client_max_querybuf_len ||
             (qb_memory > 1024 * 1024 && (c->read_flags & READ_FLAGS_AUTH_REQUIRED))) {
             c->read_flags |= READ_FLAGS_QB_LIMIT_REACHED;
@@ -6756,6 +6823,9 @@ size_t getClientMemoryUsage(client *c, size_t *output_buffer_mem_usage) {
 
     if (output_buffer_mem_usage != NULL) *output_buffer_mem_usage = mem;
     mem += c->querybuf ? sdsAllocSize(c->querybuf) : 0;
+    if (c->bulk_cutover_obj) {
+        mem += zmalloc_size(c->bulk_cutover_obj) + sdsAllocSize(objectGetVal(c->bulk_cutover_obj));
+    }
     mem += zmalloc_size(c);
     mem += c->buf_usable_size;
     /* Compression staging capacity is retained for reuse, so account it as
@@ -7212,6 +7282,7 @@ int processClientIOReadsDone(client *c) {
         if (res == PARSE_ERR) {
             return needs_post_read_update;
         } else if (res == PARSE_NEEDMORE) {
+            if (c->argv_slice_mask) clientPromoteArgv(c);
             beforeNextClient(c);
             return needs_post_read_update;
         }
