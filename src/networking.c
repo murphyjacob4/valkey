@@ -2612,10 +2612,14 @@ void beforeNextClient(client *c) {
     }
 
     /* If querybuf has been fully consumed, has no slices, client has no pending commands,
-     * and no partial command in-flight, reclaim querybuf so idle clients do not hoard memory. */
+     * no partial command in-flight, and querybuf fits in the freelist size,
+     * reclaim querybuf so idle clients do not hoard memory.
+     * Buffers larger than freelist size are retained by the active client (and shrunk
+     * by serverCron if idle) to avoid buffer thrashing on large payloads. */
     if (!isReplicatedClient(c) && c->querybuf && c->qb_pos == sdslen(c->querybuf) &&
         c->argv_slice_mask == 0 && c->cmd_queue.len == 0 &&
-        c->bulk_cutover_obj == NULL && c->multibulklen == 0 && c->reqtype == 0) {
+        c->bulk_cutover_obj == NULL && c->multibulklen == 0 && c->reqtype == 0 &&
+        sdsalloc(c->querybuf) <= PROTO_IOBUF_LEN * 2) {
         if (server.active_io_threads_num > 1) {
             tryOffloadFreeQueryBufToIOThread(c);
         } else {
