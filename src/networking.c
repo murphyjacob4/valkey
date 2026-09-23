@@ -2611,10 +2611,11 @@ void beforeNextClient(client *c) {
         return;
     }
 
-    /* If querybuf has been fully consumed, has no slices, and client has no pending commands,
-     * reclaim querybuf so idle clients do not hoard memory. */
+    /* If querybuf has been fully consumed, has no slices, client has no pending commands,
+     * and no partial command in-flight, reclaim querybuf so idle clients do not hoard memory. */
     if (!isReplicatedClient(c) && c->querybuf && c->qb_pos == sdslen(c->querybuf) &&
-        c->argv_slice_mask == 0 && c->cmd_queue.len == 0) {
+        c->argv_slice_mask == 0 && c->cmd_queue.len == 0 &&
+        c->bulk_cutover_obj == NULL && c->multibulklen == 0 && c->reqtype == 0) {
         if (server.active_io_threads_num > 1) {
             tryOffloadFreeQueryBufToIOThread(c);
         } else {
@@ -4288,7 +4289,7 @@ static int parseMultibulk(client *c,
             if (c->bulk_cutover_offset < (size_t)c->bulklen) {
                 break;
             }
-            if (sdslen(c->querybuf) - c->qb_pos < 2) {
+            if (c->querybuf == NULL || sdslen(c->querybuf) - c->qb_pos < 2) {
                 break;
             }
             if (unlikely(c->querybuf[c->qb_pos] != '\r' ||
