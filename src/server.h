@@ -2870,15 +2870,10 @@ struct serverCommand {
     /* Nested prefetch: argv index of the field/member used for the inner hashtable
      * lookup. 0 means disabled. Used by the prefetch system to find the lookup key. */
     int member_arg_index;
-    /* Retained arguments hint: argv indices of arguments that are retained
-     * into the database (e.g. SET, MSET values). Slices at these indices are promoted
-     * to owned heap robjs during command preparation, offloading allocation to IO threads.
-     * retained_first: 0 if none.
-     * retained_last: -1 for up to (argc - 1).
-     * retained_step: step size (e.g. 1 for contiguous, 2 for key-value pairs). */
-    int retained_first;
-    int retained_last;
-    int retained_step;
+    /* Retained arguments flag: 1 if command retains any arguments into the database
+     * (e.g. SET, MSET values). If set, all ephemeral slices are promoted to owned heap
+     * robjs during command preparation, offloading allocation to IO threads. */
+    int retain_args;
     /* Array of subcommands (may be NULL) */
     struct serverCommand *subcommands;
     /* Array of arguments (may be NULL) */

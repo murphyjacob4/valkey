@@ -39,9 +39,7 @@ struct commandDocs {
     cliCommandArg *args; /* An array of the command arguments. */
     struct commandDocs *subcommands;
     int member_arg_index; /* unused in CLI, present for commands.def compatibility */
-    int retained_first;   /* unused in CLI, present for commands.def compatibility */
-    int retained_last;    /* unused in CLI, present for commands.def compatibility */
-    int retained_step;    /* unused in CLI, present for commands.def compatibility */
+    int retain_args;      /* unused in CLI, present for commands.def compatibility */
     char *params;         /* A string describing the syntax of the command arguments. */
 };
 

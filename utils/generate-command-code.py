@@ -157,20 +157,10 @@ def check_acl_categories(command):
 def check_retained_args(command):
     if not command.retained_args:
         return True
-    ra = command.retained_args
-    if not isinstance(ra, dict) or "first" not in ra or "last" not in ra or "step" not in ra:
-        print("command: %s invalid retained_args spec" % command.fullname())
-        return False
-    if ra["first"] < 1:
-        print("command: %s retained_first must be >= 1" % command.fullname())
-        return False
-    if ra["last"] < -1 or ra["last"] == 0:
-        print("command: %s retained_last must be >= 1 or -1" % command.fullname())
-        return False
-    if ra["step"] < 1:
-        print("command: %s retained_step must be >= 1" % command.fullname())
-        return False
-    return True
+    if isinstance(command.retained_args, (bool, dict)):
+        return True
+    print("command: %s invalid retained_args spec" % command.fullname())
+    return False
 
 
 # Globals
@@ -574,11 +564,7 @@ class Command(object):
             s += ".member_arg_index=%d," % member_arg_index
 
         if self.retained_args:
-            s += ".retained_first=%d,.retained_last=%d,.retained_step=%d," % (
-                self.retained_args["first"],
-                self.retained_args["last"],
-                self.retained_args["step"],
-            )
+            s += ".retain_args=1,"
 
         if self.reply_schema and args.with_reply_schema:
             s += ".reply_schema=&%s," % self.reply_schema_name()

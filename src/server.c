@@ -4594,21 +4594,18 @@ static void prepareCommandGeneric(robj **argv, int argc, int *read_flags, struct
     } else if (!commandCheckArity(*cmd, argc, NULL)) {
         *read_flags |= READ_FLAGS_BAD_ARITY;
     } else {
-        /* If the command has retained argument hints and arguments were sliced,
-         * promote those specific arguments from ephemeral stack slices to owned heap robjs.
-         * Doing this during prepareCommand offloads allocation to worker IO threads and
-         * avoids slice-then-retain overhead on the main thread. */
-        if ((*cmd)->retained_first > 0 && slice_mask && *slice_mask > 0) {
-            int first = (*cmd)->retained_first;
-            int last = ((*cmd)->retained_last < 0) ? (argc - 1) : (*cmd)->retained_last;
-            int step = (*cmd)->retained_step > 0 ? (*cmd)->retained_step : 1;
-            for (int i = first; i <= last && i < argc; i += step) {
+        /* If the command retains arguments in memory and arguments were sliced,
+         * promote all slices to owned heap robjs. This clears slice_mask entirely,
+         * ensuring the command runs with a standard owned argv array.
+         * Doing this during prepareCommand offloads allocation to worker IO threads. */
+        if ((*cmd)->retain_args && slice_mask && *slice_mask > 0) {
+            for (int i = 0; i < argc; i++) {
                 if (*slice_mask & (1U << i)) {
                     robj *slice = argv[i];
                     argv[i] = createStringObject(objectGetVal(slice), sdslen(objectGetVal(slice)));
-                    *slice_mask &= ~(1U << i);
                 }
             }
+            *slice_mask = 0;
         }
         if (server.cluster_enabled) {
             debugServerAssert(*slot == -1 &&
