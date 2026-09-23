@@ -2611,6 +2611,20 @@ void beforeNextClient(client *c) {
         return;
     }
 
+    /* If querybuf has been fully consumed, has no slices, and client has no pending commands,
+     * reclaim querybuf so idle clients do not hoard memory. */
+    if (!isReplicatedClient(c) && c->querybuf && c->qb_pos == sdslen(c->querybuf) &&
+        c->argv_slice_mask == 0 && c->cmd_queue.len == 0) {
+        if (server.active_io_threads_num > 1) {
+            tryOffloadFreeQueryBufToIOThread(c);
+        } else {
+            queryBufRecycle(c->querybuf);
+            c->querybuf = NULL;
+            c->qb_pos = 0;
+            c->qb_applied = 0;
+        }
+    }
+
     updateClientMemUsageAndBucket(c);
     /* If IO threads are enabled try to write immediately the reply instead of waiting to beforeSleep,
      * unless aof_fsync is set to always in which case we need to wait for beforeSleep after writing the aof buffer. */
@@ -4802,6 +4816,42 @@ int processInputBuffer(client *c) {
     return C_OK;
 }
 
+#define QBUF_FREELIST_DEPTH 4
+
+static _Thread_local sds thread_qb_freelist[QBUF_FREELIST_DEPTH];
+static _Thread_local int thread_qb_freelist_count = 0;
+
+/* Get a query buffer, preferring a recycled buffer from the calling thread's
+ * free list before allocating a new one. */
+sds queryBufGet(void) {
+    if (thread_qb_freelist_count > 0) {
+        return thread_qb_freelist[--thread_qb_freelist_count];
+    }
+    return sdsMakeRoomFor(sdsempty(), PROTO_IOBUF_LEN);
+}
+
+/* Recycle a query buffer back into the calling thread's free list if eligible,
+ * or free it immediately. */
+void queryBufRecycle(sds qb) {
+    if (qb == NULL) return;
+    if (thread_qb_freelist_count < QBUF_FREELIST_DEPTH &&
+        sdsType(qb) == SDS_TYPE_16 &&
+        sdsalloc(qb) <= PROTO_IOBUF_LEN * 2 &&
+        sdsalloc(qb) >= PROTO_IOBUF_LEN) {
+        sdsclear(qb);
+        thread_qb_freelist[thread_qb_freelist_count++] = qb;
+    } else {
+        sdsfree(qb);
+    }
+}
+
+/* Drain all query buffers cached in the calling thread's free list. */
+void queryBufFreeListDrain(void) {
+    while (thread_qb_freelist_count > 0) {
+        sdsfree(thread_qb_freelist[--thread_qb_freelist_count]);
+    }
+}
+
 /* This function can be called from the main-thread or from the IO-thread.
  * The function allocates query-buf for the client if required and reads to it from the network.
  * It will set c->nread to the bytes read from the network.
@@ -4859,7 +4909,7 @@ static bool readToQueryBuf(client *c) {
     }
 
     if (c->querybuf == NULL) {
-        c->querybuf = sdsempty();
+        c->querybuf = queryBufGet();
         qblen = 0;
     }
 

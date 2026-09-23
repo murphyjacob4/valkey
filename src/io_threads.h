@@ -12,6 +12,8 @@
 typedef enum {
     JOB_SPSC_FREE_ARGV = 0,
     JOB_SPSC_POLL = 1,
+    JOB_SPSC_FREE_QUERYBUF_RECYCLE = 2,
+    JOB_SPSC_FREE_QUERYBUF_RAW = 3,
 } JobRequestSPSC;
 
 /* Tags for the SPMC shared inbox (main thread → any I/O thread). */
@@ -48,6 +50,7 @@ int trySendReadToIOThreads(client *c);
 int trySendWriteToIOThreads(client *c);
 int tryOffloadFreeObjToIOThreads(robj *o);
 int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv);
+int tryOffloadFreeQueryBufToIOThread(client *c);
 void IOThreadsAfterSleep(int numevents);
 void IOThreadsBeforeSleep(long long current_time);
 void drainIOThreadsQueue(void);

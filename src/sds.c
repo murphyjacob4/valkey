@@ -196,6 +196,12 @@ void sdsfree(sds s) {
     s_free_with_size(sdsAllocPtr(s), sdsAllocSize(s));
 }
 
+/* Free an SDS string given its raw allocation pointer. */
+void sdsfreeAllocPtr(void *alloc_ptr) {
+    if (alloc_ptr == NULL) return;
+    s_free(alloc_ptr);
+}
+
 /* This variant of sdsfree() gets its argument as void, and is useful
  * as free method in data structures that expect a 'void free_object(void*)'
  * prototype for the free method. */

@@ -304,6 +304,7 @@ static void flushPendingIOResponses(int blocking) {
 void cleanupThreadResources(void *dummy) {
     UNUSED(dummy);
 
+    queryBufFreeListDrain();
     /* Blocking flush: ensure all pending jobs are sent before thread dies */
     flushPendingIOResponses(1);
 }
@@ -382,6 +383,16 @@ static void *IOThreadMain(void *myid) {
                     break;
                 case JOB_SPSC_POLL:
                     ioThreadPoll((aeEventLoop *)data);
+                    break;
+                case JOB_SPSC_FREE_QUERYBUF_RECYCLE: {
+                    sds qb = (char *)data + sizeof(struct sdshdr16);
+                    serverAssert(sdsType(qb) == SDS_TYPE_16);
+                    serverAssert(sdsAllocPtr(qb) == data);
+                    queryBufRecycle(qb);
+                    break;
+                }
+                case JOB_SPSC_FREE_QUERYBUF_RAW:
+                    sdsfreeAllocPtr(data);
                     break;
                 default:
                     serverPanic("Invalid SPSC job type: %d", type);
@@ -968,6 +979,45 @@ int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv) {
      * of memory barriers and cache line bouncing associated
      * with updating the queue's write pointer per job. */
     spscEnqueue(&io_private_inbox[target_id], job, false);
+    io_jobs_submitted++;
+
+    return C_OK;
+}
+
+/* This function attempts to offload freeing the client's query buffer to the
+ * client's assigned IO thread.
+ * Returns C_OK if offloaded, C_ERR otherwise. */
+int tryOffloadFreeQueryBufToIOThread(client *c) {
+    if (server.active_io_threads_num <= 1 || c->querybuf == NULL) {
+        return C_ERR;
+    }
+
+    int target_id = c->cur_tid;
+    if (target_id < 1 || target_id >= server.active_io_threads_num) {
+        target_id = (c->id % (server.active_io_threads_num - 1)) + 1;
+    }
+
+    if (spscIsFull(&io_private_inbox[target_id])) {
+        return C_ERR;
+    }
+
+    sds qb = c->querybuf;
+    c->querybuf = NULL;
+    c->qb_pos = 0;
+    c->qb_applied = 0;
+
+    int type = sdsType(qb);
+    size_t alloc = sdsalloc(qb);
+    int job_type;
+    if (type == SDS_TYPE_16 && alloc >= PROTO_IOBUF_LEN && alloc <= PROTO_IOBUF_LEN * 2) {
+        job_type = JOB_SPSC_FREE_QUERYBUF_RECYCLE;
+    } else {
+        job_type = JOB_SPSC_FREE_QUERYBUF_RAW;
+    }
+
+    void *raw_alloc = sdsAllocPtr(qb);
+    void *job = tagJob(raw_alloc, job_type);
+    spscEnqueue(&io_private_inbox[target_id], job, true);
     io_jobs_submitted++;
 
     return C_OK;
