@@ -366,7 +366,6 @@ client *createClient(connection *conn) {
     c->argv_len = 0;
     c->argv_len_sum = 0;
     c->argv_slice_mask = 0;
-    for (int i = 0; i < ARGV_INLINE_MAX; i++) c->argv_slice_sds[i] = NULL;
     c->original_argc = 0;
     c->original_argv = NULL;
     c->redact_arg_bitmap = 0;
@@ -2168,10 +2167,6 @@ void freeClientArgv(client *c) {
     if (c->argv_slice_mask) {
         for (int j = 0; j < c->argc; j++) {
             if (c->argv_slice_mask & (1U << j)) {
-                if (c->argv_slice_sds[j]) {
-                    sdsfree(c->argv_slice_sds[j]);
-                    c->argv_slice_sds[j] = NULL;
-                }
                 c->argv_slice_mask &= ~(1U << j);
             } else {
                 decrRefCount(c->argv[j]);
@@ -4118,7 +4113,6 @@ static int parseMultibulk(client *c,
     int auth_required = c->read_flags & READ_FLAGS_AUTH_REQUIRED;
     robj **argv_inline = (p ? p->argv_inline : c->argv_inline);
     robj *slice_arr = (p ? p->argv_slice : c->argv_slice);
-    sds *slice_sds_arr = (p ? p->argv_slice_sds : c->argv_slice_sds);
     uint32_t *slice_mask_ptr = (p ? &p->argv_slice_mask : &c->argv_slice_mask);
 
     if (c->multibulklen == 0) {
@@ -4309,7 +4303,6 @@ static int parseMultibulk(client *c,
                     payload[c->bulklen] = '\0';
                     val_sds = payload;
                 }
-                slice_sds_arr[slice_idx] = NULL;
                 initStaticStringObject(slice_arr[slice_idx], val_sds);
                 *slice_mask_ptr |= (1U << slice_idx);
                 (*argv)[(*argc)++] = &slice_arr[slice_idx];
@@ -4573,15 +4566,7 @@ static bool consumeCommandQueue(client *c) {
         c->argv_len = p->argv_len;
     }
 
-    if (p->argv_slice_mask != 0) {
-        c->argv_slice_mask = p->argv_slice_mask;
-        for (int j = 0; j < ARGV_INLINE_MAX; j++) {
-            c->argv_slice_sds[j] = p->argv_slice_sds[j];
-            p->argv_slice_sds[j] = NULL;
-        }
-    } else {
-        c->argv_slice_mask = 0;
-    }
+    c->argv_slice_mask = p->argv_slice_mask;
 
     if (queue->off == queue->len) {
         /* The queue is empty. Don't free it here, because if parsing is done in
@@ -4599,10 +4584,6 @@ void discardCommandQueue(client *c) {
         for (int j = 0; j < p->argc; j++) {
             if (!(p->argv_slice_mask & (1U << j))) {
                 decrRefCount(p->argv[j]);
-            }
-            if (p->argv_slice_sds[j]) {
-                sdsfree(p->argv_slice_sds[j]);
-                p->argv_slice_sds[j] = NULL;
             }
         }
         if (p->argv != p->argv_inline) {
@@ -6541,10 +6522,6 @@ void clientPromoteArgv(client *c) {
                 robj *slice = c->argv[i];
                 robj *promoted = createStringObject(objectGetVal(slice), sdslen(objectGetVal(slice)));
                 c->argv[i] = promoted;
-                if (c->argv_slice_sds[i]) {
-                    sdsfree(c->argv_slice_sds[i]);
-                    c->argv_slice_sds[i] = NULL;
-                }
                 c->argv_slice_mask &= ~(1U << i);
             }
         }
@@ -6566,10 +6543,6 @@ void clientPromoteArgv(client *c) {
                 if (p->argv_slice_mask & (1U << j)) {
                     robj *old = p->argv[j];
                     p->argv[j] = createStringObject(objectGetVal(old), sdslen(objectGetVal(old)));
-                    if (p->argv_slice_sds[j]) {
-                        sdsfree(p->argv_slice_sds[j]);
-                        p->argv_slice_sds[j] = NULL;
-                    }
                 }
             }
             p->argv_slice_mask = 0;
@@ -6725,10 +6698,6 @@ void rewriteClientCommandArgument(client *c, int i, robj *newval) {
     if (oldval) {
         if (c->argv_slice_mask & (1U << i)) {
             c->argv_slice_mask &= ~(1U << i);
-            if (c->argv_slice_sds[i]) {
-                sdsfree(c->argv_slice_sds[i]);
-                c->argv_slice_sds[i] = NULL;
-            }
         } else {
             decrRefCount(oldval);
         }

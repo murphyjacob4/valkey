@@ -1375,7 +1375,6 @@ typedef struct parsedCommand {
     struct serverCommand *cmd;
     robj *argv_inline[ARGV_INLINE_MAX];
     robj argv_slice[ARGV_INLINE_MAX];
-    sds argv_slice_sds[ARGV_INLINE_MAX];
     uint32_t argv_slice_mask;
 } parsedCommand;
 
@@ -1415,7 +1414,6 @@ typedef struct client {
     size_t argv_len_sum; /* Sum of lengths of objects in argv list. */
     robj *argv_inline[ARGV_INLINE_MAX]; /* Inline argv pointer array to avoid zmalloc */
     robj argv_slice[ARGV_INLINE_MAX];   /* borrowed robj headers, 16 B each */
-    sds argv_slice_sds[ARGV_INLINE_MAX]; /* allocated sds if heap-per-slice, or NULL */
     uint32_t argv_slice_mask;           /* bit i: argv[i] is a slice, not owned */
     int reqtype;         /* Request protocol type: PROTO_REQ_* */
     int multibulklen;    /* Number of multi bulk arguments left to read. */

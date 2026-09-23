@@ -4584,7 +4584,7 @@ uint64_t getCommandFlags(client *c) {
  * cluster slot. This should be done before calling processCommand() and can be
  * done by I/O threads to offload the main-thread. */
 static void prepareCommandGeneric(robj **argv, int argc, int *read_flags, struct serverCommand **cmd, int *slot,
-                                  uint32_t *slice_mask, sds *slice_sds) {
+                                  uint32_t *slice_mask) {
     if (!(*read_flags & READ_FLAGS_PARSING_COMPLETED) || argc == 0) return;
     /* Make sure we don't do this twice. */
     debugServerAssert(*cmd == NULL && !(*read_flags & READ_FLAGS_COMMAND_NOT_FOUND));
@@ -4606,10 +4606,6 @@ static void prepareCommandGeneric(robj **argv, int argc, int *read_flags, struct
                 if (*slice_mask & (1U << i)) {
                     robj *slice = argv[i];
                     argv[i] = createStringObject(objectGetVal(slice), sdslen(objectGetVal(slice)));
-                    if (slice_sds && slice_sds[i]) {
-                        sdsfree(slice_sds[i]);
-                        slice_sds[i] = NULL;
-                    }
                     *slice_mask &= ~(1U << i);
                 }
             }
@@ -4626,7 +4622,7 @@ static void prepareCommandGeneric(robj **argv, int argc, int *read_flags, struct
 /* Prepare the client's current command. See prepareCommandGeneric(). */
 void prepareCommand(client *c) {
     prepareCommandGeneric(c->argv, c->argc, &c->read_flags, &c->parsed_cmd, &c->slot,
-                          &c->argv_slice_mask, c->argv_slice_sds);
+                          &c->argv_slice_mask);
 }
 
 /* Prepare all parsed commands in the client's queue. See prepareCommand(). */
@@ -4638,7 +4634,7 @@ void prepareCommandQueue(client *c) {
     for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
         parsedCommand *p = &c->cmd_queue.cmds[i];
         prepareCommandGeneric(p->argv, p->argc, &p->read_flags, &p->cmd, &p->slot,
-                              &p->argv_slice_mask, p->argv_slice_sds);
+                              &p->argv_slice_mask);
     }
 }
 
