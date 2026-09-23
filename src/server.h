@@ -1418,8 +1418,6 @@ typedef struct client {
     int reqtype;         /* Request protocol type: PROTO_REQ_* */
     int multibulklen;    /* Number of multi bulk arguments left to read. */
     long bulklen;        /* Length of bulk argument in multi bulk request. */
-    robj *bulk_cutover_obj;     /* Dedicated object for reading big bulk argument directly */
-    size_t bulk_cutover_offset; /* Bytes read into bulk_cutover_obj so far */
     long long woff;      /* Last write global replication offset. */
     cmdQueue cmd_queue;  /* Parsed commands queue */
     /* Command execution state and command information */
