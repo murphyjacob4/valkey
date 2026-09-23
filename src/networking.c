@@ -159,7 +159,9 @@ static int parseMultibulk(client *c,
                           int *argv_len,
                           size_t *argv_len_sum,
                           unsigned long long *net_input_bytes_curr_cmd,
-                          parsedCommand *p);
+                          robj **argv_inline,
+                          robj *argv_slice,
+                          uint32_t *argv_slice_mask);
 
 int ProcessingEventsWhileBlocked = 0; /* See processEventsWhileBlocked(). */
 
@@ -4042,7 +4044,8 @@ static void reallocCommandQueue(cmdQueue *queue, uint16_t new_cap) {
  * to be '*'. Otherwise, for inline commands parseInlineBuffer() is called. */
 void parseMultibulkBuffer(client *c) {
     int flag = parseMultibulk(c, &c->argc, &c->argv, &c->argv_len,
-                              &c->argv_len_sum, &c->net_input_bytes_curr_cmd, NULL);
+                              &c->argv_len_sum, &c->net_input_bytes_curr_cmd,
+                              c->argv_inline, c->argv_slice, &c->argv_slice_mask);
     c->read_flags |= flag;
 
     /* Record qb_pos for commandProcessed(). Written unconditionally because a
@@ -4079,7 +4082,8 @@ void parseMultibulkBuffer(client *c) {
         p->argv = p->argv_inline;
         p->argv_len = ARGV_INLINE_MAX;
         flag = parseMultibulk(c, &p->argc, &p->argv, &p->argv_len,
-                              &p->argv_len_sum, &p->input_bytes, p);
+                              &p->argv_len_sum, &p->input_bytes,
+                              p->argv_inline, p->argv_slice, &p->argv_slice_mask);
         p->read_flags = flag;
         p->slot = -1;
     }
@@ -4105,15 +4109,14 @@ static int parseMultibulk(client *c,
                           int *argv_len,
                           size_t *argv_len_sum,
                           unsigned long long *net_input_bytes_curr_cmd,
-                          parsedCommand *p) {
+                          robj **argv_inline,
+                          robj *argv_slice,
+                          uint32_t *argv_slice_mask) {
     char *newline = NULL;
     int ok;
     long long ll;
     int is_replicated = c->read_flags & READ_FLAGS_REPLICATED;
     int auth_required = c->read_flags & READ_FLAGS_AUTH_REQUIRED;
-    robj **argv_inline = (p ? p->argv_inline : c->argv_inline);
-    robj *slice_arr = (p ? p->argv_slice : c->argv_slice);
-    uint32_t *slice_mask_ptr = (p ? &p->argv_slice_mask : &c->argv_slice_mask);
 
     if (c->multibulklen == 0) {
         /* The client (argc) should have been reset */
@@ -4303,9 +4306,9 @@ static int parseMultibulk(client *c,
                     payload[c->bulklen] = '\0';
                     val_sds = payload;
                 }
-                initStaticStringObject(slice_arr[slice_idx], val_sds);
-                *slice_mask_ptr |= (1U << slice_idx);
-                (*argv)[(*argc)++] = &slice_arr[slice_idx];
+                initStaticStringObject(argv_slice[slice_idx], val_sds);
+                *argv_slice_mask |= (1U << slice_idx);
+                (*argv)[(*argc)++] = &argv_slice[slice_idx];
                 *argv_len_sum += c->bulklen;
                 c->qb_pos += c->bulklen + 2;
             } else {
