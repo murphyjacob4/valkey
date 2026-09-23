@@ -1007,7 +1007,7 @@ int clientsCronResizeQueryBuffer(client *c) {
                  * query buffer for the client, it's likely that the client will use it again soon. */
                 c->querybuf = NULL;
             } else {
-                c->querybuf = sdsRemoveFreeSpace(c->querybuf, 1);
+                clientResizeQueryBuffer(c, sdslen(c->querybuf), 1);
             }
         } else if (querybuf_size > PROTO_RESIZE_THRESHOLD && querybuf_size / 2 > c->querybuf_peak) {
             /* 2) Query buffer is too big for latest peak and is larger than
@@ -1018,7 +1018,7 @@ int clientsCronResizeQueryBuffer(client *c) {
             size_t resize = sdslen(c->querybuf);
             if (resize < c->querybuf_peak) resize = c->querybuf_peak;
             if (c->bulklen != -1 && resize < (size_t)c->bulklen + 2) resize = c->bulklen + 2;
-            c->querybuf = sdsResize(c->querybuf, resize, 1);
+            clientResizeQueryBuffer(c, resize, 1);
         }
     }
 

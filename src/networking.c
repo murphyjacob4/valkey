@@ -2566,6 +2566,63 @@ void trimClientQueryBuffer(client *c) {
     }
 }
 
+/* Fix up any argv slices (in current command or queued commands) that point
+ * into c->querybuf when c->querybuf is reallocated to a new address. */
+void clientFixupQueryBufSlicePointers(client *c, char *old_querybuf) {
+    if (!c->querybuf || c->querybuf == old_querybuf) return;
+    ptrdiff_t diff = c->querybuf - old_querybuf;
+
+    /* Fixup slices in client argv */
+    if (c->argv_slice_mask) {
+        int max_check = min(c->argc, 32);
+        for (int i = 0; i < max_check; i++) {
+            if (c->argv_slice_mask & (1U << i)) {
+                robj *slice = c->argv[i];
+                char *ptr = objectGetVal(slice);
+                objectSetVal(slice, ptr + diff);
+            }
+        }
+    }
+
+    /* Fixup slices in queued commands */
+    cmdQueue *queue = &c->cmd_queue;
+    for (int i = queue->off; i < queue->len; i++) {
+        parsedCommand *cmd = &queue->cmds[i];
+        if (cmd->argv_slice_mask) {
+            int max_check = min(cmd->argc, 32);
+            for (int j = 0; j < max_check; j++) {
+                if (cmd->argv_slice_mask & (1U << j)) {
+                    robj *slice = cmd->argv[j];
+                    char *ptr = objectGetVal(slice);
+                    objectSetVal(slice, ptr + diff);
+                }
+            }
+        }
+    }
+}
+
+/* Ensure c->querybuf has at least addlen bytes of free space, reallocating if
+ * needed and fixing up all argv slice pointers if the buffer address moved. */
+void clientMakeRoomForQueryBuffer(client *c, size_t addlen, int non_greedy) {
+    if (!c->querybuf) return;
+    char *old_qb = c->querybuf;
+    if (non_greedy) {
+        c->querybuf = sdsMakeRoomForNonGreedy(c->querybuf, addlen);
+    } else {
+        c->querybuf = sdsMakeRoomFor(c->querybuf, addlen);
+    }
+    clientFixupQueryBufSlicePointers(c, old_qb);
+}
+
+/* Resize c->querybuf to the specified size (growing or shrinking), fixing up
+ * all argv slice pointers if the buffer address moved. */
+void clientResizeQueryBuffer(client *c, size_t size, int would_regrow) {
+    if (!c->querybuf) return;
+    char *old_qb = c->querybuf;
+    c->querybuf = sdsResize(c->querybuf, size, would_regrow);
+    clientFixupQueryBufSlicePointers(c, old_qb);
+}
+
 /* Perform processing of the client before moving on to processing the next client.
  * This is useful for performing operations that affect the global state but can't
  * wait until we're done with all clients. In other words, it can't wait until beforeSleep().
@@ -4270,8 +4327,7 @@ static int parseMultibulk(client *c,
             c->qb_pos = newline - c->querybuf + 2;
             c->bulklen = ll;
             if (!is_replicated && ll >= PROTO_MBULK_BIG_ARG) {
-                if (*argv_slice_mask) clientPromoteArgv(c);
-                c->querybuf = sdsMakeRoomFor(c->querybuf, ll + 2);
+                clientMakeRoomForQueryBuffer(c, ll + 2, 0);
             }
             /* Per-slot network bytes-in calculation, 2nd component. */
             *net_input_bytes_curr_cmd += (bulklen_slen + 3);
@@ -4934,12 +4990,12 @@ static bool readToQueryBuf(client *c) {
          * need, so using the non-greedy growing. For an initial allocation of
          * the query buffer, we also don't wanna use the greedy growth, in order
          * to avoid collision with the RESIZE_THRESHOLD mechanism. */
-        c->querybuf = sdsMakeRoomForNonGreedy(c->querybuf, readlen);
+        clientMakeRoomForQueryBuffer(c, readlen, 1);
         /* We later set the peak to the used portion of the buffer, but here we over
          * allocated because we know what we need, make sure it'll not be shrunk before used. */
         if (c->querybuf_peak < qblen + readlen) c->querybuf_peak = qblen + readlen;
     } else {
-        c->querybuf = sdsMakeRoomFor(c->querybuf, readlen);
+        clientMakeRoomForQueryBuffer(c, readlen, 0);
 
         /* Read as much as possible from the socket to save read(2) system calls. */
         readlen = sdsavail(c->querybuf);
