@@ -4181,6 +4181,21 @@ void parseMultibulkBuffer(client *c) {
     }
 }
 
+/* Ensure client's argv array has space for the next argument, growing it if needed. */
+static inline void clientGrowArgvIfNeeded(client *c, int argc, robj ***argv, int *argv_len, robj **argv_inline) {
+    if (unlikely(argc >= *argv_len)) {
+        *argv_len = min(*argv_len < INT_MAX / 2 ? (*argv_len) * 2 : INT_MAX,
+                        argc + c->multibulklen);
+        if (*argv == argv_inline) {
+            robj **new_argv = zmalloc(sizeof(robj *) * (*argv_len));
+            memcpy(new_argv, argv_inline, sizeof(robj *) * argc);
+            *argv = new_argv;
+        } else {
+            *argv = zrealloc(*argv, sizeof(robj *) * (*argv_len));
+        }
+    }
+}
+
 /* Incremental parsing of a command in the client's query buffer.
  *
  * Parser state related to the input buffer are per client and stored in the
@@ -4367,18 +4382,7 @@ static int parseMultibulk(client *c,
             }
             sdsIncrLen(buf, -2);
 
-            /* Check if we have space in argv, grow if needed */
-            if (*argc >= *argv_len) {
-                *argv_len = min(*argv_len < INT_MAX / 2 ? (*argv_len) * 2 : INT_MAX,
-                                *argc + c->multibulklen);
-                if (*argv == argv_inline) {
-                    robj **new_argv = zmalloc(sizeof(robj *) * (*argv_len));
-                    memcpy(new_argv, argv_inline, sizeof(robj *) * (*argc));
-                    *argv = new_argv;
-                } else {
-                    *argv = zrealloc(*argv, sizeof(robj *) * (*argv_len));
-                }
-            }
+            clientGrowArgvIfNeeded(c, *argc, argv, argv_len, argv_inline);
 
             (*argv)[(*argc)++] = c->bulk_cutover_obj;
             *argv_len_sum += c->bulklen;
@@ -4392,18 +4396,7 @@ static int parseMultibulk(client *c,
             /* Not enough data (+2 == trailing \r\n) */
             break;
         } else {
-            /* Check if we have space in argv, grow if needed */
-            if (*argc >= *argv_len) {
-                *argv_len = min(*argv_len < INT_MAX / 2 ? (*argv_len) * 2 : INT_MAX,
-                                *argc + c->multibulklen);
-                if (*argv == argv_inline) {
-                    robj **new_argv = zmalloc(sizeof(robj *) * (*argv_len));
-                    memcpy(new_argv, argv_inline, sizeof(robj *) * (*argc));
-                    *argv = new_argv;
-                } else {
-                    *argv = zrealloc(*argv, sizeof(robj *) * (*argv_len));
-                }
-            }
+            clientGrowArgvIfNeeded(c, *argc, argv, argv_len, argv_inline);
 
             /* Check that what follows argv is a real \r\n */
             if (unlikely(c->querybuf[c->qb_pos + c->bulklen] != '\r' ||
