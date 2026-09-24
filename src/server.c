@@ -3938,7 +3938,9 @@ void alsoPropagate(int dbid, robj **argv, int argc, int target, int slot) {
     argvcopy = zmalloc(sizeof(robj *) * argc);
     for (j = 0; j < argc; j++) {
         argvcopy[j] = argv[j];
-        incrRefCount(argv[j]);
+        if (argv[j]->refcount != OBJ_STATIC_REFCOUNT) {
+            incrRefCount(argv[j]);
+        }
     }
     serverOpArrayAppend(&server.also_propagate, dbid, argvcopy, argc, target, slot);
 }
@@ -4381,7 +4383,6 @@ void call(client *c, int flags) {
         /* Call alsoPropagate() only if at least one of AOF / replication
          * propagation is needed. */
         if (propagate_flags != PROPAGATE_NONE && shouldPropagate(propagate_flags)) {
-            clientPromoteArgv(c);
             alsoPropagate(c->db->id, c->argv, c->argc, propagate_flags, c->slot);
         }
     }
