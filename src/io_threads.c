@@ -384,16 +384,13 @@ static void *IOThreadMain(void *myid) {
                 case JOB_SPSC_POLL:
                     ioThreadPoll((aeEventLoop *)data);
                     break;
-                case JOB_SPSC_FREE_QUERYBUF_RECYCLE: {
+                case JOB_SPSC_FREE_QUERYBUF: {
                     sds qb = (char *)data + sizeof(struct sdshdr16);
                     serverAssert(sdsType(qb) == SDS_TYPE_16);
                     serverAssert(sdsAllocPtr(qb) == data);
                     queryBufRecycle(qb);
                     break;
                 }
-                case JOB_SPSC_FREE_QUERYBUF_RAW:
-                    sdsfreeAllocPtr(data);
-                    break;
                 default:
                     serverPanic("Invalid SPSC job type: %d", type);
                 }
@@ -1002,21 +999,16 @@ int tryOffloadFreeQueryBufToIOThread(client *c) {
     }
 
     sds qb = c->querybuf;
+    if (sdsType(qb) != SDS_TYPE_16) {
+        return C_ERR;
+    }
+
     c->querybuf = NULL;
     c->qb_pos = 0;
     c->qb_applied = 0;
 
-    int type = sdsType(qb);
-    size_t alloc = sdsalloc(qb);
-    int job_type;
-    if (type == SDS_TYPE_16 && alloc >= PROTO_IOBUF_LEN && alloc <= PROTO_IOBUF_LEN * 2) {
-        job_type = JOB_SPSC_FREE_QUERYBUF_RECYCLE;
-    } else {
-        job_type = JOB_SPSC_FREE_QUERYBUF_RAW;
-    }
-
     void *raw_alloc = sdsAllocPtr(qb);
-    void *job = tagJob(raw_alloc, job_type);
+    void *job = tagJob(raw_alloc, JOB_SPSC_FREE_QUERYBUF);
     spscEnqueue(&io_private_inbox[target_id], job, true);
     io_jobs_submitted++;
 

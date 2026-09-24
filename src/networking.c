@@ -2570,6 +2570,7 @@ void trimClientQueryBuffer(client *c) {
  * into c->querybuf when c->querybuf is reallocated to a new address. */
 void clientFixupQueryBufSlicePointers(client *c, char *old_querybuf) {
     if (!c->querybuf || c->querybuf == old_querybuf) return;
+    if (c->argv_slice_mask == 0 && c->cmd_queue.len == 0) return;
     ptrdiff_t diff = c->querybuf - old_querybuf;
 
     /* Fixup slices in client argv */
@@ -2611,7 +2612,9 @@ void clientMakeRoomForQueryBuffer(client *c, size_t addlen, int non_greedy) {
     } else {
         c->querybuf = sdsMakeRoomFor(c->querybuf, addlen);
     }
-    clientFixupQueryBufSlicePointers(c, old_qb);
+    if (unlikely(c->querybuf != old_qb)) {
+        clientFixupQueryBufSlicePointers(c, old_qb);
+    }
 }
 
 /* Resize c->querybuf to the specified size (growing or shrinking), fixing up
@@ -2620,7 +2623,9 @@ void clientResizeQueryBuffer(client *c, size_t size, int would_regrow) {
     if (!c->querybuf) return;
     char *old_qb = c->querybuf;
     c->querybuf = sdsResize(c->querybuf, size, would_regrow);
-    clientFixupQueryBufSlicePointers(c, old_qb);
+    if (unlikely(c->querybuf != old_qb)) {
+        clientFixupQueryBufSlicePointers(c, old_qb);
+    }
 }
 
 /* Perform processing of the client before moving on to processing the next client.
@@ -2677,9 +2682,8 @@ void beforeNextClient(client *c) {
         c->argv_slice_mask == 0 && c->cmd_queue.len == 0 &&
         c->bulk_cutover_obj == NULL && c->multibulklen == 0 && c->reqtype == 0 &&
         sdsalloc(c->querybuf) <= PROTO_IOBUF_LEN * 2) {
-        if (server.active_io_threads_num > 1) {
-            tryOffloadFreeQueryBufToIOThread(c);
-        } else {
+        if (server.active_io_threads_num <= 1 ||
+            tryOffloadFreeQueryBufToIOThread(c) != C_OK) {
             queryBufRecycle(c->querybuf);
             c->querybuf = NULL;
             c->qb_pos = 0;
@@ -4327,6 +4331,10 @@ static int parseMultibulk(client *c,
             c->qb_pos = newline - c->querybuf + 2;
             c->bulklen = ll;
             if (!is_replicated && ll >= PROTO_MBULK_BIG_ARG) {
+                /* Even though we will read the rest of this large argument into a dedicated
+                 * cutover object, scale the client query buffer now so that subsequent
+                 * requests or pipelined commands on active connections can be ingested in
+                 * a single read(2) syscall without requiring two reads. */
                 clientMakeRoomForQueryBuffer(c, ll + 2, 0);
             }
             /* Per-slot network bytes-in calculation, 2nd component. */
