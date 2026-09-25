@@ -982,10 +982,16 @@ long long getInstantaneousMetric(int metric) {
  *
  * The function always returns 0 as it never terminates the client. */
 int clientsCronResizeQueryBuffer(client *c) {
+    time_t idletime = server.unixtime - c->last_interaction;
+
+    /* A client idle in the middle of a big argument holds an allocation sized for
+     * the whole argument. Keep only the bytes received so far (in the query
+     * buffer); the next read re-creates the cutover object. */
+    if (c->bulk_cutover_obj && idletime > 2) clientStashBulkCutover(c);
+
     /* If the client query buffer is NULL, it is using the shared query buffer and there is nothing to do. */
     if (c->querybuf == NULL) return 0;
     size_t querybuf_size = sdsalloc(c->querybuf);
-    time_t idletime = server.unixtime - c->last_interaction;
 
     /* Only resize the query buffer if the buffer is actually wasting at least a
      * few kbytes */

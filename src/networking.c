@@ -2543,27 +2543,104 @@ void logInvalidUseAndFreeClientAsync(client *c, const char *fmt, ...) {
     freeClientAsync(c);
 }
 
-/* Trims the client query buffer to the current position. */
+/* Returns true if the current command or any queued command still has argv
+ * slices pointing into c->querybuf. */
+static inline bool clientHasQueryBufSlices(client *c) {
+    if (c->argv_slice_mask != 0) return true;
+    for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
+        if (c->cmd_queue.cmds[i].argv_slice_mask != 0) return true;
+    }
+    return false;
+}
+
+/* Lowest query buffer address referenced by the argv slices of one command, or
+ * NULL if it has none. Arguments are parsed in order, so the first sliced
+ * argument is the lowest; its sds header is written in place just before the
+ * payload, hence sdsAllocPtr(). */
+static inline char *argvLowestSlicePtr(robj **argv, int argc, uint32_t slice_mask) {
+    if (slice_mask == 0) return NULL;
+    int i = __builtin_ctz(slice_mask);
+    serverAssert(i < argc);
+    return (char *)sdsAllocPtr(objectGetVal(argv[i]));
+}
+
+/* Returns the lowest query buffer offset that must be preserved: the start of
+ * the first live argv slice (current or queued command), or qb_pos if there
+ * are no slices. */
+static size_t clientQueryBufLiveStart(client *c) {
+    char *lowest = c->querybuf + c->qb_pos;
+    char *p = argvLowestSlicePtr(c->argv, c->argc, c->argv_slice_mask);
+    if (p && p < lowest) lowest = p;
+    for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
+        parsedCommand *cmd = &c->cmd_queue.cmds[i];
+        p = argvLowestSlicePtr(cmd->argv, cmd->argc, cmd->argv_slice_mask);
+        if (p && p < lowest) lowest = p;
+    }
+    serverAssert(lowest >= c->querybuf);
+    return lowest - c->querybuf;
+}
+
+/* Trims consumed data from the front of the query buffer, keeping everything
+ * from the first byte still referenced by an argv slice (see
+ * clientQueryBufLiveStart()), or from qb_pos when there are no slices. The kept
+ * region is moved to the front of the buffer and slice pointers are shifted to
+ * match, so slices of a partially received command survive the trim.
+ *
+ * Parsed framing bytes before the first slice ("*N\r\n$len...") are dead: the
+ * parser keeps its state in the client, not in the buffer.
+ *
+ * Performs no allocation. */
 void trimClientQueryBuffer(client *c) {
     if (c->querybuf == NULL || c->qb_pos == 0) return;
-    if (c->argv_slice_mask != 0) return;
-    if (c->cmd_queue.len > 0) {
-        for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
-            if (c->cmd_queue.cmds[i].argv_slice_mask != 0) return;
-        }
-    }
-
     serverAssert(c->qb_pos <= sdslen(c->querybuf));
 
-    if (c->qb_pos > 0) {
-        if (c->qb_pos == sdslen(c->querybuf)) {
-            sdsclear(c->querybuf);
-        } else {
-            sdsrange(c->querybuf, c->qb_pos, -1);
-        }
-        c->qb_pos = 0;
-        c->qb_applied = 0;
+    size_t dead_prefix_len = clientQueryBufLiveStart(c);
+    if (dead_prefix_len == 0) return;
+
+    char *old_base = c->querybuf;
+    if (dead_prefix_len == sdslen(c->querybuf)) {
+        sdsclear(c->querybuf);
+    } else {
+        sdsrange(c->querybuf, dead_prefix_len, -1); /* In-place memmove, no realloc. */
     }
+    /* The buffer base didn't move but its contents shifted left. Passing the
+     * address where the live region used to start makes the fixup subtract
+     * exactly dead_prefix_len from every slice pointer. */
+    clientFixupQueryBufSlicePointers(c, old_base + dead_prefix_len);
+    c->qb_pos -= dead_prefix_len;
+    c->qb_applied = c->qb_applied > dead_prefix_len ? c->qb_applied - dead_prefix_len : 0;
+}
+
+/* Frees up query buffer space for the next network read, preferring (in order):
+ *
+ *   1. Trim    - drop consumed bytes, keep argv slices. No allocation. This is the
+ *                common case: in a pipeline the only live slices are those of the
+ *                one command straddling the previous read.
+ *   2. Promote - copy the sliced args to heap objects so the trim can reach
+ *                qb_pos. Only when slices are what's forcing the buffer to grow.
+ *                Slicing is limited to the first ARGV_INLINE_MAX args of a command,
+ *                so a many-argument command spanning reads pins everything from
+ *                its first arg onward; without this the buffer would grow to the
+ *                size of the whole command. Growing would copy these bytes anyway.
+ *   3. Grow    - left to the caller. Unavoidable when the live region is mostly an
+ *                unparsed partial argument (below the bulk cutover threshold). */
+static void clientMakeRoomForNextRead(client *c) {
+    trimClientQueryBuffer(c);
+
+    if (c->querybuf == NULL || c->bulk_cutover_obj != NULL) return;
+
+    size_t free_space = sdsavail(c->querybuf);
+    bool full_read_fits = free_space >= PROTO_IOBUF_LEN;
+    if (full_read_fits) return;
+
+    /* After the trim, everything in [0, qb_pos) is parsed data that is only
+     * retained because of argv slices; promoting them would release it all. */
+    size_t reclaimable_by_promotion = c->qb_pos;
+    bool promotion_makes_room = free_space + reclaimable_by_promotion >= PROTO_IOBUF_LEN;
+    if (!promotion_makes_room || !clientHasQueryBufSlices(c)) return;
+
+    clientPromoteArgv(c);
+    trimClientQueryBuffer(c);
 }
 
 /* Fix up any argv slices (in current command or queued commands) that point
@@ -2681,7 +2758,7 @@ void beforeNextClient(client *c) {
     if (!isReplicatedClient(c) && c->querybuf && c->qb_pos == sdslen(c->querybuf) &&
         c->argv_slice_mask == 0 && c->cmd_queue.len == 0 &&
         c->bulk_cutover_obj == NULL && c->multibulklen == 0 && c->reqtype == 0 &&
-        sdsalloc(c->querybuf) <= PROTO_IOBUF_LEN * 2) {
+        sdsalloc(c->querybuf) < PROTO_IOBUF_LEN * 2) {
         if (server.active_io_threads_num <= 1 ||
             tryOffloadFreeQueryBufToIOThread(c) != C_OK) {
             queryBufRecycle(c->querybuf);
@@ -4196,6 +4273,48 @@ static inline void clientGrowArgvIfNeeded(client *c, int argc, robj ***argv, int
     }
 }
 
+/* Start reading the current big bulk argument directly into a dedicated object
+ * sized for the whole argument (the "cutover" object), moving any of its bytes
+ * that are already in the query buffer into it. */
+static void clientStartBulkCutover(client *c) {
+    serverAssert(c->bulk_cutover_obj == NULL && c->bulklen >= PROTO_MBULK_BIG_ARG);
+    c->bulk_cutover_obj = createRawStringObject(NULL, c->bulklen + 2);
+    c->bulk_cutover_offset = 0;
+    size_t avail = c->querybuf ? sdslen(c->querybuf) - c->qb_pos : 0;
+    size_t to_copy = min(avail, (size_t)c->bulklen + 2);
+    if (to_copy > 0) {
+        memcpy(objectGetVal(c->bulk_cutover_obj), c->querybuf + c->qb_pos, to_copy);
+        c->bulk_cutover_offset = to_copy;
+        c->qb_pos += to_copy;
+    }
+}
+
+/* Move the bytes received so far for a big bulk argument back into the query
+ * buffer and free the argument-sized cutover object. clientsCron uses this for
+ * idle clients, so a client that stalls mid-argument doesn't pin 'bulklen'
+ * bytes of memory. The parser state (bulklen, multibulklen) is untouched, and
+ * the next read resumes the cutover (see readToQueryBuf). */
+void clientStashBulkCutover(client *c) {
+    if (c->bulk_cutover_obj == NULL) return;
+
+    /* Appending may reallocate the query buffer, so nothing may point into it. */
+    clientPromoteArgv(c);
+    serverAssert(!clientHasQueryBufSlices(c));
+    trimClientQueryBuffer(c);
+    /* While a cutover is active every read goes into the cutover object, so the
+     * query buffer has no unparsed bytes and the stashed bytes land at qb_pos. */
+    serverAssert(c->querybuf == NULL || c->qb_pos == sdslen(c->querybuf));
+    size_t received = c->bulk_cutover_offset;
+    if (c->querybuf == NULL) c->querybuf = sdsempty();
+    c->querybuf = sdsMakeRoomForNonGreedy(c->querybuf, received);
+    memcpy(c->querybuf + sdslen(c->querybuf), objectGetVal(c->bulk_cutover_obj), received);
+    sdsIncrLen(c->querybuf, received);
+
+    decrRefCount(c->bulk_cutover_obj);
+    c->bulk_cutover_obj = NULL;
+    c->bulk_cutover_offset = 0;
+}
+
 /* Incremental parsing of a command in the client's query buffer.
  *
  * Parser state related to the input buffer are per client and stored in the
@@ -4345,13 +4464,6 @@ static int parseMultibulk(client *c,
 
             c->qb_pos = newline - c->querybuf + 2;
             c->bulklen = ll;
-            if (!is_replicated && ll >= PROTO_MBULK_BIG_ARG) {
-                /* Even though we will read the rest of this large argument into a dedicated
-                 * cutover object, scale the client query buffer now so that subsequent
-                 * requests or pipelined commands on active connections can be ingested in
-                 * a single read(2) syscall without requiring two reads. */
-                clientMakeRoomForQueryBuffer(c, ll + 2, 0);
-            }
             /* Per-slot network bytes-in calculation, 2nd component. */
             *net_input_bytes_curr_cmd += (bulklen_slen + 3);
         }
@@ -4360,15 +4472,7 @@ static int parseMultibulk(client *c,
         if (c->bulk_cutover_obj == NULL && !is_replicated && c->id != CLIENT_ID_AOF &&
             argv == &c->argv && c->bulklen >= PROTO_MBULK_BIG_ARG &&
             sdslen(c->querybuf) - c->qb_pos < (size_t)(c->bulklen + 2)) {
-            c->bulk_cutover_obj = createRawStringObject(NULL, c->bulklen + 2);
-            c->bulk_cutover_offset = 0;
-            size_t avail = sdslen(c->querybuf) - c->qb_pos;
-            size_t to_copy = min(avail, (size_t)c->bulklen + 2);
-            if (to_copy > 0) {
-                memcpy(objectGetVal(c->bulk_cutover_obj), c->querybuf + c->qb_pos, to_copy);
-                c->bulk_cutover_offset = to_copy;
-                c->qb_pos += to_copy;
-            }
+            clientStartBulkCutover(c);
             break;
         }
 
@@ -4864,8 +4968,10 @@ int processInputBuffer(client *c) {
              * (read while blocked), so re-parse instead of waiting for I/O. */
             continue;
         } else if (res != PARSE_OK) {
-            /* Parse error or partial command. */
-            if (c->argv_slice_mask) clientPromoteArgv(c);
+            /* Parse error or partial command. Slices of a partial command stay
+             * valid across querybuf reallocation (pointers are fixed up), so
+             * only promote them on a parse error. */
+            if (res == PARSE_ERR && c->argv_slice_mask) clientPromoteArgv(c);
             break;
         }
 
@@ -4898,17 +5004,21 @@ sds queryBufGet(void) {
     if (thread_qb_freelist_count > 0) {
         return thread_qb_freelist[--thread_qb_freelist_count];
     }
-    return sdsMakeRoomFor(sdsempty(), PROTO_IOBUF_LEN);
+    /* Non-greedy so a fresh buffer lands in the PROTO_IOBUF_LEN (16KiB) size
+     * class rather than being doubled to 32KiB. */
+    return sdsMakeRoomForNonGreedy(sdsempty(), PROTO_IOBUF_LEN);
 }
 
 /* Recycle a query buffer back into the calling thread's free list if eligible,
- * or free it immediately. */
+ * or free it immediately. Only buffers in the PROTO_IOBUF_LEN (16KiB) size
+ * class are recycled; the allocator may round the usable size up slightly, so
+ * accept anything at least PROTO_IOBUF_LEN but below the next doubling. */
 void queryBufRecycle(sds qb) {
     if (qb == NULL) return;
     if (thread_qb_freelist_count < QBUF_FREELIST_DEPTH &&
         sdsType(qb) == SDS_TYPE_16 &&
-        sdsalloc(qb) <= PROTO_IOBUF_LEN * 2 &&
-        sdsalloc(qb) >= PROTO_IOBUF_LEN) {
+        sdsalloc(qb) >= PROTO_IOBUF_LEN &&
+        sdsalloc(qb) < PROTO_IOBUF_LEN * 2) {
         sdsclear(qb);
         thread_qb_freelist[thread_qb_freelist_count++] = qb;
     } else {
@@ -4939,10 +5049,21 @@ static bool readToQueryBuf(client *c) {
 
     int is_replicated = c->read_flags & READ_FLAGS_REPLICATED;
 
-    /* Trim any previously consumed buffer data prior to reading more data from the network.
-     * This reclaims query buffer space without reallocating, on whichever thread performs the read. */
-    if (!is_replicated) {
-        trimClientQueryBuffer(c);
+    /* Reclaim consumed query buffer space before reading more data from the network,
+     * on whichever thread performs the read. Replicated clients' query buffers can
+     * only be trimmed once the data has been applied and propagated. */
+    if (!is_replicated) clientMakeRoomForNextRead(c);
+
+    /* Resume a big bulk argument that clientsCron stashed back into the query
+     * buffer while the client was idle (see clientStashBulkCutover). This is the
+     * same state the parser would start a cutover from, so re-establish it before
+     * reading rather than growing the query buffer to the argument size. The
+     * command queue must be empty so the partial command is the one in c->argv. */
+    if (c->bulk_cutover_obj == NULL && !is_replicated && c->id != CLIENT_ID_AOF &&
+        c->reqtype == PROTO_REQ_MULTIBULK && c->multibulklen && c->bulklen >= PROTO_MBULK_BIG_ARG &&
+        c->cmd_queue.off >= c->cmd_queue.len &&
+        (c->querybuf ? sdslen(c->querybuf) - c->qb_pos : 0) < (size_t)(c->bulklen + 2)) {
+        clientStartBulkCutover(c);
     }
 
     if (c->bulk_cutover_obj != NULL && c->bulk_cutover_offset < (size_t)c->bulklen + 2) {
@@ -5228,8 +5349,13 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
             " ssub=%i", client->pubsub_data ? (int)hashtableSize(client->pubsub_data->pubsubshard_channels) : 0,
             " multi=%i", client->mstate ? client->mstate->count : -1,
             " watch=%i", client->mstate ? (int)listLength(&client->mstate->watched_keys) : 0,
-            " qbuf=%U", client->querybuf ? (unsigned long long)sdslen(client->querybuf) : 0,
-            " qbuf-free=%U", client->querybuf ? (unsigned long long)sdsavail(client->querybuf) : 0,
+            /* qbuf is only the not-yet-parsed input. Already parsed bytes that are still
+             * referenced by sliced argv are reported under argv-mem, and the memory they
+             * pin is accounted for in tot-mem. */
+            " qbuf=%U", (unsigned long long)(client->querybuf ? sdslen(client->querybuf) - client->qb_pos : 0) +
+                        (client->bulk_cutover_obj ? (unsigned long long)client->bulk_cutover_offset : 0),
+            " qbuf-free=%U", (unsigned long long)(client->querybuf ? sdsavail(client->querybuf) : 0) +
+                             (client->bulk_cutover_obj ? (unsigned long long)(client->bulklen + 2 - client->bulk_cutover_offset) : 0),
             " argv-mem=%U", (unsigned long long)client->argv_len_sum,
             " multi-mem=%U", client->mstate ? (unsigned long long)client->mstate->argv_len_sums : 0,
             " rbs=%U", (unsigned long long)client->buf_usable_size,
@@ -7401,9 +7527,11 @@ int processClientIOReadsDone(client *c) {
         parseResult res = handleParseResults(c);
         /* On parse error - stop here. */
         if (res == PARSE_ERR) {
+            if (c->argv_slice_mask) clientPromoteArgv(c);
             return needs_post_read_update;
         } else if (res == PARSE_NEEDMORE) {
-            if (c->argv_slice_mask) clientPromoteArgv(c);
+            /* Keep partial-command slices: querybuf reallocations fix up
+             * slice pointers, so there is no need to promote here. */
             beforeNextClient(c);
             return needs_post_read_update;
         }

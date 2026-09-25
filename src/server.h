@@ -3110,6 +3110,7 @@ void freeClientOrCloseLater(client *c, int async);
 void logInvalidUseAndFreeClientAsync(client *c, const char *fmt, ...);
 void beforeNextClient(client *c);
 void trimClientQueryBuffer(client *c);
+void clientStashBulkCutover(client *c);
 void clientFixupQueryBufSlicePointers(client *c, char *old_querybuf);
 void clientMakeRoomForQueryBuffer(client *c, size_t addlen, int non_greedy);
 void clientResizeQueryBuffer(client *c, size_t size, int would_regrow);
