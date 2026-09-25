@@ -5476,6 +5476,7 @@ int clientSetName(client *c, robj *name, const char **err) {
     if (objectGetRefcount(name) == OBJ_STATIC_REFCOUNT) {
         c->name = createStringObject(objectGetVal(name), len);
     } else {
+        materializeSlice(name);
         c->name = name;
         incrRefCount(name);
     }
@@ -5521,8 +5522,7 @@ void clientSetinfoCommand(client *c) {
     }
     if (*destvar) decrRefCount(*destvar);
     if (sdslen(val)) {
-        *destvar = valob;
-        incrRefCount(valob);
+        *destvar = clientRetainArg(c, 3);
     } else
         *destvar = NULL;
     addReply(c, shared.ok);
@@ -5712,32 +5712,28 @@ static int parseClientFiltersOrReply(client *c, int index, clientFilter *filter)
                 decrRefCount(filter->lib_name);
                 filter->lib_name = NULL;
             }
-            filter->lib_name = c->argv[index + 1];
-            incrRefCount(filter->lib_name);
+            filter->lib_name = clientRetainArg(c, index + 1);
             index += 2;
         } else if (!strcasecmp(objectGetVal(c->argv[index]), "not-lib-name") && moreargs) {
             if (filter->not_lib_name) {
                 decrRefCount(filter->not_lib_name);
                 filter->not_lib_name = NULL;
             }
-            filter->not_lib_name = c->argv[index + 1];
-            incrRefCount(filter->not_lib_name);
+            filter->not_lib_name = clientRetainArg(c, index + 1);
             index += 2;
         } else if (!strcasecmp(objectGetVal(c->argv[index]), "lib-ver") && moreargs) {
             if (filter->lib_ver) {
                 decrRefCount(filter->lib_ver);
                 filter->lib_ver = NULL;
             }
-            filter->lib_ver = c->argv[index + 1];
-            incrRefCount(filter->lib_ver);
+            filter->lib_ver = clientRetainArg(c, index + 1);
             index += 2;
         } else if (!strcasecmp(objectGetVal(c->argv[index]), "not-lib-ver") && moreargs) {
             if (filter->not_lib_ver) {
                 decrRefCount(filter->not_lib_ver);
                 filter->not_lib_ver = NULL;
             }
-            filter->not_lib_ver = c->argv[index + 1];
-            incrRefCount(filter->not_lib_ver);
+            filter->not_lib_ver = clientRetainArg(c, index + 1);
             index += 2;
         } else if (!strcasecmp(objectGetVal(c->argv[index]), "db") && moreargs) {
             int db_id;
@@ -6827,8 +6823,28 @@ robj *clientRetainArg(client *c, int i) {
         robj *owned = createStringObject(objectGetVal(slice), sdslen(objectGetVal(slice)));
         return owned;
     }
+    materializeSlice(c->argv[i]);
     incrRefCount(c->argv[i]);
     return c->argv[i];
+}
+
+/* Materialize the robj header for argument i onto the heap, leaving its SDS string
+ * pointing into querybuf with OBJ_ENCODING_SLICED. */
+void clientMaterializeArgvObjectOnly(client *c, int i) {
+    serverAssert(i >= 0 && i < c->argc);
+    if (c->argv_slice_mask & (1U << i)) {
+        robj *slice = c->argv[i];
+        robj *o = createObject(OBJ_STRING, objectGetVal(slice));
+        objectSetEncoding(o, OBJ_ENCODING_SLICED);
+        c->argv[i] = o;
+        c->argv_slice_mask &= ~(1U << i);
+    }
+}
+
+/* Materialize both the robj header and the SDS string payload of argument i onto the heap. */
+void clientMaterializeArgv(client *c, int i) {
+    clientMaterializeArgvObjectOnly(c, i);
+    materializeSlice(c->argv[i]);
 }
 
 /* Promote all slices in client to heap objects, ensuring no slices remain. */
@@ -6836,13 +6852,16 @@ void clientPromoteArgv(client *c) {
     if (c->argv_slice_mask) {
         for (int i = 0; i < c->argc; i++) {
             if (c->argv_slice_mask & (1U << i)) {
-                robj *slice = c->argv[i];
-                robj *promoted = createStringObject(objectGetVal(slice), sdslen(objectGetVal(slice)));
-                c->argv[i] = promoted;
-                c->argv_slice_mask &= ~(1U << i);
+                clientMaterializeArgv(c, i);
             }
         }
         serverAssert(c->argv_slice_mask == 0);
+    }
+
+    for (int i = 0; i < c->argc; i++) {
+        if (c->argv[i] && objectGetEncoding(c->argv[i]) == OBJ_ENCODING_SLICED) {
+            materializeSlice(c->argv[i]);
+        }
     }
 
     if (c->argv == c->argv_inline) {
@@ -6965,6 +6984,7 @@ void rewriteClientCommandVector(client *c, int argc, ...) {
         if (a->refcount == OBJ_STATIC_REFCOUNT) {
             a = createStringObject(objectGetVal(a), sdslen(objectGetVal(a)));
         } else {
+            materializeSlice(a);
             incrRefCount(a);
         }
         argv[j] = a;
@@ -7008,6 +7028,7 @@ void rewriteClientCommandArgument(client *c, int i, robj *newval) {
         if (newval->refcount == OBJ_STATIC_REFCOUNT) {
             newval = createStringObject(objectGetVal(newval), sdslen(objectGetVal(newval)));
         } else {
+            materializeSlice(newval);
             incrRefCount(newval);
         }
     }

@@ -432,6 +432,7 @@ void dbReplaceValue(serverDb *db, robj *key, robj **valref) {
  * The client 'c' argument may be set to NULL if the operation is performed
  * in a context where there is no clear client performing the operation. */
 void setKey(client *c, serverDb *db, robj *key, robj **valref, int flags) {
+    materializeSlice(*valref);
     int keyfound = 0;
 
     if (flags & SETKEY_ALREADY_EXIST)

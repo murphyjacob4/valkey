@@ -466,19 +466,28 @@ void blockForKeys(client *c, int btype, robj **keys, int numkeys, mstime_t timeo
 
     for (j = 0; j < numkeys; j++) {
         /* If the key already exists in the dictionary ignore it. */
-        if (!(client_blocked_entry = dictAddRaw(c->bstate->keys, keys[j], NULL))) {
-            continue;
+        if (dictFind(c->bstate->keys, keys[j]) != NULL) continue;
+
+        /* Callers may hand us key objects captured before argv promotion (still
+         * querybuf slices), so take an owned reference that outlives the command. */
+        robj *key = keys[j];
+        if (objectGetRefcount(key) == OBJ_STATIC_REFCOUNT) {
+            key = createStringObject(objectGetVal(key), sdslen(objectGetVal(key)));
+        } else {
+            materializeSlice(key);
+            incrRefCount(key);
         }
-        incrRefCount(keys[j]);
+        client_blocked_entry = dictAddRaw(c->bstate->keys, key, NULL);
+        serverAssert(client_blocked_entry != NULL);
 
         /* And in the other "side", to map keys -> clients */
-        db_blocked_entry = dictAddRaw(c->db->blocking_keys, keys[j], &db_blocked_existing_entry);
+        db_blocked_entry = dictAddRaw(c->db->blocking_keys, key, &db_blocked_existing_entry);
 
         /* In case key[j] did not have blocking clients yet, we need to create a new list */
         if (db_blocked_entry != NULL) {
             l = listCreate();
             dictSetVal(c->db->blocking_keys, db_blocked_entry, l);
-            incrRefCount(keys[j]);
+            incrRefCount(key);
         } else {
             l = dictGetVal(db_blocked_existing_entry);
         }
@@ -488,9 +497,9 @@ void blockForKeys(client *c, int btype, robj **keys, int numkeys, mstime_t timeo
         /* We need to add the key to blocking_keys_unblock_on_nokey, if the client
          * wants to be awakened if key is deleted (like XREADGROUP) */
         if (unblock_on_nokey) {
-            db_blocked_entry = dictAddRaw(c->db->blocking_keys_unblock_on_nokey, keys[j], &db_blocked_existing_entry);
+            db_blocked_entry = dictAddRaw(c->db->blocking_keys_unblock_on_nokey, key, &db_blocked_existing_entry);
             if (db_blocked_entry) {
-                incrRefCount(keys[j]);
+                incrRefCount(key);
                 dictSetUnsignedIntegerVal(db_blocked_entry, 1);
             } else {
                 dictIncrUnsignedIntegerVal(db_blocked_existing_entry, 1);
@@ -931,12 +940,20 @@ void blockClientInUseOnKeys(client *c, int num_keys, robj *keys[]) {
     serverAssert(dictSize(c->bstate->keys) == 0);
 
     for (int i = 0; i < num_keys; ++i) {
-        robj *key = keys[i];
-        serverAssert(key->type == OBJ_STRING);
+        serverAssert(keys[i]->type == OBJ_STRING);
 
         /* Deduplicate via bstate->keys dict */
-        if (dictAdd(c->bstate->keys, key, NULL) != DICT_OK) continue;
-        incrRefCount(key);
+        if (dictFind(c->bstate->keys, keys[i]) != NULL) continue;
+
+        /* Keys may still be argv slices into the querybuf; take an owned reference. */
+        robj *key = keys[i];
+        if (objectGetRefcount(key) == OBJ_STATIC_REFCOUNT) {
+            key = createStringObject(objectGetVal(key), sdslen(objectGetVal(key)));
+        } else {
+            materializeSlice(key);
+            incrRefCount(key);
+        }
+        serverAssert(dictAdd(c->bstate->keys, key, NULL) == DICT_OK);
 
         list *blockedClientsList = keyToClients_getBlockedClientsList(key);
         if (!blockedClientsList) blockedClientsList = keyToClients_addEntry(key);

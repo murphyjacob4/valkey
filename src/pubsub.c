@@ -607,6 +607,7 @@ void subscribeCommand(client *c) {
 
 /* UNSUBSCRIBE [channel ...] */
 void unsubscribeCommand(client *c) {
+    if (c->argv_slice_mask) clientPromoteArgv(c);
     if (!c->pubsub_data) initClientPubSubData(c);
 
     if (c->argc == 1) {
@@ -643,6 +644,7 @@ void psubscribeCommand(client *c) {
 
 /* PUNSUBSCRIBE [pattern [pattern ...]] */
 void punsubscribeCommand(client *c) {
+    if (c->argv_slice_mask) clientPromoteArgv(c);
     if (c->argc == 1) {
         pubsubUnsubscribeAllPatterns(c, 1);
     } else {
@@ -665,6 +667,7 @@ int pubsubPublishMessageAndPropagateToCluster(robj *channel, robj *message, int 
 
 /* PUBLISH <channel> <message> */
 void publishCommand(client *c) {
+    if (c->argv_slice_mask) clientPromoteArgv(c);
     if (server.sentinel_mode) {
         sentinelPublishCommand(c);
         return;
@@ -677,6 +680,7 @@ void publishCommand(client *c) {
 
 /* PUBSUB command for Pub/Sub introspection. */
 void pubsubCommand(client *c) {
+    if (c->argv_slice_mask) clientPromoteArgv(c);
     if (c->argc == 2 && !strcasecmp(objectGetVal(c->argv[1]), "help")) {
         const char *help[] = {
             "CHANNELS [<pattern>]",
@@ -760,6 +764,7 @@ void channelList(client *c, sds pat, kvstore *pubsub_channels) {
 
 /* SPUBLISH <shardchannel> <message> */
 void spublishCommand(client *c) {
+    if (c->argv_slice_mask) clientPromoteArgv(c);
     int receivers = pubsubPublishMessageAndPropagateToCluster(c->argv[1], c->argv[2], 1);
     if (!server.cluster_enabled) forceCommandPropagation(c, PROPAGATE_REPL);
     addReplyLongLong(c, receivers);
@@ -783,6 +788,7 @@ void ssubscribeCommand(client *c) {
 
 /* SUNSUBSCRIBE [shardchannel [shardchannel ...]] */
 void sunsubscribeCommand(client *c) {
+    if (c->argv_slice_mask) clientPromoteArgv(c);
     if (!c->pubsub_data) initClientPubSubData(c);
 
     if (c->argc == 1) {

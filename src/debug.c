@@ -2222,9 +2222,8 @@ void logCurrentClient(client *cc, const char *title) {
     /* Check if the first argument, usually a key, is found inside the
      * selected DB, and if so print info about the associated object. */
     if (cc->argc > 1) {
-        robj *val, *key;
-
-        key = getDecodedObject(cc->argv[1]);
+        robj *val;
+        robj *key = (cc->argv[1]->refcount == OBJ_STATIC_REFCOUNT) ? cc->argv[1] : getDecodedObject(cc->argv[1]);
         val = dbFind(cc->db, objectGetVal(key));
         if (val) {
             if (server.hide_user_data_from_log) {
@@ -2234,7 +2233,7 @@ void logCurrentClient(client *cc, const char *title) {
             }
             serverLogObjectDebugInfo(val);
         }
-        decrRefCount(key);
+        if (cc->argv[1]->refcount != OBJ_STATIC_REFCOUNT) decrRefCount(key);
     }
 }
 

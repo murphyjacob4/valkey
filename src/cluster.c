@@ -504,6 +504,11 @@ void migrateCommand(client *c) {
     kv = zrealloc(kv, sizeof(robj *) * num_keys);
     int oi = 0;
 
+    /* Without COPY, the key objects are retained in the DEL argv we propagate,
+     * so promote any sliced arguments now, before kv[] captures pointers into
+     * c->argv (promotion replaces the argv entries). */
+    if (!copy && c->argv_slice_mask) clientPromoteArgv(c);
+
     for (j = 0; j < num_keys; j++) {
         if ((ov[oi] = lookupKeyRead(c->db, c->argv[first_key + j])) != NULL) {
             kv[oi] = c->argv[first_key + j];

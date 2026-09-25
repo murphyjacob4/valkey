@@ -870,13 +870,13 @@ slotMigrationJob *createSlotImportJob(client *c,
      * We also backfill this job's establish command (which would have been
      * lost, as we did not have a dedicated query buffer before this point). */
     initClientReplicationData(job->client);
-    if (!job->client->querybuf) {
-        job->client->querybuf = generateSyncSlotsEstablishCommand(job);
-        job->client->qb_pos = sdslen(job->client->querybuf);
-        /* The backfilled ESTABLISH command is already applied, so qb_applied
-         * must match qb_pos for commandProcessed() to advance reploff. */
-        job->client->qb_applied = job->client->qb_pos;
-    }
+    if (job->client->argv_slice_mask) clientPromoteArgv(job->client);
+    if (job->client->querybuf) sdsfree(job->client->querybuf);
+    job->client->querybuf = generateSyncSlotsEstablishCommand(job);
+    job->client->qb_pos = sdslen(job->client->querybuf);
+    /* The backfilled ESTABLISH command is already applied, so qb_applied
+     * must match qb_pos for commandProcessed() to advance reploff. */
+    job->client->qb_applied = job->client->qb_pos;
     job->client->repl_data->read_reploff = sdslen(job->client->querybuf);
 
     return job;

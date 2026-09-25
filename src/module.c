@@ -1081,6 +1081,14 @@ void ValkeyModuleCommandDispatcher(client *c) {
     ValkeyModuleCtx ctx;
     moduleCreateContext(&ctx, cp->module, VALKEYMODULE_CTX_COMMAND);
 
+    if (c->argv_slice_mask) {
+        for (int i = 0; i < c->argc; i++) {
+            if (c->argv_slice_mask & (1U << i)) {
+                clientMaterializeArgvObjectOnly(c, i);
+            }
+        }
+    }
+
     ctx.client = c;
     cp->func(&ctx, (void **)c->argv, c->argc);
     moduleFreeContext(&ctx);
@@ -1097,7 +1105,10 @@ void ValkeyModuleCommandDispatcher(client *c) {
     for (int i = 0; i < c->argc; i++) {
         /* Only do the work if the module took ownership of the object:
          * in that case the refcount is no longer 1. */
-        if (c->argv[i]->refcount > 1) trimStringObjectIfNeeded(c->argv[i], 0);
+        if (c->argv[i]->refcount > 1) {
+            materializeSlice(c->argv[i]);
+            trimStringObjectIfNeeded(c->argv[i], 0);
+        }
     }
 }
 
@@ -1111,6 +1122,15 @@ void ValkeyModuleCommandDispatcher(client *c) {
  * the context in a way that the command can recognize this is a special
  * "get keys" call by calling ValkeyModule_IsKeysPositionRequest(ctx). */
 int moduleGetCommandKeysViaAPI(struct serverCommand *cmd, robj **argv, int argc, getKeysResult *result) {
+    client *c = server.current_client;
+    if (c && c->argv == argv && c->argv_slice_mask) {
+        for (int i = 0; i < c->argc; i++) {
+            if (c->argv_slice_mask & (1U << i)) {
+                clientMaterializeArgvObjectOnly(c, i);
+            }
+        }
+    }
+
     ValkeyModuleCommand *cp = cmd->module_cmd;
     ValkeyModuleCtx ctx;
     moduleCreateContext(&ctx, cp->module, VALKEYMODULE_CTX_KEYS_POS_REQUEST);
@@ -1131,6 +1151,15 @@ int moduleGetCommandKeysViaAPI(struct serverCommand *cmd, robj **argv, int argc,
  * moduleGetCommandKeysViaAPI, for modules that declare "getchannels-api"
  * during registration. Unlike keys, this is the only way to declare channels. */
 int moduleGetCommandChannelsViaAPI(struct serverCommand *cmd, robj **argv, int argc, getKeysResult *result) {
+    client *c = server.current_client;
+    if (c && c->argv == argv && c->argv_slice_mask) {
+        for (int i = 0; i < c->argc; i++) {
+            if (c->argv_slice_mask & (1U << i)) {
+                clientMaterializeArgvObjectOnly(c, i);
+            }
+        }
+    }
+
     ValkeyModuleCommand *cp = cmd->module_cmd;
     ValkeyModuleCtx ctx;
     moduleCreateContext(&ctx, cp->module, VALKEYMODULE_CTX_CHANNELS_POS_REQUEST);
@@ -2984,6 +3013,7 @@ void VM_FreeString(ValkeyModuleCtx *ctx, ValkeyModuleString *str) {
  * This API is not thread safe, access to these retained strings (if they originated
  * from a client command arguments) must be done with GIL locked. */
 void VM_RetainString(ValkeyModuleCtx *ctx, ValkeyModuleString *str) {
+    materializeSlice(str);
     if (ctx == NULL || !autoMemoryFreed(ctx, VALKEYMODULE_AM_STRING, str)) {
         /* Increment the string reference counting only if we can't
          * just remove the object from the list of objects that should
@@ -3033,6 +3063,7 @@ ValkeyModuleString *VM_HoldString(ValkeyModuleCtx *ctx, ValkeyModuleString *str)
         return VM_CreateStringFromString(ctx, str);
     }
 
+    materializeSlice(str);
     incrRefCount(str);
     if (ctx != NULL) {
         /*
@@ -4317,6 +4348,7 @@ int VM_KeyExists(ValkeyModuleCtx *ctx, robj *keyname) {
 
 /* Initialize a ValkeyModuleKey struct */
 static void moduleInitKey(ValkeyModuleKey *kp, ValkeyModuleCtx *ctx, robj *keyname, robj *value, int mode) {
+    materializeSlice(keyname);
     kp->ctx = ctx;
     kp->db = ctx->client->db;
     kp->key = keyname;
@@ -4614,6 +4646,7 @@ int VM_StringSet(ValkeyModuleKey *key, ValkeyModuleString *str) {
     if (!(key->mode & VALKEYMODULE_WRITE) || key->iter) return VALKEYMODULE_ERR;
     VM_DeleteKey(key);
     /* Retain str so setKey copies it to db rather than reallocating it. */
+    materializeSlice(str);
     incrRefCount(str);
     setKey(key->ctx->client, key->db, key->key, &str, SETKEY_NO_SIGNAL | SETKEY_DOESNT_EXIST);
     key->value = str;
@@ -6467,10 +6500,12 @@ robj **moduleCreateArgvFromUserFormat(const char *cmdname, const char *fmt, int 
             argv[argc++] = createStringObject(cstr, strlen(cstr));
         } else if (*p == 's') {
             robj *obj = va_arg(ap, void *);
-            if (obj->refcount == OBJ_STATIC_REFCOUNT)
+            if (obj->refcount == OBJ_STATIC_REFCOUNT) {
                 obj = createStringObject(objectGetVal(obj), sdslen(objectGetVal(obj)));
-            else
+            } else {
+                materializeSlice(obj);
                 incrRefCount(obj);
+            }
             argv[argc++] = obj;
         } else if (*p == 'b') {
             char *buf = va_arg(ap, char *);
@@ -6492,6 +6527,7 @@ robj **moduleCreateArgvFromUserFormat(const char *cmdname, const char *fmt, int 
 
             size_t i = 0;
             for (i = 0; i < vlen; i++) {
+                materializeSlice(v[i]);
                 incrRefCount(v[i]);
                 argv[argc++] = v[i];
             }
@@ -7198,6 +7234,7 @@ int VM_CallArgv(ValkeyModuleCtx *ctx,
 
         robj **argv_copy = zmalloc(sizeof(robj *) * argc);
         for (int i = 0; i < argc; i++) {
+            materializeSlice(argv[i]);
             incrRefCount(argv[i]);
             argv_copy[i] = argv[i];
         }
@@ -9641,8 +9678,22 @@ void moduleNotifyKeyspaceEvent(int type, const char *event, robj *key, int dbid)
      * selected DB (e.g. MOVE/COPY notify on the destination DB), so save the
      * original DB and restore it afterwards to avoid leaving the client on the
      * wrong DB for subsequent commands. */
-    client *executing_client = server.executing_client;
+    client *executing_client = server.executing_client ? server.executing_client : server.current_client;
     int origin_dbid = (executing_client != NULL) ? executing_client->db->id : -1;
+
+    if (executing_client && executing_client->argv_slice_mask) {
+        for (int i = 0; i < executing_client->argc; i++) {
+            if (executing_client->argv_slice_mask & (1U << i)) {
+                clientMaterializeArgvObjectOnly(executing_client, i);
+            }
+        }
+    }
+
+    robj *key_obj = key;
+    if (key && key->refcount == OBJ_STATIC_REFCOUNT) {
+        key_obj = createObject(OBJ_STRING, objectGetVal(key));
+        objectSetEncoding(key_obj, OBJ_ENCODING_SLICED);
+    }
 
     while ((ln = listNext(&li))) {
         ValkeyModuleKeyspaceSubscriber *sub = ln->value;
@@ -9666,11 +9717,15 @@ void moduleNotifyKeyspaceEvent(int type, const char *event, robj *key, int dbid)
             int prev_active = sub->active;
             sub->active = 1;
             server.lazy_expire_disabled++;
-            sub->notify_callback(&ctx, type, event, key);
+            sub->notify_callback(&ctx, type, event, key_obj);
             server.lazy_expire_disabled--;
             sub->active = prev_active;
             moduleFreeContext(&ctx);
         }
+    }
+
+    if (key_obj != key) {
+        decrRefCount(key_obj);
     }
 
     /* Restore the executing client's originally selected DB. */
@@ -11712,6 +11767,14 @@ int VM_UnregisterCommandFilter(ValkeyModuleCtx *ctx, ValkeyModuleCommandFilter *
 void moduleCallCommandFilters(client *c) {
     if (listLength(moduleCommandFilters) == 0) return;
 
+    if (c->argv_slice_mask) {
+        for (int i = 0; i < c->argc; i++) {
+            if (c->argv_slice_mask & (1U << i)) {
+                clientMaterializeArgvObjectOnly(c, i);
+            }
+        }
+    }
+
     listIter li;
     listNode *ln;
     listRewind(moduleCommandFilters, &li);
@@ -11719,6 +11782,7 @@ void moduleCallCommandFilters(client *c) {
     ValkeyModuleCommandFilterCtx filter = {.argv = c->argv, .argv_len = c->argv_len, .argc = c->argc, .c = c};
 
     robj *pre_filter_command = c->argv[0];
+    materializeSlice(pre_filter_command);
     incrRefCount(pre_filter_command);
     const int pre_filter_argc = c->argc;
 
@@ -11773,6 +11837,7 @@ static void backupOriginalClientArgv(ValkeyModuleCommandFilterCtx *fctx) {
         fctx->c->original_argc = fctx->argc;
         fctx->argv = zmalloc(fctx->argv_len * sizeof(ValkeyModuleString *));
         for (int i = 0; i < fctx->argc; i++) {
+            materializeSlice(fctx->c->original_argv[i]);
             incrRefCount(fctx->c->original_argv[i]);
             fctx->argv[i] = fctx->c->original_argv[i];
         }
@@ -11869,6 +11934,14 @@ void moduleFireCommandResultEvent(client *c,
         if (commandResultSuccessListeners == 0) return;
     }
 
+    if (c->argv_slice_mask) {
+        for (int i = 0; i < c->argc; i++) {
+            if (c->argv_slice_mask & (1U << i)) {
+                clientMaterializeArgvObjectOnly(c, i);
+            }
+        }
+    }
+
     /* Get argv - prefer original_argv if available (before any rewriting) */
     robj **argv = c->original_argv ? c->original_argv : c->argv;
     int argc = c->original_argv ? c->original_argc : c->argc;
@@ -11929,6 +12002,14 @@ void moduleFireCommandResultEvent(client *c,
 void moduleFireCommandRejectedEvent(client *c, const char *reply_str) {
     if (commandResultRejectedListeners == 0) return;
 
+    if (c->argv_slice_mask) {
+        for (int i = 0; i < c->argc; i++) {
+            if (c->argv_slice_mask & (1U << i)) {
+                clientMaterializeArgvObjectOnly(c, i);
+            }
+        }
+    }
+
     ValkeyModuleCommandResultInfoV1 info = {
         .version = VALKEYMODULE_COMMANDRESULTINFO_VERSION,
         .command_name = c->cmd ? c->cmd->fullname : NULL,
@@ -11952,6 +12033,14 @@ void moduleFireCommandRejectedEvent(client *c, const char *reply_str) {
  * VALKEYMODULE_ACL_LOG_KEY/CHANNEL; pass -1 for all other subevents. */
 void moduleFireCommandACLRejectedEvent(client *c, uint64_t subevent, int errpos) {
     if (commandResultACLRejectedListeners == 0) return;
+
+    if (c->argv_slice_mask) {
+        for (int i = 0; i < c->argc; i++) {
+            if (c->argv_slice_mask & (1U << i)) {
+                clientMaterializeArgvObjectOnly(c, i);
+            }
+        }
+    }
 
     char int_key_buf[LONG_STR_SIZE];
     const char *rejection_context = NULL;
@@ -13270,7 +13359,23 @@ void moduleNotifyKeyUnlink(robj *key, robj *val, int dbid, int flags) {
     } else if (flags & DB_FLAG_KEY_OVERWRITE) {
         subevent = VALKEYMODULE_SUBEVENT_KEY_OVERWRITTEN;
     }
-    KeyInfo info = {dbid, key, val, VALKEYMODULE_READ};
+
+    client *executing_client = server.executing_client ? server.executing_client : server.current_client;
+    if (executing_client && executing_client->argv_slice_mask) {
+        for (int i = 0; i < executing_client->argc; i++) {
+            if (executing_client->argv_slice_mask & (1U << i)) {
+                clientMaterializeArgvObjectOnly(executing_client, i);
+            }
+        }
+    }
+
+    robj *key_obj = key;
+    if (key && key->refcount == OBJ_STATIC_REFCOUNT) {
+        key_obj = createObject(OBJ_STRING, objectGetVal(key));
+        objectSetEncoding(key_obj, OBJ_ENCODING_SLICED);
+    }
+
+    KeyInfo info = {dbid, key_obj, val, VALKEYMODULE_READ};
     moduleFireServerEvent(VALKEYMODULE_EVENT_KEY, subevent, &info);
 
     if (val->type == OBJ_MODULE) {
@@ -13278,12 +13383,17 @@ void moduleNotifyKeyUnlink(robj *key, robj *val, int dbid, int flags) {
         moduleType *mt = mv->type;
         /* We prefer to use the enhanced version. */
         if (mt->unlink2 != NULL) {
-            ValkeyModuleKeyOptCtx ctx = {key, NULL, dbid, -1};
+            ValkeyModuleKeyOptCtx ctx = {key_obj, NULL, dbid, -1};
             mt->unlink2(&ctx, mv->value);
         } else if (mt->unlink != NULL) {
-            mt->unlink(key, mv->value);
+            mt->unlink(key_obj, mv->value);
         }
     }
+
+    if (key_obj != key) {
+        decrRefCount(key_obj);
+    }
+
     server.lazy_expire_disabled--;
 }
 
@@ -14955,6 +15065,7 @@ void VM_ScriptingEngineDebuggerProcessCommands(int *client_disconnected,
  * MODULE UNLOAD <name>
  */
 void moduleCommand(client *c) {
+    if (c->argv_slice_mask) clientPromoteArgv(c);
     char *subcmd = objectGetVal(c->argv[1]);
 
     if (c->argc == 2 && !strcasecmp(subcmd, "help")) {

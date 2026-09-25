@@ -490,10 +490,19 @@ void objectUnembedVal(robj *o) {
     o->val_ptr = new_val;
 }
 
+/* Materialize the sliced SDS string pointed to by robj o into an owned heap SDS. */
+void materializeSlice(robj *o) {
+    if (objectGetEncoding(o) == OBJ_ENCODING_SLICED) {
+        o->val_ptr = sdsdup((sds)o->val_ptr);
+        objectSetEncoding(o, OBJ_ENCODING_RAW);
+    }
+}
+
 /* This functions may reallocate the value. The new allocation is returned and
  * the old object's reference counter is decremented and possibly freed. Use the
  * returned object instead of 'o' after calling this function. */
 robj *objectSetKeyAndExpire(robj *o, const_sds key, long long expire) {
+    materializeSlice(o);
     if (objectGetType(o) == OBJ_STRING && objectGetEncoding(o) == OBJ_ENCODING_EMBSTR) {
         robj *new = createStringObjectWithKeyAndExpire(objectGetVal(o), sdslen(objectGetVal(o)), key, expire);
         objectSetLRU(new, objectGetLRU(o));
@@ -512,7 +521,9 @@ robj *objectSetKeyAndExpire(robj *o, const_sds key, long long expire) {
     } else if (objectGetType(o) == OBJ_STRING && objectGetEncoding(o) == OBJ_ENCODING_INT) {
         /* The pointer is not allocated memory. We can just copy the pointer. */
         ptr = o->val_ptr;
-    } else if (objectGetType(o) == OBJ_STRING && objectGetEncoding(o) == OBJ_ENCODING_RAW) {
+    } else if (objectGetType(o) == OBJ_STRING &&
+               (objectGetEncoding(o) == OBJ_ENCODING_RAW ||
+                objectGetEncoding(o) == OBJ_ENCODING_SLICED)) {
         /* Dup the string. */
         ptr = sdsdup(o->val_ptr);
     } else {
@@ -614,6 +625,7 @@ robj *dupStringObject(const robj *o) {
     switch (objectGetEncoding(o)) {
     case OBJ_ENCODING_RAW: return createRawStringObject(objectGetVal(o), sdslen(objectGetVal(o)));
     case OBJ_ENCODING_EMBSTR: return createEmbeddedStringObject(objectGetVal(o), sdslen(objectGetVal(o)));
+    case OBJ_ENCODING_SLICED: return createRawStringObject(objectGetVal(o), sdslen(objectGetVal(o)));
     case OBJ_ENCODING_INT:
         d = createObject(OBJ_STRING, NULL);
         d->encoding = OBJ_ENCODING_INT;
@@ -1038,6 +1050,10 @@ robj *tryObjectEncodingEx(robj *o, int try_trim) {
             objectSetEncoding(o, OBJ_ENCODING_INT);
             o->val_ptr = (void *)value;
             return o;
+        } else if (objectGetEncoding(o) == OBJ_ENCODING_SLICED) {
+            objectSetEncoding(o, OBJ_ENCODING_INT);
+            o->val_ptr = (void *)value;
+            return o;
         } else if (objectGetEncoding(o) == OBJ_ENCODING_EMBSTR) {
             decrRefCount(o);
             return createStringObjectFromLongLongForValue(value);
@@ -1071,6 +1087,18 @@ robj *tryObjectEncoding(robj *o) {
  * If the object is already raw-encoded just increment the ref count. */
 robj *getDecodedObject(robj *o) {
     robj *dec;
+
+    /* Stack/querybuf-backed objects (e.g. argv slices) can't be retained;
+     * callers pair this with decrRefCount, so hand back an owned copy. */
+    if (objectGetRefcount(o) == OBJ_STATIC_REFCOUNT && sdsEncodedObject(o)) {
+        return createStringObject(objectGetVal(o), sdslen(objectGetVal(o)));
+    }
+
+    if (objectGetEncoding(o) == OBJ_ENCODING_SLICED) {
+        materializeSlice(o);
+        incrRefCount(o);
+        return o;
+    }
 
     if (sdsEncodedObject(o)) {
         incrRefCount(o);
@@ -1324,6 +1352,7 @@ char *strEncoding(int encoding) {
     case OBJ_ENCODING_EMBSTR: return "embstr";
     case OBJ_ENCODING_STREAM: return "stream";
     case OBJ_ENCODING_PATH_HASH: return "pathhash";
+    case OBJ_ENCODING_SLICED: return "sliced";
     default: return "unknown";
     }
 }

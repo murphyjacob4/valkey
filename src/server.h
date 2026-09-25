@@ -834,6 +834,7 @@ typedef struct ValkeyModuleType moduleType;
 #define OBJ_ENCODING_LISTPACK 11  /* Encoded as a listpack */
 #define OBJ_ENCODING_LISTPACK2 12 /* Encoded as a listpack with metadata tag */
 #define OBJ_ENCODING_PATH_HASH 13 /* Path hash backed by a radix tree */
+#define OBJ_ENCODING_SLICED 14    /* Sliced sds string encoding (querybuf slice) */
 
 #define OBJ_REFCOUNT_BITS 29
 #define OBJ_SHARED_REFCOUNT ((1 << OBJ_REFCOUNT_BITS) - 1) /* Global object never destroyed. */
@@ -3202,6 +3203,9 @@ int clientSetName(client *c, robj *name, const char **err);
 bool clientCommandArgShouldBeRedacted(client *c, int arg_index);
 robj *clientRetainArg(client *c, int i);
 void clientPromoteArgv(client *c);
+void clientMaterializeArgvObjectOnly(client *c, int i);
+void clientMaterializeArgv(client *c, int i);
+void materializeSlice(robj *o);
 void rewriteClientCommandVector(client *c, int argc, ...);
 void rewriteClientCommandArgument(client *c, int i, robj *newval);
 void replaceClientCommandVector(client *c, int argc, robj **argv);
@@ -3392,7 +3396,10 @@ int compareStringObjects(const robj *a, const robj *b);
 int collateStringObjects(const robj *a, const robj *b);
 int equalStringObjects(robj *a, robj *b);
 void trimStringObjectIfNeeded(robj *o, int trim_small_values);
-#define sdsEncodedObject(objptr) (objectGetEncoding(objptr) == OBJ_ENCODING_RAW || objectGetEncoding(objptr) == OBJ_ENCODING_EMBSTR)
+#define sdsEncodedObject(objptr) \
+    (objectGetEncoding(objptr) == OBJ_ENCODING_RAW || \
+     objectGetEncoding(objptr) == OBJ_ENCODING_EMBSTR || \
+     objectGetEncoding(objptr) == OBJ_ENCODING_SLICED)
 
 /* Objects with val and/or key embedded */
 robj *objectSetKeyAndExpire(robj *o, const_sds key, long long expire);

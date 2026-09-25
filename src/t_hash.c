@@ -1272,6 +1272,7 @@ void hincrbyCommand(client *c) {
             rewriteClientCommandArgument(c, 3, newobj);
             decrRefCount(newobj);
         } else {
+            if (c->argv_slice_mask) clientPromoteArgv(c);
             int new_argc = 8; /* HSETEX(1) + key(2) + PXAT(3) + unix-time-milliseconds(4) + FIELDS(5) + numfields(6) + field(7) + value(8) */
             robj **new_argv = zmalloc(sizeof(robj *) * (8));
             robj *milliseconds_obj = createStringObjectFromLongLong(expiry);
@@ -1355,6 +1356,7 @@ void hincrbyfloatCommand(client *c) {
         rewriteClientCommandArgument(c, 3, newobj);
         decrRefCount(newobj);
     } else {
+        if (c->argv_slice_mask) clientPromoteArgv(c);
         int new_argc = 8; /* HSETEX(1) + key(2) + PXAT(3) + unix-time-milliseconds(4) + FIELDS(5) + numfields(6) + field(7) + value(8) */
         robj **new_argv = zmalloc(sizeof(robj *) * (8));
         robj *milliseconds_obj = createStringObjectFromLongLong(expiry);
@@ -1807,6 +1809,21 @@ void hsetexCommand(client *c) {
     /* Prepare a new argv when rewriting the command. If set_expired is true,
      * all expired fields will be deleted. Otherwise, if rewriting is needed due to NX/XX/FNX/FXX flags,
      * copy the command, key, and optional arguments, skipping the NX/XX/FNX/FXX flags. */
+    if ((set_expired || need_rewrite_argv || (flags & ARGS_KEEPTTL)) && c->argv_slice_mask) {
+        /* 'expire' aliases an argv entry and is matched by identity below when
+         * rewriting EX/PX/EXAT as PXAT. Promotion replaces argv entries, so
+         * re-point it at the promoted object. */
+        int expire_idx = -1;
+        for (int j = 0; expire && j < c->argc; j++) {
+            if (c->argv[j] == expire) {
+                expire_idx = j;
+                break;
+            }
+        }
+        clientPromoteArgv(c);
+        if (expire_idx != -1) expire = c->argv[expire_idx];
+    }
+
     if (set_expired) {
         new_argv = zmalloc(sizeof(robj *) * (num_fields + 2));
         new_argv[new_argc++] = shared.hdel;
@@ -2034,6 +2051,7 @@ void hgetexCommand(client *c) {
     /* This command is never propagated as is. It is either propagated as HDEL, HPEXPIREAT or PERSIST.
      * This why it doesn't need special handling in feedAppendOnlyFile to convert relative expire time to absolute one. */
     if (set_expiry || set_expired || persist) {
+        if (c->argv_slice_mask) clientPromoteArgv(c);
         /* allocate a new client argv for replicating the command. */
         new_argv = zmalloc(sizeof(robj *) * (num_fields + 5));
         if (set_expired)
@@ -2283,6 +2301,7 @@ void hexpireGenericCommand(client *c, mstime_t basetime, int unit) {
         else if (result == EXPIRATION_MODIFICATION_EXPIRE_ASAP) {
             /* In case we are expiring all the elements prepare a new argv since we are going to delete all the expired fields. */
             if (new_argv == NULL) {
+                if (c->argv_slice_mask) clientPromoteArgv(c);
                 new_argv = zmalloc(sizeof(robj *) * (num_fields + 2));
                 new_argv[new_argc++] = shared.hdel;
                 new_argv[new_argc++] = c->argv[1];
