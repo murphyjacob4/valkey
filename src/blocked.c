@@ -471,11 +471,7 @@ void blockForKeys(client *c, int btype, robj **keys, int numkeys, mstime_t timeo
         /* Callers may hand us key objects captured before argv materialization (still
          * querybuf slices), so take an owned reference that outlives the command. */
         robj *key = keys[j];
-        if (objectGetRefcount(key) == OBJ_STATIC_REFCOUNT) {
-            key = createStringObject(objectGetVal(key), sdslen(objectGetVal(key)));
-        } else {
-            incrRefCount(key);
-        }
+        key = retainObject(key);
         client_blocked_entry = dictAddRaw(c->bstate->keys, key, NULL);
         serverAssert(client_blocked_entry != NULL);
 
@@ -573,11 +569,7 @@ static void signalKeyAsReadyLogic(serverDb *db, robj *key, int type, int deleted
         if (dictFind(db->blocking_keys, key) == NULL) return;
     }
 
-    if (key->refcount == OBJ_STATIC_REFCOUNT) {
-        key = createRawStringObject(objectGetVal(key), sdslen(objectGetVal(key)));
-    } else {
-        incrRefCount(key);
-    }
+    key = retainObject(key);
 
     dictEntry *de, *existing;
     de = dictAddRaw(db->ready_keys, key, &existing);
@@ -946,11 +938,7 @@ void blockClientInUseOnKeys(client *c, int num_keys, robj *keys[]) {
 
         /* Keys may still be argv slices into the querybuf; take an owned reference. */
         robj *key = keys[i];
-        if (objectGetRefcount(key) == OBJ_STATIC_REFCOUNT) {
-            key = createStringObject(objectGetVal(key), sdslen(objectGetVal(key)));
-        } else {
-            incrRefCount(key);
-        }
+        key = retainObject(key);
         serverAssert(dictAdd(c->bstate->keys, key, NULL) == DICT_OK);
 
         list *blockedClientsList = keyToClients_getBlockedClientsList(key);

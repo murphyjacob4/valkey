@@ -612,11 +612,7 @@ static int evalRegisterNewScript(client *c, robj *body, char **sha) {
         /* Script LRU eviction only applies to EVAL, not SCRIPT LOAD. */
         es->node = scriptsLRUAdd(_sha);
     }
-    if (objectGetRefcount(body) == OBJ_STATIC_REFCOUNT) {
-        body = createStringObject(objectGetVal(body), sdslen(objectGetVal(body)));
-    } else {
-        incrRefCount(body);
-    }
+    body = retainObject(body);
     es->body = body;
 
     int retval = dictAdd(evalCtx.scripts, _sha, es);

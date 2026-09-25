@@ -699,7 +699,7 @@ void watchCommand(client *c) {
     if (!c->mstate) initClientMultiState(c);
 
     for (j = 1; j < c->argc; j++) {
-        watchForKey(c, clientRetainArg(c, j));
+        watchForKey(c, retainObject(c->argv[j]));
     }
     addReply(c, shared.ok);
 }

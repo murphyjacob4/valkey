@@ -408,12 +408,7 @@ void trackingInvalidateKey(client *c, robj *keyobj, int bcast) {
          * As the invalidation messages may be interleaved with command
          * response and should after command response. */
         if (target == server.current_client && (server.current_client->flag.executing_command)) {
-            if (keyobj->refcount == OBJ_STATIC_REFCOUNT) {
-                keyobj = createRawStringObject(objectGetVal(keyobj), sdslen(objectGetVal(keyobj)));
-            } else {
-                incrRefCount(keyobj);
-            }
-            listAddNodeTail(server.tracking_pending_keys, keyobj);
+            listAddNodeTail(server.tracking_pending_keys, retainObject(keyobj));
         } else {
             sendTrackingMessage(target, (char *)objectGetVal(keyobj), sdslen(objectGetVal(keyobj)), 0);
         }

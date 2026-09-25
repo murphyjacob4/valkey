@@ -5496,12 +5496,7 @@ int clientSetName(client *c, robj *name, const char **err) {
         return C_OK;
     }
     if (c->name) decrRefCount(c->name);
-    if (objectGetRefcount(name) == OBJ_STATIC_REFCOUNT) {
-        c->name = createStringObject(objectGetVal(name), len);
-    } else {
-        c->name = name;
-        incrRefCount(name);
-    }
+    c->name = retainObject(name);
     return C_OK;
 }
 
@@ -5544,7 +5539,7 @@ void clientSetinfoCommand(client *c) {
     }
     if (*destvar) decrRefCount(*destvar);
     if (sdslen(val)) {
-        *destvar = clientRetainArg(c, 3);
+        *destvar = retainObject(c->argv[3]);
     } else
         *destvar = NULL;
     addReply(c, shared.ok);
@@ -5734,28 +5729,28 @@ static int parseClientFiltersOrReply(client *c, int index, clientFilter *filter)
                 decrRefCount(filter->lib_name);
                 filter->lib_name = NULL;
             }
-            filter->lib_name = clientRetainArg(c, index + 1);
+            filter->lib_name = retainObject(c->argv[index + 1]);
             index += 2;
         } else if (!strcasecmp(objectGetVal(c->argv[index]), "not-lib-name") && moreargs) {
             if (filter->not_lib_name) {
                 decrRefCount(filter->not_lib_name);
                 filter->not_lib_name = NULL;
             }
-            filter->not_lib_name = clientRetainArg(c, index + 1);
+            filter->not_lib_name = retainObject(c->argv[index + 1]);
             index += 2;
         } else if (!strcasecmp(objectGetVal(c->argv[index]), "lib-ver") && moreargs) {
             if (filter->lib_ver) {
                 decrRefCount(filter->lib_ver);
                 filter->lib_ver = NULL;
             }
-            filter->lib_ver = clientRetainArg(c, index + 1);
+            filter->lib_ver = retainObject(c->argv[index + 1]);
             index += 2;
         } else if (!strcasecmp(objectGetVal(c->argv[index]), "not-lib-ver") && moreargs) {
             if (filter->not_lib_ver) {
                 decrRefCount(filter->not_lib_ver);
                 filter->not_lib_ver = NULL;
             }
-            filter->not_lib_ver = clientRetainArg(c, index + 1);
+            filter->not_lib_ver = retainObject(c->argv[index + 1]);
             index += 2;
         } else if (!strcasecmp(objectGetVal(c->argv[index]), "db") && moreargs) {
             int db_id;
@@ -6833,16 +6828,6 @@ void securityWarningCommand(client *c) {
     freeClientAsync(c);
 }
 
-/* Returns argument i with a reference held by the caller. An inline argument
- * can't be retained, so the caller gets a copy and c->argv[i] is left alone. */
-robj *clientRetainArg(client *c, int i) {
-    serverAssert(i >= 0 && i < c->argc);
-    robj *o = c->argv[i];
-    if (argIsInline(o)) return createStringObject(objectGetVal(o), sdslen(objectGetVal(o)));
-    incrRefCount(o); /* Copies a sliced value. */
-    return o;
-}
-
 /* Moves the inline argument headers of c to the heap so they can be retained.
  * The values stay sliced until then, see incrRefCount(). */
 void clientDetachArgv(client *c) {
@@ -6973,12 +6958,7 @@ void rewriteClientCommandVector(client *c, int argc, ...) {
         robj *a;
 
         a = va_arg(ap, robj *);
-        if (a->refcount == OBJ_STATIC_REFCOUNT) {
-            a = createStringObject(objectGetVal(a), sdslen(objectGetVal(a)));
-        } else {
-            incrRefCount(a);
-        }
-        argv[j] = a;
+        argv[j] = retainObject(a);
     }
     replaceClientCommandVector(c, argc, argv);
     va_end(ap);
@@ -7016,11 +6996,7 @@ void rewriteClientCommandArgument(client *c, int i, robj *newval) {
     if (oldval) c->argv_len_sum -= getStringObjectLen(oldval);
     if (newval) {
         c->argv_len_sum += getStringObjectLen(newval);
-        if (newval->refcount == OBJ_STATIC_REFCOUNT) {
-            newval = createStringObject(objectGetVal(newval), sdslen(objectGetVal(newval)));
-        } else {
-            incrRefCount(newval);
-        }
+        newval = retainObject(newval);
     }
     c->argv[i] = newval;
     if (oldval) decrRefCount(oldval);

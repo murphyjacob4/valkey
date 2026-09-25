@@ -785,6 +785,17 @@ void incrRefCount(robj *o) {
     }
 }
 
+/* Returns o with a reference held by the caller. A static object, such as an
+ * inline command argument (see argIsInline()), can't be retained, so the caller
+ * gets a copy instead. */
+robj *retainObject(robj *o) {
+    if (objectGetRefcount(o) == OBJ_STATIC_REFCOUNT) {
+        return createStringObject(objectGetVal(o), sdslen(objectGetVal(o)));
+    }
+    incrRefCount(o);
+    return o;
+}
+
 void decrRefCount(robj *o) {
     if (objectGetRefcount(o) >= OBJ_FIRST_SPECIAL_REFCOUNT) {
         return;
@@ -1092,16 +1103,7 @@ robj *tryObjectEncoding(robj *o) {
 robj *getDecodedObject(robj *o) {
     robj *dec;
 
-    /* Stack/querybuf-backed objects (e.g. argv slices) can't be retained;
-     * callers pair this with decrRefCount, so hand back an owned copy. */
-    if (objectGetRefcount(o) == OBJ_STATIC_REFCOUNT && sdsEncodedObject(o)) {
-        return createStringObject(objectGetVal(o), sdslen(objectGetVal(o)));
-    }
-
-    if (sdsEncodedObject(o)) {
-        incrRefCount(o);
-        return o;
-    }
+    if (sdsEncodedObject(o)) return retainObject(o);
     if (objectGetType(o) == OBJ_STRING && objectGetEncoding(o) == OBJ_ENCODING_INT) {
         char buf[32];
 

@@ -1383,7 +1383,7 @@ typedef struct parsedCommand {
  *
  *   - inline: the robj header is one of argv_inline_objs[], with a static
  *     refcount (see argIsInline()). It can't be retained, only copied (see
- *     clientRetainArg()), and decrRefCount() ignores it.
+ *     retainObject()), and decrRefCount() ignores it.
  *   - sliced: the value is an sds written in place in the query buffer
  *     (OBJ_ENCODING_SLICED). The buffer must not be trimmed past it or freed
  *     while it is in use, and a reallocation must move its pointer.
@@ -3224,7 +3224,6 @@ sds catClientInfoShortString(sds s, client *client, int hide_user_data);
 sds getAllClientsInfoString(int type, int hide_user_data);
 int clientSetName(client *c, robj *name, const char **err);
 bool clientCommandArgShouldBeRedacted(client *c, int arg_index);
-robj *clientRetainArg(client *c, int i);
 void clientMaterializeArgv(client *c);
 void clientDetachArgv(client *c);
 void materializeSlice(robj *o);
@@ -3364,6 +3363,7 @@ int execGetKeys(struct serverCommand *cmd, robj **argv, int argc, getKeysResult 
 /* Object implementation */
 void decrRefCount(robj *o);
 void incrRefCount(robj *o);
+robj *retainObject(robj *o);
 robj *makeObjectShared(robj *o);
 void freeStringObject(robj *o);
 void freeListObject(robj *o);

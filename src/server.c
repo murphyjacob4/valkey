@@ -3943,12 +3943,7 @@ void alsoPropagate(int dbid, robj **argv, int argc, int target, int slot) {
 
     argvcopy = zmalloc(sizeof(robj *) * argc);
     for (j = 0; j < argc; j++) {
-        if (argv[j]->refcount == OBJ_STATIC_REFCOUNT) {
-            argvcopy[j] = dupStringObject(argv[j]);
-        } else {
-            incrRefCount(argv[j]);
-            argvcopy[j] = argv[j];
-        }
+        argvcopy[j] = retainObject(argv[j]);
     }
     serverOpArrayAppend(&server.also_propagate, dbid, argvcopy, argc, target, slot);
 }

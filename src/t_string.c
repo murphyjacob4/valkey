@@ -152,7 +152,7 @@ void setGenericCommand(client *c,
     int val_idx = (flags & ARGS_ARGV3) ? 3 : 2;
     int is_inline = argIsInline(c->argv[val_idx]);
     if (is_inline || c->flag.argv_borrowed) {
-        val = clientRetainArg(c, val_idx);
+        val = retainObject(c->argv[val_idx]);
     }
     if (is_inline) {
         val = tryObjectEncoding(val);
@@ -165,7 +165,7 @@ void setGenericCommand(client *c,
      * When the client does not own the argv array (VM_CallArgv borrowed it),
      * we must go through rewriteClientCommandArgument to get a new owned copy
      * instead of assigning directly into the borrowed array.
-     * When val was inline, clientRetainArg copied it for setKey, leaving
+     * When val was inline, retainObject() copied it for setKey, leaving
      * c->argv[val_idx] untouched. */
     if (is_inline) {
         /* The db owns the copy. */
@@ -456,7 +456,7 @@ void getsetCommand(client *c) {
     robj *val = c->argv[2];
     int is_inline = argIsInline(c->argv[2]);
     if (is_inline) {
-        val = clientRetainArg(c, 2);
+        val = retainObject(c->argv[2]);
         val = tryObjectEncoding(val);
         setKey(c, c->db, c->argv[1], &val, 0);
     } else if (c->flag.argv_borrowed) {
@@ -619,7 +619,7 @@ void msetGenericCommand(client *c, int nx) {
         robj *val = c->argv[j + 1];
         int is_inline = argIsInline(c->argv[j + 1]);
         if (is_inline) {
-            val = clientRetainArg(c, j + 1);
+            val = retainObject(c->argv[j + 1]);
             val = tryObjectEncoding(val);
             setKey(c, c->db, c->argv[j], &val, setkey_flags);
         } else if (c->flag.argv_borrowed) {
@@ -719,7 +719,7 @@ void msetexCommand(client *c) {
         robj *val = c->argv[j + 1];
         int is_inline = argIsInline(c->argv[j + 1]);
         if (is_inline) {
-            val = clientRetainArg(c, j + 1);
+            val = retainObject(c->argv[j + 1]);
             val = tryObjectEncoding(val);
             setKey(c, c->db, key, &val, setkey_flags);
             if (expire) val = setExpire(c, c->db, key, milliseconds);
@@ -1024,7 +1024,7 @@ void appendCommand(client *c) {
         robj *val = c->argv[2];
         int is_inline = argIsInline(c->argv[2]);
         if (is_inline) {
-            val = clientRetainArg(c, 2);
+            val = retainObject(c->argv[2]);
             val = tryObjectEncoding(val);
             dbAdd(c->db, c->argv[1], &val);
             totlen = stringObjectLen(val);

@@ -6484,12 +6484,7 @@ robj **moduleCreateArgvFromUserFormat(const char *cmdname, const char *fmt, int 
             argv[argc++] = createStringObject(cstr, strlen(cstr));
         } else if (*p == 's') {
             robj *obj = va_arg(ap, void *);
-            if (obj->refcount == OBJ_STATIC_REFCOUNT) {
-                obj = createStringObject(objectGetVal(obj), sdslen(objectGetVal(obj)));
-            } else {
-                incrRefCount(obj);
-            }
-            argv[argc++] = obj;
+            argv[argc++] = retainObject(obj);
         } else if (*p == 'b') {
             char *buf = va_arg(ap, char *);
             size_t len = va_arg(ap, size_t);
