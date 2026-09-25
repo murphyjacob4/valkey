@@ -462,7 +462,14 @@ start_server {} {
             $rr client setname client$j
             $rr write [join [list "*2\r\n\$$client_mem\r\n" [string repeat v $client_mem]] ""]
             $rr flush
+            # Wait until the whole payload has been received (qbuf includes bytes streamed
+            # into a large-argument cutover object), not just until tot-mem crosses the
+            # threshold. tot-mem also includes the client's query buffer, which may be
+            # retained alongside the cutover object since earlier arguments may be sliced
+            # into it, and the cutover object itself is allocated up front. Sampling only
+            # once all data arrived ensures every client is measured in the same state.
             wait_for_condition 200 10 {
+                [client_field client$j qbuf] >= $client_mem &&
                 [client_field client$j tot-mem] >= $client_mem
             } else {
                 fail "Failed to fill qbuf for test"

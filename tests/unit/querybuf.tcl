@@ -21,85 +21,47 @@ start_server {tags {"querybuf slow"}} {
     # increase the execution frequency of clientsCron
     r config set hz 100
 
-    # The test will run at least 2s to check if client query
-    # buffer will be resized when client idle 2s.
-    test "query buffer resized correctly" {
-
+    test "query buffer is only held while a command is pending" {
         set rd [valkey_deferring_client]
 
         $rd client setname test_client
         $rd read
 
-        # Make sure query buff has size of 0 bytes at start as the client uses the shared qb.
+        # Between commands the client holds no query buffer.
         assert {[client_query_buffer test_client] == 0}
 
-        # Pause cron to prevent premature shrinking (timing issue).
-        r debug pause-cron 1
-
-        # Send partial command to client to make sure it doesn't use the shared qb.
+        # Send a partial command so the client has to hold a query buffer.
         $rd write "*3\r\n\$3\r\nset\r\n\$2\r\na"
         $rd flush
-        # Wait for the client to start using a private query buffer. 
         wait_for_condition 1000 10 {
             [client_query_buffer test_client] > 0
         } else {
-            fail "client should start using a private query buffer"
+            fail "client should hold a query buffer while a command is pending"
         }
-     
-        # send the rest of the command
+
+        # Once the command completes, the buffer is returned to the pool right away,
+        # without waiting for clientsCron.
         $rd write "a\r\n\$1\r\nb\r\n"
         $rd flush
         assert_equal {OK} [$rd read]
-
-        set orig_test_client_qbuf [client_query_buffer test_client]
-        # Make sure query buff has less than the peak resize threshold (PROTO_RESIZE_THRESHOLD) 32k
-        # but at least the basic IO reading buffer size (PROTO_IOBUF_LEN) 16k
-        set MAX_QUERY_BUFFER_SIZE [expr 32768 + 2] ; # 32k + 2, allowing for potential greedy allocation of (16k + 1) * 2 bytes for the query buffer.
-        assert {$orig_test_client_qbuf >= 16384 && $orig_test_client_qbuf <= $MAX_QUERY_BUFFER_SIZE}
-
-        # Allow shrinking to occur
-        r debug pause-cron 0
-
-        # Check that the initial query buffer is resized after 2 sec
-        wait_for_condition 1000 10 {
-            [client_idle_sec test_client] >= 3 && [client_query_buffer test_client] < $orig_test_client_qbuf
-        } else {
-            fail "query buffer was not resized"
-        }
+        assert {[client_query_buffer test_client] == 0}
         $rd close
     }
 
-    test "query buffer resized correctly when not idle" {
-        # Pause cron to prevent premature shrinking (timing issue).
-        r debug pause-cron 1
-
-        # Memory will increase by more than 32k due to client query buffer.
+    test "query buffer is not retained after a large argument" {
         set rd [valkey_client]
         $rd client setname test_client
 
-        # Create a large query buffer (more than PROTO_RESIZE_THRESHOLD - 32k)
+        # A large argument is read into a dedicated object, not the query buffer,
+        # and nothing is retained once the command completes.
         $rd set x [string repeat A 400000]
+        assert {[client_query_buffer test_client] == 0}
+        assert_equal 400000 [r strlen x]
 
-        # Make sure query buff is larger than the peak resize threshold (PROTO_RESIZE_THRESHOLD) 32k
-        set orig_test_client_qbuf [client_query_buffer test_client]
-        assert {$orig_test_client_qbuf > 32768}
-
-        r debug pause-cron 0
-
-        # Wait for qbuf to shrink due to lower peak
-        set t [clock milliseconds]
-        while true {
-            # Write something smaller, so query buf peak can shrink
-            $rd set x [string repeat A 100]
-            set new_test_client_qbuf [client_query_buffer test_client]
-            if {$new_test_client_qbuf < $orig_test_client_qbuf && $new_test_client_qbuf > 0} { break } 
-            if {[expr [clock milliseconds] - $t] > 1000} { break }
-            after 10
-        }
-        # Validate qbuf shrunk but isn't 0 since we maintain room based on latest peak
-        assert {[client_query_buffer test_client] > 0 && [client_query_buffer test_client] < $orig_test_client_qbuf}
+        $rd set x [string repeat A 100]
+        assert {[client_query_buffer test_client] == 0}
         $rd close
-    } {0} {needs:debug}
+    }
 
     test "query buffer resized correctly with fat argv" {
         set rd [valkey_client]
@@ -123,7 +85,16 @@ start_server {tags {"querybuf slow"}} {
         } else {
             fail "query buffer should be resized when client idle time bigger than 2s"
         }
-     
+
+        # Finish the argument: the upload resumes and the stored value is intact.
+        $rd write "[string repeat b 999998]c\r\n"
+        $rd flush
+        assert_equal {OK} [$rd read]
+        assert_equal 1000000 [r strlen a]
+        assert_equal "ab" [r getrange a 0 1]
+        assert_equal "bc" [r getrange a 999998 999999]
+        assert {[client_query_buffer test_client] == 0}
+
         $rd close
     }
 
