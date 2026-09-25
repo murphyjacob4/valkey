@@ -1081,6 +1081,12 @@ void ValkeyModuleCommandDispatcher(client *c) {
     ValkeyModuleCtx ctx;
     moduleCreateContext(&ctx, cp->module, VALKEYMODULE_CTX_COMMAND);
 
+    /* Modules receive argv as ValkeyModuleString pointers and may retain them
+     * (ValkeyModule_RetainString(), ValkeyModule_HoldString(), ...), which needs
+     * a heap object with a real refcount rather than a slice's static header.
+     * Give each sliced argument its own header; the value keeps pointing into
+     * the query buffer and is only copied if the module retains it (see
+     * incrRefCount()). */
     if (c->argv_slice_mask) {
         for (int i = 0; i < c->argc; i++) {
             if (c->argv_slice_mask & (1U << i)) {
@@ -1106,7 +1112,6 @@ void ValkeyModuleCommandDispatcher(client *c) {
         /* Only do the work if the module took ownership of the object:
          * in that case the refcount is no longer 1. */
         if (c->argv[i]->refcount > 1) {
-            materializeSlice(c->argv[i]);
             trimStringObjectIfNeeded(c->argv[i], 0);
         }
     }
@@ -1123,6 +1128,7 @@ void ValkeyModuleCommandDispatcher(client *c) {
  * "get keys" call by calling ValkeyModule_IsKeysPositionRequest(ctx). */
 int moduleGetCommandKeysViaAPI(struct serverCommand *cmd, robj **argv, int argc, getKeysResult *result) {
     client *c = server.current_client;
+    /* Modules may retain argv, see ValkeyModuleCommandDispatcher(). */
     if (c && c->argv == argv && c->argv_slice_mask) {
         for (int i = 0; i < c->argc; i++) {
             if (c->argv_slice_mask & (1U << i)) {
@@ -3013,7 +3019,6 @@ void VM_FreeString(ValkeyModuleCtx *ctx, ValkeyModuleString *str) {
  * This API is not thread safe, access to these retained strings (if they originated
  * from a client command arguments) must be done with GIL locked. */
 void VM_RetainString(ValkeyModuleCtx *ctx, ValkeyModuleString *str) {
-    materializeSlice(str);
     if (ctx == NULL || !autoMemoryFreed(ctx, VALKEYMODULE_AM_STRING, str)) {
         /* Increment the string reference counting only if we can't
          * just remove the object from the list of objects that should
