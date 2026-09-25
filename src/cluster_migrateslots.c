@@ -121,7 +121,7 @@ static void freeSlotMigrationJob(void *o);
 static sds generateSlotMigrationJobDescription(slotMigrationJob *job, clusterNode *other_node);
 static void slotExportTryUnpause(void);
 static slotMigrationJob *clusterLookupMigrationJob(sds name);
-static sds generateSyncSlotsEstablishCommand(slotMigrationJob *job);
+static sds catSyncSlotsEstablishCommand(sds s, slotMigrationJob *job);
 static void clusterCleanupSlotMigrationLog(size_t max_len);
 
 /* Create an empty list of slot ranges. */
@@ -871,8 +871,12 @@ slotMigrationJob *createSlotImportJob(client *c,
      * lost, as we did not have a dedicated query buffer before this point). */
     initClientReplicationData(job->client);
     if (job->client->argv_slice_mask) clientPromoteArgv(job->client);
-    if (job->client->querybuf) sdsfree(job->client->querybuf);
-    job->client->querybuf = generateSyncSlotsEstablishCommand(job);
+    if (job->client->querybuf) {
+        sdsclear(job->client->querybuf);
+    } else {
+        job->client->querybuf = sdsempty();
+    }
+    job->client->querybuf = catSyncSlotsEstablishCommand(job->client->querybuf, job);
     job->client->qb_pos = sdslen(job->client->querybuf);
     /* The backfilled ESTABLISH command is already applied, so qb_applied
      * must match qb_pos for commandProcessed() to advance reploff. */
@@ -1491,11 +1495,11 @@ void initSlotExportJobClient(slotMigrationJob *job) {
     initClientReplicationData(job->client);
 }
 
-/* Generate and store the SYNCSLOTS ESTABLISH command to send to the target for
- * the job. */
-sds generateSyncSlotsEstablishCommand(slotMigrationJob *job) {
+/* Append the SYNCSLOTS ESTABLISH command to send to the target for the job to
+ * 's' and return the result. */
+sds catSyncSlotsEstablishCommand(sds s, slotMigrationJob *job) {
     serverAssert(strlen(job->source_node_name) > 0);
-    sds result = sdscatprintf(sdsempty(),
+    sds result = sdscatprintf(s,
                               "*%ld\r\n$7\r\nCLUSTER\r\n$9\r\nSYNCSLOTS\r\n"
                               "$9\r\nESTABLISH\r\n$6\r\nSOURCE\r\n$40\r\n"
                               "%.40s\r\n$4\r\nNAME\r\n$40\r\n%.40s\r\n"
@@ -2142,7 +2146,7 @@ void proceedWithSlotMigration(slotMigrationJob *job) {
             return;
         case SLOT_EXPORT_SEND_ESTABLISH:
             initSlotExportJobClient(job);
-            addReplySds(job->client, generateSyncSlotsEstablishCommand(job));
+            addReplySds(job->client, catSyncSlotsEstablishCommand(sdsempty(), job));
             connSetReadHandler(job->client->conn,
                                slotMigrationJobReadEstablishResponse);
             updateSlotMigrationJobState(job,
