@@ -474,7 +474,6 @@ void blockForKeys(client *c, int btype, robj **keys, int numkeys, mstime_t timeo
         if (objectGetRefcount(key) == OBJ_STATIC_REFCOUNT) {
             key = createStringObject(objectGetVal(key), sdslen(objectGetVal(key)));
         } else {
-            materializeSlice(key);
             incrRefCount(key);
         }
         client_blocked_entry = dictAddRaw(c->bstate->keys, key, NULL);
@@ -950,7 +949,6 @@ void blockClientInUseOnKeys(client *c, int num_keys, robj *keys[]) {
         if (objectGetRefcount(key) == OBJ_STATIC_REFCOUNT) {
             key = createStringObject(objectGetVal(key), sdslen(objectGetVal(key)));
         } else {
-            materializeSlice(key);
             incrRefCount(key);
         }
         serverAssert(dictAdd(c->bstate->keys, key, NULL) == DICT_OK);

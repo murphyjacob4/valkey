@@ -3946,7 +3946,6 @@ void alsoPropagate(int dbid, robj **argv, int argc, int target, int slot) {
         if (argv[j]->refcount == OBJ_STATIC_REFCOUNT) {
             argvcopy[j] = dupStringObject(argv[j]);
         } else {
-            materializeSlice(argv[j]);
             incrRefCount(argv[j]);
             argvcopy[j] = argv[j];
         }

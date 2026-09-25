@@ -3063,7 +3063,6 @@ ValkeyModuleString *VM_HoldString(ValkeyModuleCtx *ctx, ValkeyModuleString *str)
         return VM_CreateStringFromString(ctx, str);
     }
 
-    materializeSlice(str);
     incrRefCount(str);
     if (ctx != NULL) {
         /*
@@ -4348,7 +4347,6 @@ int VM_KeyExists(ValkeyModuleCtx *ctx, robj *keyname) {
 
 /* Initialize a ValkeyModuleKey struct */
 static void moduleInitKey(ValkeyModuleKey *kp, ValkeyModuleCtx *ctx, robj *keyname, robj *value, int mode) {
-    materializeSlice(keyname);
     kp->ctx = ctx;
     kp->db = ctx->client->db;
     kp->key = keyname;
@@ -4646,7 +4644,6 @@ int VM_StringSet(ValkeyModuleKey *key, ValkeyModuleString *str) {
     if (!(key->mode & VALKEYMODULE_WRITE) || key->iter) return VALKEYMODULE_ERR;
     VM_DeleteKey(key);
     /* Retain str so setKey copies it to db rather than reallocating it. */
-    materializeSlice(str);
     incrRefCount(str);
     setKey(key->ctx->client, key->db, key->key, &str, SETKEY_NO_SIGNAL | SETKEY_DOESNT_EXIST);
     key->value = str;
@@ -6503,7 +6500,6 @@ robj **moduleCreateArgvFromUserFormat(const char *cmdname, const char *fmt, int 
             if (obj->refcount == OBJ_STATIC_REFCOUNT) {
                 obj = createStringObject(objectGetVal(obj), sdslen(objectGetVal(obj)));
             } else {
-                materializeSlice(obj);
                 incrRefCount(obj);
             }
             argv[argc++] = obj;
@@ -6527,7 +6523,6 @@ robj **moduleCreateArgvFromUserFormat(const char *cmdname, const char *fmt, int 
 
             size_t i = 0;
             for (i = 0; i < vlen; i++) {
-                materializeSlice(v[i]);
                 incrRefCount(v[i]);
                 argv[argc++] = v[i];
             }
@@ -7234,7 +7229,6 @@ int VM_CallArgv(ValkeyModuleCtx *ctx,
 
         robj **argv_copy = zmalloc(sizeof(robj *) * argc);
         for (int i = 0; i < argc; i++) {
-            materializeSlice(argv[i]);
             incrRefCount(argv[i]);
             argv_copy[i] = argv[i];
         }
@@ -11782,7 +11776,6 @@ void moduleCallCommandFilters(client *c) {
     ValkeyModuleCommandFilterCtx filter = {.argv = c->argv, .argv_len = c->argv_len, .argc = c->argc, .c = c};
 
     robj *pre_filter_command = c->argv[0];
-    materializeSlice(pre_filter_command);
     incrRefCount(pre_filter_command);
     const int pre_filter_argc = c->argc;
 
@@ -11837,7 +11830,6 @@ static void backupOriginalClientArgv(ValkeyModuleCommandFilterCtx *fctx) {
         fctx->c->original_argc = fctx->argc;
         fctx->argv = zmalloc(fctx->argv_len * sizeof(ValkeyModuleString *));
         for (int i = 0; i < fctx->argc; i++) {
-            materializeSlice(fctx->c->original_argv[i]);
             incrRefCount(fctx->c->original_argv[i]);
             fctx->argv[i] = fctx->c->original_argv[i];
         }

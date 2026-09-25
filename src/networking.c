@@ -5489,7 +5489,6 @@ int clientSetName(client *c, robj *name, const char **err) {
     if (objectGetRefcount(name) == OBJ_STATIC_REFCOUNT) {
         c->name = createStringObject(objectGetVal(name), len);
     } else {
-        materializeSlice(name);
         c->name = name;
         incrRefCount(name);
     }
@@ -6836,7 +6835,6 @@ robj *clientRetainArg(client *c, int i) {
         robj *owned = createStringObject(objectGetVal(slice), sdslen(objectGetVal(slice)));
         return owned;
     }
-    materializeSlice(c->argv[i]);
     incrRefCount(c->argv[i]);
     return c->argv[i];
 }
@@ -6997,7 +6995,6 @@ void rewriteClientCommandVector(client *c, int argc, ...) {
         if (a->refcount == OBJ_STATIC_REFCOUNT) {
             a = createStringObject(objectGetVal(a), sdslen(objectGetVal(a)));
         } else {
-            materializeSlice(a);
             incrRefCount(a);
         }
         argv[j] = a;
@@ -7041,7 +7038,6 @@ void rewriteClientCommandArgument(client *c, int i, robj *newval) {
         if (newval->refcount == OBJ_STATIC_REFCOUNT) {
             newval = createStringObject(objectGetVal(newval), sdslen(objectGetVal(newval)));
         } else {
-            materializeSlice(newval);
             incrRefCount(newval);
         }
     }

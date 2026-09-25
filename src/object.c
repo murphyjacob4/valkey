@@ -771,6 +771,8 @@ void freeStreamObject(robj *o) {
 
 void incrRefCount(robj *o) {
     if (objectGetRefcount(o) < OBJ_FIRST_SPECIAL_REFCOUNT) {
+        /* A retained object must not point into a client's query buffer. */
+        materializeSlice(o);
         o->refcount++;
     } else {
         if (objectGetRefcount(o) == OBJ_SHARED_REFCOUNT) {
@@ -1092,12 +1094,6 @@ robj *getDecodedObject(robj *o) {
      * callers pair this with decrRefCount, so hand back an owned copy. */
     if (objectGetRefcount(o) == OBJ_STATIC_REFCOUNT && sdsEncodedObject(o)) {
         return createStringObject(objectGetVal(o), sdslen(objectGetVal(o)));
-    }
-
-    if (objectGetEncoding(o) == OBJ_ENCODING_SLICED) {
-        materializeSlice(o);
-        incrRefCount(o);
-        return o;
     }
 
     if (sdsEncodedObject(o)) {
