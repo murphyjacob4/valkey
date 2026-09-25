@@ -297,6 +297,25 @@ foreach call_type {nested normal} {
         assert_match "OK" [r unblock_by_timer 100 100]
     }
     
+    test "Blocked module command keeps its arguments while more input arrives" {
+        set rd [valkey_deferring_client]
+        $rd block_echo_argv 500 hello world
+        $rd flush
+        wait_for_blocked_clients_count 1
+
+        # Pipelined input read while the client is blocked makes the server
+        # trim and grow the query buffer the arguments were parsed from.
+        set pings 2000
+        $rd write [string repeat "*1\r\n\$4\r\nPING\r\n" $pings]
+        $rd flush
+
+        assert_equal {hello world} [$rd read]
+        for {set i 0} {$i < $pings} {incr i} {
+            assert_equal PONG [$rd read]
+        }
+        $rd close
+    }
+
     test "Unload the module - blockedclient" {
         assert_equal {OK} [r module unload blockedclient]
     }

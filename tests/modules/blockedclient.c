@@ -1032,6 +1032,32 @@ int unblock_by_timer(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc)
     return VALKEYMODULE_OK;
 }
 
+static int block_echo_argv_reply(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    ValkeyModule_ReplyWithArray(ctx, argc - 2);
+    for (int i = 2; i < argc; i++) ValkeyModule_ReplyWithString(ctx, argv[i]);
+    return VALKEYMODULE_OK;
+}
+
+static void block_echo_argv_unblock(ValkeyModuleCtx *ctx, void *data) {
+    VALKEYMODULE_NOT_USED(ctx);
+    ValkeyModule_UnblockClient(data, NULL);
+}
+
+/* BLOCK_ECHO_ARGV <delay-ms> arg [arg ...]
+ * Blocks the client for delay-ms and then replies with the arguments as seen
+ * by the reply callback. */
+int block_echo_argv(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    if (argc < 3) return ValkeyModule_WrongArity(ctx);
+
+    long long delay;
+    if (ValkeyModule_StringToLongLong(argv[1], &delay) != VALKEYMODULE_OK)
+        return ValkeyModule_ReplyWithError(ctx, "ERR invalid delay");
+
+    ValkeyModuleBlockedClient *bc = ValkeyModule_BlockClient(ctx, block_echo_argv_reply, NULL, NULL, 0);
+    ValkeyModule_CreateTimer(ctx, delay, block_echo_argv_unblock, bc);
+    return VALKEYMODULE_OK;
+}
+
 int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
     VALKEYMODULE_NOT_USED(argv);
     VALKEYMODULE_NOT_USED(argc);
@@ -1127,6 +1153,9 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
         return VALKEYMODULE_ERR;
 
     if (ValkeyModule_CreateCommand(ctx, "unblock_by_timer", unblock_by_timer, "", 0, 0, 0) == VALKEYMODULE_ERR)
+        return VALKEYMODULE_ERR;
+
+    if (ValkeyModule_CreateCommand(ctx, "block_echo_argv", block_echo_argv, "", 0, 0, 0) == VALKEYMODULE_ERR)
         return VALKEYMODULE_ERR;
 
     return VALKEYMODULE_OK;
