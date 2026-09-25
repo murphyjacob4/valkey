@@ -7,6 +7,11 @@
         "arity": 3,
         "container": "SCRIPT",
         "function": "scriptCommand",
+        "retained_args": {
+            "first": 2,
+            "last": 2,
+            "step": 1
+        },
         "command_flags": [
             "DENYOOM",
             "NOSCRIPT",
