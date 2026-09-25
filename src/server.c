@@ -4390,10 +4390,11 @@ void call(client *c, int flags) {
             propagate_flags &= ~PROPAGATE_AOF;
 
         /* Call alsoPropagate() only if at least one of AOF / replication
-         * propagation is needed. */
-        if (propagate_flags != PROPAGATE_NONE && shouldPropagate(propagate_flags)) {
-            alsoPropagate(c->db->id, c->argv, c->argc, propagate_flags, c->slot);
-        }
+         * propagation is needed. Don't gate this on shouldPropagate():
+         * alsoPropagate() must still feed forkless background iteration
+         * (e.g. SWAPDB tracking) when there are no replicas and AOF is off,
+         * and it performs its own shouldPropagate() check afterwards. */
+        if (propagate_flags != PROPAGATE_NONE) alsoPropagate(c->db->id, c->argv, c->argc, propagate_flags, c->slot);
     }
 
     /* Restore the old replication flags, since call() can be executed
