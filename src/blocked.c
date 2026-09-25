@@ -105,7 +105,7 @@ void freeClientBlockingState(client *c) {
  * flag is set client query buffer is not longer processed, but accumulated,
  * and will be processed when the client is unblocked. */
 void blockClient(client *c, int btype) {
-    clientPromoteArgv(c);
+    clientMaterializeArgv(c);
     /* Replicated clients should never be blocked unless pause or module */
     serverAssert(!(isReplicatedClient(c) && btype != BLOCKED_MODULE && btype != BLOCKED_POSTPONE));
 
@@ -455,7 +455,7 @@ void blockForKeys(client *c, int btype, robj **keys, int numkeys, mstime_t timeo
     list *l;
     int j;
 
-    clientPromoteArgv(c);
+    clientMaterializeArgv(c);
     initClientBlockingState(c);
 
     if (!c->flag.reexecuting_command) {
@@ -468,7 +468,7 @@ void blockForKeys(client *c, int btype, robj **keys, int numkeys, mstime_t timeo
         /* If the key already exists in the dictionary ignore it. */
         if (dictFind(c->bstate->keys, keys[j]) != NULL) continue;
 
-        /* Callers may hand us key objects captured before argv promotion (still
+        /* Callers may hand us key objects captured before argv materialization (still
          * querybuf slices), so take an owned reference that outlives the command. */
         robj *key = keys[j];
         if (objectGetRefcount(key) == OBJ_STATIC_REFCOUNT) {

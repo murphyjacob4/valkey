@@ -996,7 +996,7 @@ int clientsCronResizeQueryBuffer(client *c) {
     /* Only resize the query buffer if the buffer is actually wasting at least a
      * few kbytes */
     if (sdsavail(c->querybuf) > 1024 * 4) {
-        clientPromoteArgv(c);
+        clientMaterializeArgv(c);
         if (!isReplicatedClient(c)) {
             trimClientQueryBuffer(c);
         }
@@ -4228,12 +4228,12 @@ void call(client *c, int flags) {
     uint32_t *debug_argv_refcount = NULL;
     uint32_t debug_slice_mask = 0;
     int debug_argv_borrowed = c->flag.argv_borrowed;
-    int debug_argv_sliced = (c->argv_slice_mask != 0);
+    int debug_argv_sliced = (c->argv_sliced_mask != 0);
     if ((debug_argv_borrowed || debug_argv_sliced) && server.enable_debug_assert) {
         debug_argc_clone = c->original_argv ? c->original_argc : c->argc;
         debug_argv_clone = zmalloc(sizeof(robj *) * debug_argc_clone);
         debug_argv_refcount = zmalloc(sizeof(uint32_t) * debug_argc_clone);
-        debug_slice_mask = c->argv_slice_mask;
+        debug_slice_mask = c->argv_sliced_mask;
         for (int i = 0; i < debug_argc_clone; i++) {
             debug_argv_clone[i] = c->original_argv ? c->original_argv[i] : c->argv[i];
             debug_argv_refcount[i] = c->original_argv ? c->original_argv[i]->refcount : c->argv[i]->refcount;
@@ -4251,7 +4251,7 @@ void call(client *c, int flags) {
         }
         serverAssert(argc == debug_argc_clone);
         for (int i = 0; i < debug_argc_clone; i++) {
-            int should_check = debug_argv_borrowed || (c->argv_slice_mask && (debug_slice_mask & (1U << i)));
+            int should_check = debug_argv_borrowed || ((debug_slice_mask & (1U << i)) && argIsInline(argv[i]));
             if (should_check) {
                 if (argv[i] != debug_argv_clone[i]) {
                     serverLog(LL_WARNING, "Debug: command %s modified argv[%d]", c->cmd->current_name, i);
@@ -4605,7 +4605,7 @@ static void prepareCommandGeneric(robj **argv, int argc, int *read_flags, struct
         *read_flags |= READ_FLAGS_BAD_ARITY;
     } else {
         /* If the command has retained argument hints and arguments were sliced,
-         * promote those specific arguments from ephemeral stack slices to owned heap robjs.
+         * copy those specific arguments into owned heap robjs.
          * Doing this during prepareCommand offloads allocation to worker IO threads and
          * avoids slice-then-retain overhead on the main thread. */
         if ((*cmd)->retained_first > 0 && slice_mask && *slice_mask > 0) {
@@ -4632,7 +4632,7 @@ static void prepareCommandGeneric(robj **argv, int argc, int *read_flags, struct
 /* Prepare the client's current command. See prepareCommandGeneric(). */
 void prepareCommand(client *c) {
     prepareCommandGeneric(c->argv, c->argc, &c->read_flags, &c->parsed_cmd, &c->slot,
-                          &c->argv_slice_mask);
+                          &c->argv_sliced_mask);
 }
 
 /* Prepare all parsed commands in the client's queue. See prepareCommand(). */
@@ -4644,7 +4644,7 @@ void prepareCommandQueue(client *c) {
     for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
         parsedCommand *p = &c->cmd_queue.cmds[i];
         prepareCommandGeneric(p->argv, p->argc, &p->read_flags, &p->cmd, &p->slot,
-                              &p->argv_slice_mask);
+                              &p->argv_sliced_mask);
     }
 }
 

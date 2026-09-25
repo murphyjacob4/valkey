@@ -1087,13 +1087,7 @@ void ValkeyModuleCommandDispatcher(client *c) {
      * Give each sliced argument its own header; the value keeps pointing into
      * the query buffer and is only copied if the module retains it (see
      * incrRefCount()). */
-    if (c->argv_slice_mask) {
-        for (int i = 0; i < c->argc; i++) {
-            if (c->argv_slice_mask & (1U << i)) {
-                clientMaterializeArgvObjectOnly(c, i);
-            }
-        }
-    }
+    clientDetachArgv(c);
 
     ctx.client = c;
     cp->func(&ctx, (void **)c->argv, c->argc);
@@ -1129,13 +1123,7 @@ void ValkeyModuleCommandDispatcher(client *c) {
 int moduleGetCommandKeysViaAPI(struct serverCommand *cmd, robj **argv, int argc, getKeysResult *result) {
     client *c = server.current_client;
     /* Modules may retain argv, see ValkeyModuleCommandDispatcher(). */
-    if (c && c->argv == argv && c->argv_slice_mask) {
-        for (int i = 0; i < c->argc; i++) {
-            if (c->argv_slice_mask & (1U << i)) {
-                clientMaterializeArgvObjectOnly(c, i);
-            }
-        }
-    }
+    if (c && c->argv == argv) clientDetachArgv(c);
 
     ValkeyModuleCommand *cp = cmd->module_cmd;
     ValkeyModuleCtx ctx;
@@ -1158,13 +1146,7 @@ int moduleGetCommandKeysViaAPI(struct serverCommand *cmd, robj **argv, int argc,
  * during registration. Unlike keys, this is the only way to declare channels. */
 int moduleGetCommandChannelsViaAPI(struct serverCommand *cmd, robj **argv, int argc, getKeysResult *result) {
     client *c = server.current_client;
-    if (c && c->argv == argv && c->argv_slice_mask) {
-        for (int i = 0; i < c->argc; i++) {
-            if (c->argv_slice_mask & (1U << i)) {
-                clientMaterializeArgvObjectOnly(c, i);
-            }
-        }
-    }
+    if (c && c->argv == argv) clientDetachArgv(c);
 
     ValkeyModuleCommand *cp = cmd->module_cmd;
     ValkeyModuleCtx ctx;
@@ -9680,13 +9662,7 @@ void moduleNotifyKeyspaceEvent(int type, const char *event, robj *key, int dbid)
     client *executing_client = server.executing_client ? server.executing_client : server.current_client;
     int origin_dbid = (executing_client != NULL) ? executing_client->db->id : -1;
 
-    if (executing_client && executing_client->argv_slice_mask) {
-        for (int i = 0; i < executing_client->argc; i++) {
-            if (executing_client->argv_slice_mask & (1U << i)) {
-                clientMaterializeArgvObjectOnly(executing_client, i);
-            }
-        }
-    }
+    if (executing_client) clientDetachArgv(executing_client);
 
     robj *key_obj = key;
     if (key && key->refcount == OBJ_STATIC_REFCOUNT) {
@@ -11766,13 +11742,9 @@ int VM_UnregisterCommandFilter(ValkeyModuleCtx *ctx, ValkeyModuleCommandFilter *
 void moduleCallCommandFilters(client *c) {
     if (listLength(moduleCommandFilters) == 0) return;
 
-    if (c->argv_slice_mask) {
-        for (int i = 0; i < c->argc; i++) {
-            if (c->argv_slice_mask & (1U << i)) {
-                clientMaterializeArgvObjectOnly(c, i);
-            }
-        }
-    }
+    /* Filters may insert, delete and reallocate arguments, which neither the
+     * inline argv array nor argv_sliced_mask would follow. */
+    clientMaterializeArgv(c);
 
     listIter li;
     listNode *ln;
@@ -11931,13 +11903,7 @@ void moduleFireCommandResultEvent(client *c,
         if (commandResultSuccessListeners == 0) return;
     }
 
-    if (c->argv_slice_mask) {
-        for (int i = 0; i < c->argc; i++) {
-            if (c->argv_slice_mask & (1U << i)) {
-                clientMaterializeArgvObjectOnly(c, i);
-            }
-        }
-    }
+    clientDetachArgv(c);
 
     /* Get argv - prefer original_argv if available (before any rewriting) */
     robj **argv = c->original_argv ? c->original_argv : c->argv;
@@ -11999,13 +11965,7 @@ void moduleFireCommandResultEvent(client *c,
 void moduleFireCommandRejectedEvent(client *c, const char *reply_str) {
     if (commandResultRejectedListeners == 0) return;
 
-    if (c->argv_slice_mask) {
-        for (int i = 0; i < c->argc; i++) {
-            if (c->argv_slice_mask & (1U << i)) {
-                clientMaterializeArgvObjectOnly(c, i);
-            }
-        }
-    }
+    clientDetachArgv(c);
 
     ValkeyModuleCommandResultInfoV1 info = {
         .version = VALKEYMODULE_COMMANDRESULTINFO_VERSION,
@@ -12031,13 +11991,7 @@ void moduleFireCommandRejectedEvent(client *c, const char *reply_str) {
 void moduleFireCommandACLRejectedEvent(client *c, uint64_t subevent, int errpos) {
     if (commandResultACLRejectedListeners == 0) return;
 
-    if (c->argv_slice_mask) {
-        for (int i = 0; i < c->argc; i++) {
-            if (c->argv_slice_mask & (1U << i)) {
-                clientMaterializeArgvObjectOnly(c, i);
-            }
-        }
-    }
+    clientDetachArgv(c);
 
     char int_key_buf[LONG_STR_SIZE];
     const char *rejection_context = NULL;
@@ -13358,13 +13312,7 @@ void moduleNotifyKeyUnlink(robj *key, robj *val, int dbid, int flags) {
     }
 
     client *executing_client = server.executing_client ? server.executing_client : server.current_client;
-    if (executing_client && executing_client->argv_slice_mask) {
-        for (int i = 0; i < executing_client->argc; i++) {
-            if (executing_client->argv_slice_mask & (1U << i)) {
-                clientMaterializeArgvObjectOnly(executing_client, i);
-            }
-        }
-    }
+    if (executing_client) clientDetachArgv(executing_client);
 
     robj *key_obj = key;
     if (key && key->refcount == OBJ_STATIC_REFCOUNT) {
@@ -15062,7 +15010,7 @@ void VM_ScriptingEngineDebuggerProcessCommands(int *client_disconnected,
  * MODULE UNLOAD <name>
  */
 void moduleCommand(client *c) {
-    if (c->argv_slice_mask) clientPromoteArgv(c);
+    if (c->argv_sliced_mask) clientMaterializeArgv(c);
     char *subcmd = objectGetVal(c->argv[1]);
 
     if (c->argc == 2 && !strcasecmp(subcmd, "help")) {

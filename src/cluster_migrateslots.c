@@ -870,7 +870,7 @@ slotMigrationJob *createSlotImportJob(client *c,
      * We also backfill this job's establish command (which would have been
      * lost, as we did not have a dedicated query buffer before this point). */
     initClientReplicationData(job->client);
-    if (job->client->argv_slice_mask) clientPromoteArgv(job->client);
+    if (job->client->argv_sliced_mask) clientMaterializeArgv(job->client);
     if (job->client->querybuf) {
         sdsclear(job->client->querybuf);
     } else {

@@ -160,8 +160,8 @@ static int parseMultibulk(client *c,
                           size_t *argv_len_sum,
                           unsigned long long *net_input_bytes_curr_cmd,
                           robj **argv_inline,
-                          robj *argv_slice,
-                          uint32_t *argv_slice_mask);
+                          robj *argv_inline_objs,
+                          uint32_t *argv_sliced_mask);
 
 int ProcessingEventsWhileBlocked = 0; /* See processEventsWhileBlocked(). */
 
@@ -196,6 +196,7 @@ size_t getStringObjectLen(robj *o) {
     switch (objectGetEncoding(o)) {
     case OBJ_ENCODING_RAW: return sdslen(objectGetVal(o));
     case OBJ_ENCODING_EMBSTR: return sdslen(objectGetVal(o));
+    case OBJ_ENCODING_SLICED: return sdslen(objectGetVal(o));
     default: return 0; /* Just integer encoding for now. */
     }
 }
@@ -367,7 +368,7 @@ client *createClient(connection *conn) {
     c->argv = NULL;
     c->argv_len = 0;
     c->argv_len_sum = 0;
-    c->argv_slice_mask = 0;
+    c->argv_sliced_mask = 0;
     c->original_argc = 0;
     c->original_argv = NULL;
     c->redact_arg_bitmap = 0;
@@ -2168,15 +2169,10 @@ void freeClientArgv(client *c) {
         goto clear;
     }
 
-    if (c->argv_slice_mask) {
-        for (int j = 0; j < c->argc; j++) {
-            if (c->argv_slice_mask & (1U << j)) {
-                c->argv_slice_mask &= ~(1U << j);
-            } else {
-                decrRefCount(c->argv[j]);
-            }
-        }
-        serverAssert(c->argv_slice_mask == 0);
+    /* Inline and sliced arguments point into this client, so free them here
+     * rather than in an I/O thread. decrRefCount() ignores inline headers. */
+    if (c->argv_sliced_mask) {
+        for (int j = 0; j < c->argc; j++) decrRefCount(c->argv[j]);
         if (c->argv != c->argv_inline) zfree(c->argv);
         goto clear;
     }
@@ -2189,6 +2185,7 @@ void freeClientArgv(client *c) {
     }
 clear:
     c->argc = 0;
+    c->argv_sliced_mask = 0;
     c->cmd = NULL;
     c->parsed_cmd = NULL;
     c->argv_len_sum = 0;
@@ -2546,22 +2543,39 @@ void logInvalidUseAndFreeClientAsync(client *c, const char *fmt, ...) {
 /* Returns true if the current command or any queued command still has argv
  * slices pointing into c->querybuf. */
 static inline bool clientHasQueryBufSlices(client *c) {
-    if (c->argv_slice_mask != 0) return true;
+    if (c->argv_sliced_mask != 0) return true;
     for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
-        if (c->cmd_queue.cmds[i].argv_slice_mask != 0) return true;
+        if (c->cmd_queue.cmds[i].argv_sliced_mask != 0) return true;
     }
     return false;
+}
+
+/* Returns argv[i] if it is still a slice of the query buffer, else NULL. The
+ * mask bit is only a hint, see argIsInline(). */
+static inline robj *argvSlicedArg(robj **argv, int argc, uint32_t sliced_mask, int i) {
+    if (i >= argc || !(sliced_mask & (1U << i))) return NULL;
+    robj *o = argv[i];
+    return (o && objectGetEncoding(o) == OBJ_ENCODING_SLICED) ? o : NULL;
 }
 
 /* Lowest query buffer address referenced by the argv slices of one command, or
  * NULL if it has none. Arguments are parsed in order, so the first sliced
  * argument is the lowest; its sds header is written in place just before the
  * payload, hence sdsAllocPtr(). */
-static inline char *argvLowestSlicePtr(robj **argv, int argc, uint32_t slice_mask) {
-    if (slice_mask == 0) return NULL;
-    int i = __builtin_ctz(slice_mask);
-    serverAssert(i < argc);
-    return (char *)sdsAllocPtr(objectGetVal(argv[i]));
+static inline char *argvLowestSlicePtr(robj **argv, int argc, uint32_t sliced_mask) {
+    for (int i = 0; sliced_mask && i < min(argc, ARGV_INLINE_MAX); i++) {
+        robj *o = argvSlicedArg(argv, argc, sliced_mask, i);
+        if (o) return (char *)sdsAllocPtr(objectGetVal(o));
+    }
+    return NULL;
+}
+
+/* Moves the argv slices of one command by 'diff' bytes. */
+static void argvMoveSlices(robj **argv, int argc, uint32_t sliced_mask, ptrdiff_t diff) {
+    for (int i = 0; sliced_mask && i < min(argc, ARGV_INLINE_MAX); i++) {
+        robj *o = argvSlicedArg(argv, argc, sliced_mask, i);
+        if (o) objectSetVal(o, (char *)objectGetVal(o) + diff);
+    }
 }
 
 /* Returns the lowest query buffer offset that must be preserved: the start of
@@ -2569,11 +2583,11 @@ static inline char *argvLowestSlicePtr(robj **argv, int argc, uint32_t slice_mas
  * are no slices. */
 static size_t clientQueryBufLiveStart(client *c) {
     char *lowest = c->querybuf + c->qb_pos;
-    char *p = argvLowestSlicePtr(c->argv, c->argc, c->argv_slice_mask);
+    char *p = argvLowestSlicePtr(c->argv, c->argc, c->argv_sliced_mask);
     if (p && p < lowest) lowest = p;
     for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
         parsedCommand *cmd = &c->cmd_queue.cmds[i];
-        p = argvLowestSlicePtr(cmd->argv, cmd->argc, cmd->argv_slice_mask);
+        p = argvLowestSlicePtr(cmd->argv, cmd->argc, cmd->argv_sliced_mask);
         if (p && p < lowest) lowest = p;
     }
     serverAssert(lowest >= c->querybuf);
@@ -2613,17 +2627,19 @@ void trimClientQueryBuffer(client *c) {
 
 /* Frees up query buffer space for the next network read, preferring (in order):
  *
- *   1. Trim    - drop consumed bytes, keep argv slices. No allocation. This is the
- *                common case: in a pipeline the only live slices are those of the
- *                one command straddling the previous read.
- *   2. Promote - copy the sliced args to heap objects so the trim can reach
- *                qb_pos. Only when slices are what's forcing the buffer to grow.
- *                Slicing is limited to the first ARGV_INLINE_MAX args of a command,
- *                so a many-argument command spanning reads pins everything from
- *                its first arg onward; without this the buffer would grow to the
- *                size of the whole command. Growing would copy these bytes anyway.
- *   3. Grow    - left to the caller. Unavoidable when the live region is mostly an
- *                unparsed partial argument (below the bulk cutover threshold). */
+ *   1. Trim        - drop consumed bytes, keep argv slices. No allocation. This
+ *                    is the common case: in a pipeline the only live slices are
+ *                    those of the one command straddling the previous read.
+ *   2. Materialize - copy the sliced args to heap objects so the trim can reach
+ *                    qb_pos. Only when slices are what's forcing the buffer to
+ *                    grow. Slicing is limited to the first ARGV_INLINE_MAX args
+ *                    of a command, so a many-argument command spanning reads
+ *                    pins everything from its first arg onward; without this the
+ *                    buffer would grow to the size of the whole command. Growing
+ *                    would copy these bytes anyway.
+ *   3. Grow        - left to the caller. Unavoidable when the live region is
+ *                    mostly an unparsed partial argument (below the bulk cutover
+ *                    threshold). */
 static void clientMakeRoomForNextRead(client *c) {
     trimClientQueryBuffer(c);
 
@@ -2634,12 +2650,12 @@ static void clientMakeRoomForNextRead(client *c) {
     if (full_read_fits) return;
 
     /* After the trim, everything in [0, qb_pos) is parsed data that is only
-     * retained because of argv slices; promoting them would release it all. */
-    size_t reclaimable_by_promotion = c->qb_pos;
-    bool promotion_makes_room = free_space + reclaimable_by_promotion >= PROTO_IOBUF_LEN;
-    if (!promotion_makes_room || !clientHasQueryBufSlices(c)) return;
+     * retained because of argv slices; materializing them would release it all. */
+    size_t reclaimable_by_materializing = c->qb_pos;
+    bool materializing_makes_room = free_space + reclaimable_by_materializing >= PROTO_IOBUF_LEN;
+    if (!materializing_makes_room || !clientHasQueryBufSlices(c)) return;
 
-    clientPromoteArgv(c);
+    clientMaterializeArgv(c);
     trimClientQueryBuffer(c);
 }
 
@@ -2647,35 +2663,14 @@ static void clientMakeRoomForNextRead(client *c) {
  * into c->querybuf when c->querybuf is reallocated to a new address. */
 void clientFixupQueryBufSlicePointers(client *c, char *old_querybuf) {
     if (!c->querybuf || c->querybuf == old_querybuf) return;
-    if (c->argv_slice_mask == 0 && c->cmd_queue.len == 0) return;
+    if (c->argv_sliced_mask == 0 && c->cmd_queue.len == 0) return;
     ptrdiff_t diff = c->querybuf - old_querybuf;
 
-    /* Fixup slices in client argv */
-    if (c->argv_slice_mask) {
-        int max_check = min(c->argc, 32);
-        for (int i = 0; i < max_check; i++) {
-            if (c->argv_slice_mask & (1U << i)) {
-                robj *slice = c->argv[i];
-                char *ptr = objectGetVal(slice);
-                objectSetVal(slice, ptr + diff);
-            }
-        }
-    }
-
-    /* Fixup slices in queued commands */
+    argvMoveSlices(c->argv, c->argc, c->argv_sliced_mask, diff);
     cmdQueue *queue = &c->cmd_queue;
     for (int i = queue->off; i < queue->len; i++) {
         parsedCommand *cmd = &queue->cmds[i];
-        if (cmd->argv_slice_mask) {
-            int max_check = min(cmd->argc, 32);
-            for (int j = 0; j < max_check; j++) {
-                if (cmd->argv_slice_mask & (1U << j)) {
-                    robj *slice = cmd->argv[j];
-                    char *ptr = objectGetVal(slice);
-                    objectSetVal(slice, ptr + diff);
-                }
-            }
-        }
+        argvMoveSlices(cmd->argv, cmd->argc, cmd->argv_sliced_mask, diff);
     }
 }
 
@@ -2756,7 +2751,7 @@ void beforeNextClient(client *c) {
      * Buffers larger than freelist size are retained by the active client (and shrunk
      * by serverCron if idle) to avoid buffer thrashing on large payloads. */
     if (!isReplicatedClient(c) && c->querybuf && c->qb_pos == sdslen(c->querybuf) &&
-        c->argv_slice_mask == 0 && c->cmd_queue.len == 0 &&
+        c->argv_sliced_mask == 0 && c->cmd_queue.len == 0 &&
         c->bulk_cutover_obj == NULL && c->multibulklen == 0 && c->reqtype == 0 &&
         sdsalloc(c->querybuf) < PROTO_IOBUF_LEN * 2) {
         if (server.active_io_threads_num <= 1 ||
@@ -3953,9 +3948,9 @@ void resetClient(client *c) {
     /* When debug assert is enabled, poison the argv slices to quickly catch
      * bugs where slices are used beyond their lifecycle. */
     if (server.enable_debug_assert) {
-        memset(c->argv_slice, 0xA5, sizeof(c->argv_slice));
+        memset(c->argv_inline_objs, 0xA5, sizeof(c->argv_inline_objs));
     }
-    serverAssert(c->argv_slice_mask == 0);
+    serverAssert(c->argv_sliced_mask == 0);
     c->redact_arg_bitmap = 0;
     c->cur_script = NULL;
     c->net_input_bytes_curr_cmd = 0;
@@ -4175,7 +4170,7 @@ static void setProtocolError(const char *errstr, client *c) {
 
 /* When the command queue is reallocated, internal pointers within parsedCommand
  * structures (specifically cmd->argv pointing to cmd->argv_inline, and cmd->argv[j]
- * pointing to cmd->argv_slice[j]) will still point to the old buffer location.
+ * pointing to cmd->argv_inline_objs[j]) will still point to the old buffer location.
  * This function fixes up those self-referential pointers to point to the newly
  * allocated parsedCommand array. */
 static void fixupCommandQueuePointers(cmdQueue *queue, parsedCommand *old_cmds) {
@@ -4186,8 +4181,8 @@ static void fixupCommandQueuePointers(cmdQueue *queue, parsedCommand *old_cmds) 
             cmd->argv = cmd->argv_inline;
         }
         for (int j = 0; j < cmd->argc; j++) {
-            if (cmd->argv[j] == &old_cmds[i].argv_slice[j]) {
-                cmd->argv[j] = &cmd->argv_slice[j];
+            if (cmd->argv[j] == &old_cmds[i].argv_inline_objs[j]) {
+                cmd->argv[j] = &cmd->argv_inline_objs[j];
             }
         }
     }
@@ -4214,7 +4209,7 @@ static void reallocCommandQueue(cmdQueue *queue, uint16_t new_cap) {
 void parseMultibulkBuffer(client *c) {
     int flag = parseMultibulk(c, &c->argc, &c->argv, &c->argv_len,
                               &c->argv_len_sum, &c->net_input_bytes_curr_cmd,
-                              c->argv_inline, c->argv_slice, &c->argv_slice_mask);
+                              c->argv_inline, c->argv_inline_objs, &c->argv_sliced_mask);
     c->read_flags |= flag;
 
     /* Record qb_pos for commandProcessed(). Written unconditionally because a
@@ -4252,7 +4247,7 @@ void parseMultibulkBuffer(client *c) {
         p->argv_len = ARGV_INLINE_MAX;
         flag = parseMultibulk(c, &p->argc, &p->argv, &p->argv_len,
                               &p->argv_len_sum, &p->input_bytes,
-                              p->argv_inline, p->argv_slice, &p->argv_slice_mask);
+                              p->argv_inline, p->argv_inline_objs, &p->argv_sliced_mask);
         p->read_flags = flag;
         p->slot = -1;
     }
@@ -4298,7 +4293,7 @@ void clientStashBulkCutover(client *c) {
     if (c->bulk_cutover_obj == NULL) return;
 
     /* Appending may reallocate the query buffer, so nothing may point into it. */
-    clientPromoteArgv(c);
+    clientMaterializeArgv(c);
     serverAssert(!clientHasQueryBufSlices(c));
     trimClientQueryBuffer(c);
     /* While a cutover is active every read goes into the cutover object, so the
@@ -4354,8 +4349,8 @@ static int parseMultibulk(client *c,
                           size_t *argv_len_sum,
                           unsigned long long *net_input_bytes_curr_cmd,
                           robj **argv_inline,
-                          robj *argv_slice,
-                          uint32_t *argv_slice_mask) {
+                          robj *argv_inline_objs,
+                          uint32_t *argv_sliced_mask) {
     char *newline = NULL;
     int ok;
     long long ll;
@@ -4566,9 +4561,10 @@ static int parseMultibulk(client *c,
                     payload[c->bulklen] = '\0';
                     val_sds = payload;
                 }
-                initStaticStringObject(argv_slice[slice_idx], val_sds);
-                *argv_slice_mask |= (1U << slice_idx);
-                (*argv)[(*argc)++] = &argv_slice[slice_idx];
+                initStaticStringObject(argv_inline_objs[slice_idx], val_sds);
+                objectSetEncoding(&argv_inline_objs[slice_idx], OBJ_ENCODING_SLICED);
+                *argv_sliced_mask |= (1U << slice_idx);
+                (*argv)[(*argc)++] = &argv_inline_objs[slice_idx];
                 *argv_len_sum += c->bulklen;
                 c->qb_pos += c->bulklen + 2;
             } else {
@@ -4825,15 +4821,15 @@ static bool consumeCommandQueue(client *c) {
      * drains, so move them into the client. Only the first ARGV_INLINE_MAX args
      * can be sliced or inline; a heap argv already holds the rest. */
     for (int j = 0; j < min(p->argc, ARGV_INLINE_MAX); j++) {
-        if (p->argv_slice_mask & (1U << j)) {
-            c->argv_slice[j] = p->argv_slice[j];
-            c->argv[j] = &c->argv_slice[j];
+        if (queued_argv[j] == &p->argv_inline_objs[j]) {
+            c->argv_inline_objs[j] = p->argv_inline_objs[j];
+            c->argv[j] = &c->argv_inline_objs[j];
         } else {
             c->argv[j] = queued_argv[j];
         }
     }
 
-    c->argv_slice_mask = p->argv_slice_mask;
+    c->argv_sliced_mask = p->argv_sliced_mask;
 
     if (queue->off == queue->len) {
         /* The queue is empty. Don't free it here, because if parsing is done in
@@ -4848,11 +4844,7 @@ void discardCommandQueue(client *c) {
     cmdQueue *queue = &c->cmd_queue;
     while (queue->off < queue->len) {
         parsedCommand *p = &queue->cmds[queue->off++];
-        for (int j = 0; j < p->argc; j++) {
-            if (!(p->argv_slice_mask & (1U << j))) {
-                decrRefCount(p->argv[j]);
-            }
-        }
+        for (int j = 0; j < p->argc; j++) decrRefCount(p->argv[j]);
         if (p->argv != p->argv_inline) {
             zfree(p->argv);
         }
@@ -4992,8 +4984,8 @@ int processInputBuffer(client *c) {
         } else if (res != PARSE_OK) {
             /* Parse error or partial command. Slices of a partial command stay
              * valid across querybuf reallocation (pointers are fixed up), so
-             * only promote them on a parse error. */
-            if (res == PARSE_ERR && c->argv_slice_mask) clientPromoteArgv(c);
+             * only materialize them on a parse error. */
+            if (res == PARSE_ERR && c->argv_sliced_mask) clientMaterializeArgv(c);
             break;
         }
 
@@ -6841,77 +6833,54 @@ void securityWarningCommand(client *c) {
     freeClientAsync(c);
 }
 
-/* Return a heap-owned robj for argument i, with a reference held by the caller.
- *   - sliced   : materialize a real object; caller owns it; c->argv[i] is left alone.
- *   - borrowed : incrRefCount(c->argv[i]) and return it
- *   - owned    : incrRefCount and return it.
- */
+/* Returns argument i with a reference held by the caller. An inline argument
+ * can't be retained, so the caller gets a copy and c->argv[i] is left alone. */
 robj *clientRetainArg(client *c, int i) {
     serverAssert(i >= 0 && i < c->argc);
-    if (c->argv_slice_mask & (1U << i)) {
-        robj *slice = c->argv[i];
-        robj *owned = createStringObject(objectGetVal(slice), sdslen(objectGetVal(slice)));
-        return owned;
-    }
-    incrRefCount(c->argv[i]);
-    return c->argv[i];
+    robj *o = c->argv[i];
+    if (argIsInline(o)) return createStringObject(objectGetVal(o), sdslen(objectGetVal(o)));
+    incrRefCount(o); /* Copies a sliced value. */
+    return o;
 }
 
-/* Materialize the robj header for argument i onto the heap, leaving its SDS string
- * pointing into querybuf with OBJ_ENCODING_SLICED. */
-void clientMaterializeArgvObjectOnly(client *c, int i) {
-    serverAssert(i >= 0 && i < c->argc);
-    if (c->argv_slice_mask & (1U << i)) {
-        robj *slice = c->argv[i];
-        robj *o = createObject(OBJ_STRING, objectGetVal(slice));
-        objectSetEncoding(o, OBJ_ENCODING_SLICED);
-        c->argv[i] = o;
-        c->argv_slice_mask &= ~(1U << i);
+/* Moves the inline argument headers of c to the heap so they can be retained.
+ * The values stay sliced until then, see incrRefCount(). */
+void clientDetachArgv(client *c) {
+    for (int i = 0; c->argv_sliced_mask && i < min(c->argc, ARGV_INLINE_MAX); i++) {
+        robj *o = c->argv[i];
+        if (!argIsInline(o)) continue;
+        c->argv[i] = createObject(OBJ_STRING, objectGetVal(o));
+        objectSetEncoding(c->argv[i], OBJ_ENCODING_SLICED);
     }
 }
 
-/* Materialize both the robj header and the SDS string payload of argument i onto the heap. */
-void clientMaterializeArgv(client *c, int i) {
-    clientMaterializeArgvObjectOnly(c, i);
-    materializeSlice(c->argv[i]);
-}
-
-/* Promote all slices in client to heap objects, ensuring no slices remain. */
-void clientPromoteArgv(client *c) {
-    if (c->argv_slice_mask) {
-        for (int i = 0; i < c->argc; i++) {
-            if (c->argv_slice_mask & (1U << i)) {
-                clientMaterializeArgv(c, i);
-            }
-        }
-        serverAssert(c->argv_slice_mask == 0);
-    }
-
-    for (int i = 0; i < c->argc; i++) {
-        if (c->argv[i] && objectGetEncoding(c->argv[i]) == OBJ_ENCODING_SLICED) {
-            materializeSlice(c->argv[i]);
+static void argvMaterialize(robj **argv, int argc, uint32_t *sliced_mask) {
+    for (int i = 0; *sliced_mask && i < min(argc, ARGV_INLINE_MAX); i++) {
+        robj *o = argv[i];
+        if (o && argIsInline(o)) {
+            argv[i] = createStringObject(objectGetVal(o), sdslen(objectGetVal(o)));
+        } else if (o) {
+            materializeSlice(o);
         }
     }
+    *sliced_mask = 0;
+}
 
+/* Makes every inline or sliced argument of c and of its queued commands an
+ * owned heap object, and moves inline argv arrays to the heap, so nothing
+ * points into the client or its query buffer anymore. */
+void clientMaterializeArgv(client *c) {
+    argvMaterialize(c->argv, c->argc, &c->argv_sliced_mask);
     if (c->argv == c->argv_inline) {
         robj **heap_argv = zmalloc(sizeof(robj *) * c->argv_len);
         memcpy(heap_argv, c->argv_inline, sizeof(robj *) * c->argc);
         c->argv = heap_argv;
     }
 
-    /* Walk cmd_queue and promote any queued sliced commands */
     cmdQueue *queue = &c->cmd_queue;
     for (int i = queue->off; i < queue->len; i++) {
         parsedCommand *p = &queue->cmds[i];
-        if (p->argv_slice_mask != 0) {
-            for (int j = 0; j < p->argc; j++) {
-                if (p->argv_slice_mask & (1U << j)) {
-                    robj *old = p->argv[j];
-                    p->argv[j] = createStringObject(objectGetVal(old), sdslen(objectGetVal(old)));
-                }
-            }
-            p->argv_slice_mask = 0;
-        }
+        argvMaterialize(p->argv, p->argc, &p->argv_sliced_mask);
         if (p->argv == p->argv_inline) {
             robj **heap_argv = zmalloc(sizeof(robj *) * p->argv_len);
             memcpy(heap_argv, p->argv_inline, sizeof(robj *) * p->argc);
@@ -6949,9 +6918,7 @@ static void backupAndUpdateClientArgv(client *c, int new_argc, robj **new_argv) 
 
         for (int i = 0; i < old_argc && i < new_argc; i++) {
             c->argv[i] = old_argv[i];
-            if (!(c->argv_slice_mask & (1U << i))) {
-                incrRefCount(c->argv[i]);
-            }
+            if (!argIsInline(c->argv[i])) incrRefCount(c->argv[i]);
         }
 
         /* Initialize new argument slots to NULL */
@@ -6966,11 +6933,7 @@ static void backupAndUpdateClientArgv(client *c, int new_argc, robj **new_argv) 
     /* Clean up old argv if necessary */
     if (c->argv != old_argv && c->original_argv != old_argv) {
         for (int i = 0; i < old_argc; i++) {
-            if (old_argv[i]) {
-                if (!(c->argv_slice_mask & (1U << i))) {
-                    decrRefCount(old_argv[i]);
-                }
-            }
+            if (old_argv[i]) decrRefCount(old_argv[i]);
         }
         if (old_argv != c->argv_inline) zfree(old_argv);
     }
@@ -7023,7 +6986,7 @@ void rewriteClientCommandVector(client *c, int argc, ...) {
 
 /* Completely replace the client command vector with the provided one. */
 void replaceClientCommandVector(client *c, int argc, robj **argv) {
-    if (c->argv_slice_mask) clientPromoteArgv(c);
+    if (c->argv_sliced_mask) clientMaterializeArgv(c);
     backupAndUpdateClientArgv(c, argc, argv);
     c->argv_len_sum = 0;
     c->flag.buffered_reply = 0;
@@ -7060,13 +7023,8 @@ void rewriteClientCommandArgument(client *c, int i, robj *newval) {
         }
     }
     c->argv[i] = newval;
-    if (oldval) {
-        if (c->argv_slice_mask & (1U << i)) {
-            c->argv_slice_mask &= ~(1U << i);
-        } else {
-            decrRefCount(oldval);
-        }
-    }
+    if (oldval) decrRefCount(oldval);
+    if (i < ARGV_INLINE_MAX) c->argv_sliced_mask &= ~(1U << i);
 
     /* If this is the command name make sure to fix c->cmd. */
     if (i == 0) {
@@ -7575,11 +7533,11 @@ int processClientIOReadsDone(client *c) {
         parseResult res = handleParseResults(c);
         /* On parse error - stop here. */
         if (res == PARSE_ERR) {
-            if (c->argv_slice_mask) clientPromoteArgv(c);
+            if (c->argv_sliced_mask) clientMaterializeArgv(c);
             return needs_post_read_update;
         } else if (res == PARSE_NEEDMORE) {
             /* Keep partial-command slices: querybuf reallocations fix up
-             * slice pointers, so there is no need to promote here. */
+             * slice pointers, so there is no need to materialize here. */
             beforeNextClient(c);
             return needs_post_read_update;
         }

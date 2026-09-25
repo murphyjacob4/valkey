@@ -1375,9 +1375,32 @@ typedef struct parsedCommand {
     unsigned long long input_bytes;
     struct serverCommand *cmd;
     robj *argv_inline[ARGV_INLINE_MAX];
-    robj argv_slice[ARGV_INLINE_MAX];
-    uint32_t argv_slice_mask;
+    robj argv_inline_objs[ARGV_INLINE_MAX];
+    uint32_t argv_sliced_mask;
 } parsedCommand;
+
+/* Command arguments are parsed without allocating when possible:
+ *
+ *   - inline: the robj header is one of argv_inline_objs[], with a static
+ *     refcount (see argIsInline()). It can't be retained, only copied (see
+ *     clientRetainArg()), and decrRefCount() ignores it.
+ *   - sliced: the value is an sds written in place in the query buffer
+ *     (OBJ_ENCODING_SLICED). The buffer must not be trimmed past it or freed
+ *     while it is in use, and a reallocation must move its pointer.
+ *
+ * The parser creates arguments that are both. An inline header can be moved to
+ * the heap (clientDetachArgv()) so it can be retained, still sliced; retaining
+ * it copies the value (see incrRefCount()). clientMaterializeArgv() does both,
+ * for every argument.
+ *
+ * argv_sliced_mask has bit i set if argv[i] may be sliced. The encoding is the
+ * truth: an argument can be materialized in place without clearing its bit.
+ * Every inline argument has its bit set, so a zero mask means argv holds only
+ * owned heap objects. Only the first ARGV_INLINE_MAX arguments can be
+ * inline or sliced. */
+static inline bool argIsInline(const robj *o) {
+    return o->refcount == OBJ_STATIC_REFCOUNT;
+}
 
 /* Queue of parsed commands. */
 typedef struct {
@@ -1413,9 +1436,9 @@ typedef struct client {
     int argc;            /* Num of arguments of current command. */
     int argv_len;        /* Size of argv array (may be more than argc) */
     size_t argv_len_sum; /* Sum of lengths of objects in argv list. */
-    robj *argv_inline[ARGV_INLINE_MAX]; /* Inline argv pointer array to avoid zmalloc */
-    robj argv_slice[ARGV_INLINE_MAX];   /* borrowed robj headers, 16 B each */
-    uint32_t argv_slice_mask;           /* bit i: argv[i] is a slice, not owned */
+    robj *argv_inline[ARGV_INLINE_MAX];     /* Inline argv pointer array to avoid zmalloc */
+    robj argv_inline_objs[ARGV_INLINE_MAX]; /* Inline argument headers, see argIsInline() */
+    uint32_t argv_sliced_mask;              /* Bit i: argv[i] may be sliced, see argIsInline() */
     int reqtype;         /* Request protocol type: PROTO_REQ_* */
     int multibulklen;    /* Number of multi bulk arguments left to read. */
     long bulklen;        /* Length of bulk argument in multi bulk request. */
@@ -2874,7 +2897,7 @@ struct serverCommand {
      * lookup. 0 means disabled. Used by the prefetch system to find the lookup key. */
     int member_arg_index;
     /* Retained arguments hint: argv indices of arguments that are retained
-     * into the database (e.g. SET, MSET values). Slices at these indices are promoted
+     * into the database (e.g. SET, MSET values). Slices at these indices are copied
      * to owned heap robjs during command preparation, offloading allocation to IO threads.
      * retained_first: 0 if none.
      * retained_last: -1 for up to (argc - 1).
@@ -3202,9 +3225,8 @@ sds getAllClientsInfoString(int type, int hide_user_data);
 int clientSetName(client *c, robj *name, const char **err);
 bool clientCommandArgShouldBeRedacted(client *c, int arg_index);
 robj *clientRetainArg(client *c, int i);
-void clientPromoteArgv(client *c);
-void clientMaterializeArgvObjectOnly(client *c, int i);
-void clientMaterializeArgv(client *c, int i);
+void clientMaterializeArgv(client *c);
+void clientDetachArgv(client *c);
 void materializeSlice(robj *o);
 void rewriteClientCommandVector(client *c, int argc, ...);
 void rewriteClientCommandArgument(client *c, int i, robj *newval);

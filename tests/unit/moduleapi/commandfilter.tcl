@@ -26,6 +26,12 @@ start_server {tags {"modules"}} {
         r lrange mylist 0 -1
     } {elem1 --inserted-before-- @insertbefore elem2 @insertafter --inserted-after-- elem3}
 
+    test {Command Filter can insert into a command that fills the inline argv} {
+        r del mylist
+        r rpush mylist e1 e2 e3 e4 e5 e6 e7 e8 e9 @insertafter
+        r lrange mylist 0 -1
+    } {e1 e2 e3 e4 e5 e6 e7 e8 e9 @insertafter --inserted-after--}
+
     test {Command Filter can call RedisModule_CommandFilterArgReplace} {
         r del mylist
         r rpush mylist elem1 @replaceme elem2

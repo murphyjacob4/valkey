@@ -600,14 +600,14 @@ void subscribeCommand(client *c) {
         addReplyError(c, "SUBSCRIBE isn't allowed for a DENY BLOCKING client");
         return;
     }
-    clientPromoteArgv(c);
+    clientMaterializeArgv(c);
     for (j = 1; j < c->argc; j++) pubsubSubscribeChannel(c, c->argv[j], pubSubType);
     markClientAsPubSub(c);
 }
 
 /* UNSUBSCRIBE [channel ...] */
 void unsubscribeCommand(client *c) {
-    if (c->argv_slice_mask) clientPromoteArgv(c);
+    if (c->argv_sliced_mask) clientMaterializeArgv(c);
     if (!c->pubsub_data) initClientPubSubData(c);
 
     if (c->argc == 1) {
@@ -637,14 +637,14 @@ void psubscribeCommand(client *c) {
         return;
     }
 
-    clientPromoteArgv(c);
+    clientMaterializeArgv(c);
     for (j = 1; j < c->argc; j++) pubsubSubscribePattern(c, c->argv[j]);
     markClientAsPubSub(c);
 }
 
 /* PUNSUBSCRIBE [pattern [pattern ...]] */
 void punsubscribeCommand(client *c) {
-    if (c->argv_slice_mask) clientPromoteArgv(c);
+    if (c->argv_sliced_mask) clientMaterializeArgv(c);
     if (c->argc == 1) {
         pubsubUnsubscribeAllPatterns(c, 1);
     } else {
@@ -667,7 +667,7 @@ int pubsubPublishMessageAndPropagateToCluster(robj *channel, robj *message, int 
 
 /* PUBLISH <channel> <message> */
 void publishCommand(client *c) {
-    if (c->argv_slice_mask) clientPromoteArgv(c);
+    if (c->argv_sliced_mask) clientMaterializeArgv(c);
     if (server.sentinel_mode) {
         sentinelPublishCommand(c);
         return;
@@ -680,7 +680,7 @@ void publishCommand(client *c) {
 
 /* PUBSUB command for Pub/Sub introspection. */
 void pubsubCommand(client *c) {
-    if (c->argv_slice_mask) clientPromoteArgv(c);
+    if (c->argv_sliced_mask) clientMaterializeArgv(c);
     if (c->argc == 2 && !strcasecmp(objectGetVal(c->argv[1]), "help")) {
         const char *help[] = {
             "CHANNELS [<pattern>]",
@@ -764,7 +764,7 @@ void channelList(client *c, sds pat, kvstore *pubsub_channels) {
 
 /* SPUBLISH <shardchannel> <message> */
 void spublishCommand(client *c) {
-    if (c->argv_slice_mask) clientPromoteArgv(c);
+    if (c->argv_sliced_mask) clientMaterializeArgv(c);
     int receivers = pubsubPublishMessageAndPropagateToCluster(c->argv[1], c->argv[2], 1);
     if (!server.cluster_enabled) forceCommandPropagation(c, PROPAGATE_REPL);
     addReplyLongLong(c, receivers);
@@ -779,7 +779,7 @@ void ssubscribeCommand(client *c) {
         return;
     }
 
-    clientPromoteArgv(c);
+    clientMaterializeArgv(c);
     for (int j = 1; j < c->argc; j++) {
         pubsubSubscribeChannel(c, c->argv[j], pubSubShardType);
     }
@@ -788,7 +788,7 @@ void ssubscribeCommand(client *c) {
 
 /* SUNSUBSCRIBE [shardchannel [shardchannel ...]] */
 void sunsubscribeCommand(client *c) {
-    if (c->argv_slice_mask) clientPromoteArgv(c);
+    if (c->argv_sliced_mask) clientMaterializeArgv(c);
     if (!c->pubsub_data) initClientPubSubData(c);
 
     if (c->argc == 1) {

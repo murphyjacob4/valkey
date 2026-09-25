@@ -505,9 +505,9 @@ void migrateCommand(client *c) {
     int oi = 0;
 
     /* Without COPY, the key objects are retained in the DEL argv we propagate,
-     * so promote any sliced arguments now, before kv[] captures pointers into
-     * c->argv (promotion replaces the argv entries). */
-    if (!copy && c->argv_slice_mask) clientPromoteArgv(c);
+     * so materialize any sliced arguments now, before kv[] captures pointers into
+     * c->argv (materialization replaces the argv entries). */
+    if (!copy && c->argv_sliced_mask) clientMaterializeArgv(c);
 
     for (j = 0; j < num_keys; j++) {
         if ((ov[oi] = lookupKeyRead(c->db, c->argv[first_key + j])) != NULL) {

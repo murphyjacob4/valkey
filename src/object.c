@@ -493,6 +493,8 @@ void objectUnembedVal(robj *o) {
 /* Materialize the sliced SDS string pointed to by robj o into an owned heap SDS. */
 void materializeSlice(robj *o) {
     if (objectGetEncoding(o) == OBJ_ENCODING_SLICED) {
+        /* An inline header would leak the copy, see argIsInline(). */
+        serverAssert(!argIsInline(o));
         o->val_ptr = sdsdup((sds)o->val_ptr);
         objectSetEncoding(o, OBJ_ENCODING_RAW);
     }

@@ -2072,18 +2072,6 @@ void streamRewriteStripLimit(client *c, int limit_idx) {
     c->argv_len_sum -= getStringObjectLen(limit_tok);
     c->argv_len_sum -= getStringObjectLen(limit_val);
 
-    if (c->argv_slice_mask) {
-        if (!(c->argv_slice_mask & (1U << limit_idx))) {
-            decrRefCount(limit_tok);
-        }
-        if (!(c->argv_slice_mask & (1U << (limit_idx + 1)))) {
-            decrRefCount(limit_val);
-        }
-    } else {
-        decrRefCount(limit_tok);
-        decrRefCount(limit_val);
-    }
-
     /* Intentionally shrink the argv vector by dropping the two "LIMIT <count>" slots,
      * shifting the tail (everything after them) two slots left. */
     int tail = c->argc - (limit_idx + 2);
@@ -2093,15 +2081,18 @@ void streamRewriteStripLimit(client *c, int limit_idx) {
                 sizeof(robj *) * tail);
     }
 
-    if (c->argv_slice_mask) {
-        uint32_t low_mask = c->argv_slice_mask & ((1U << limit_idx) - 1);
-        uint32_t high_mask = (c->argv_slice_mask >> (limit_idx + 2)) << limit_idx;
-        c->argv_slice_mask = low_mask | high_mask;
+    if (c->argv_sliced_mask) {
+        uint32_t low_mask = c->argv_sliced_mask & ((1U << limit_idx) - 1);
+        uint32_t high_mask = (c->argv_sliced_mask >> (limit_idx + 2)) << limit_idx;
+        c->argv_sliced_mask = low_mask | high_mask;
     }
 
     c->argc -= 2;
     c->argv[c->argc] = NULL;
     c->argv[c->argc + 1] = NULL;
+
+    decrRefCount(limit_tok);
+    decrRefCount(limit_val);
 }
 
 /* XADD key [(MAXLEN [~|=] <count> | MINID [~|=] <id>) [LIMIT <entries>]] [NOMKSTREAM] <ID or *> [field value] [field

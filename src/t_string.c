@@ -150,11 +150,11 @@ void setGenericCommand(client *c,
     setkey_flags |= found ? SETKEY_ALREADY_EXIST : SETKEY_DOESNT_EXIST;
 
     int val_idx = (flags & ARGS_ARGV3) ? 3 : 2;
-    int is_sliced = (c->argv_slice_mask & (1U << val_idx)) != 0;
-    if (is_sliced || c->flag.argv_borrowed) {
+    int is_inline = argIsInline(c->argv[val_idx]);
+    if (is_inline || c->flag.argv_borrowed) {
         val = clientRetainArg(c, val_idx);
     }
-    if (is_sliced) {
+    if (is_inline) {
         val = tryObjectEncoding(val);
     }
     setKey(c, c->db, key, &val, setkey_flags);
@@ -165,10 +165,10 @@ void setGenericCommand(client *c,
      * When the client does not own the argv array (VM_CallArgv borrowed it),
      * we must go through rewriteClientCommandArgument to get a new owned copy
      * instead of assigning directly into the borrowed array.
-     * When val was sliced, clientRetainArg materialized an owned copy for setKey,
-     * leaving c->argv[val_idx] as an untouched slice header. */
-    if (is_sliced) {
-        /* No-op: argv retains slice header; db owns materialized object. */
+     * When val was inline, clientRetainArg copied it for setKey, leaving
+     * c->argv[val_idx] untouched. */
+    if (is_inline) {
+        /* The db owns the copy. */
     } else if (c->flag.argv_borrowed) {
         rewriteClientCommandArgument(c, val_idx, val);
     } else {
@@ -205,7 +205,7 @@ void setGenericCommand(client *c,
     /* Propagate without the GET argument (Isn't needed if we had expire since in that case we completely re-written the
      * command argv) */
     if ((flags & ARGS_SET_GET) && !expire) {
-        clientPromoteArgv(c);
+        clientMaterializeArgv(c);
         int argc = 0;
         int j;
         robj **argv = zmalloc((c->argc - 1) * sizeof(robj *));
@@ -277,24 +277,24 @@ void setCommand(client *c) {
         return;
     }
 
-    if (!c->flag.argv_borrowed && !(c->argv_slice_mask & (1U << 2))) {
+    if (!c->flag.argv_borrowed) {
         c->argv[2] = tryObjectEncoding(c->argv[2]);
     }
     setGenericCommand(c, flags, c->argv[1], c->argv[2], expire, unit, NULL, NULL, comparison);
 }
 
 void setnxCommand(client *c) {
-    if (!c->flag.argv_borrowed && !(c->argv_slice_mask & (1U << 2))) c->argv[2] = tryObjectEncoding(c->argv[2]);
+    if (!c->flag.argv_borrowed) c->argv[2] = tryObjectEncoding(c->argv[2]);
     setGenericCommand(c, ARGS_SET_NX, c->argv[1], c->argv[2], NULL, 0, shared.cone, shared.czero, NULL);
 }
 
 void setexCommand(client *c) {
-    if (!c->flag.argv_borrowed && !(c->argv_slice_mask & (1U << 3))) c->argv[3] = tryObjectEncoding(c->argv[3]);
+    if (!c->flag.argv_borrowed) c->argv[3] = tryObjectEncoding(c->argv[3]);
     setGenericCommand(c, ARGS_EX | ARGS_ARGV3, c->argv[1], c->argv[3], c->argv[2], UNIT_SECONDS, NULL, NULL, NULL);
 }
 
 void psetexCommand(client *c) {
-    if (!c->flag.argv_borrowed && !(c->argv_slice_mask & (1U << 3))) c->argv[3] = tryObjectEncoding(c->argv[3]);
+    if (!c->flag.argv_borrowed) c->argv[3] = tryObjectEncoding(c->argv[3]);
     setGenericCommand(c, ARGS_PX | ARGS_ARGV3, c->argv[1], c->argv[3], c->argv[2], UNIT_MILLISECONDS, NULL, NULL, NULL);
 }
 
@@ -454,8 +454,8 @@ void getsetCommand(client *c) {
     initDeferredReplyBuffer(c);
     if (getGenericCommand(c) == C_ERR) return;
     robj *val = c->argv[2];
-    int is_sliced = (c->argv_slice_mask & (1U << 2)) != 0;
-    if (is_sliced) {
+    int is_inline = argIsInline(c->argv[2]);
+    if (is_inline) {
         val = clientRetainArg(c, 2);
         val = tryObjectEncoding(val);
         setKey(c, c->db, c->argv[1], &val, 0);
@@ -617,8 +617,8 @@ void msetGenericCommand(client *c, int nx) {
     int setkey_flags = nx ? SETKEY_DOESNT_EXIST : 0;
     for (j = 1; j < c->argc; j += 2) {
         robj *val = c->argv[j + 1];
-        int is_sliced = (c->argv_slice_mask & (1U << (j + 1))) != 0;
-        if (is_sliced) {
+        int is_inline = argIsInline(c->argv[j + 1]);
+        if (is_inline) {
             val = clientRetainArg(c, j + 1);
             val = tryObjectEncoding(val);
             setKey(c, c->db, c->argv[j], &val, setkey_flags);
@@ -717,8 +717,8 @@ void msetexCommand(client *c) {
     for (int j = 2; j < 2 + numkeys * 2; j += 2) {
         robj *key = c->argv[j];
         robj *val = c->argv[j + 1];
-        int is_sliced = (c->argv_slice_mask & (1U << (j + 1))) != 0;
-        if (is_sliced) {
+        int is_inline = argIsInline(c->argv[j + 1]);
+        if (is_inline) {
             val = clientRetainArg(c, j + 1);
             val = tryObjectEncoding(val);
             setKey(c, c->db, key, &val, setkey_flags);
@@ -1022,8 +1022,8 @@ void appendCommand(client *c) {
     if (o == NULL) {
         /* Create the key */
         robj *val = c->argv[2];
-        int is_sliced = (c->argv_slice_mask & (1U << 2)) != 0;
-        if (is_sliced) {
+        int is_inline = argIsInline(c->argv[2]);
+        if (is_inline) {
             val = clientRetainArg(c, 2);
             val = tryObjectEncoding(val);
             dbAdd(c->db, c->argv[1], &val);
