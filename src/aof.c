@@ -1400,6 +1400,7 @@ try_fsync:
 sds catAppendOnlyGenericCommand(sds dst, int argc, robj **argv) {
     char buf[32];
     int len, j;
+    robj *o;
 
     buf[0] = '*';
     len = 1 + ll2string(buf + 1, sizeof(buf) - 1, argc);
@@ -1408,27 +1409,15 @@ sds catAppendOnlyGenericCommand(sds dst, int argc, robj **argv) {
     dst = sdscatlen(dst, buf, len);
 
     for (j = 0; j < argc; j++) {
-        robj *o = argv[j];
-        if (o->encoding == OBJ_ENCODING_INT) {
-            char aux[32];
-            size_t dlen = ll2string(aux, sizeof(aux), (long)objectGetVal(o));
-            buf[0] = '$';
-            len = 1 + ll2string(buf + 1, sizeof(buf) - 1, dlen);
-            buf[len++] = '\r';
-            buf[len++] = '\n';
-            dst = sdscatlen(dst, buf, len);
-            dst = sdscatlen(dst, aux, dlen);
-            dst = sdscatlen(dst, "\r\n", 2);
-        } else {
-            size_t objlen = sdslen(objectGetVal(o));
-            buf[0] = '$';
-            len = 1 + ll2string(buf + 1, sizeof(buf) - 1, objlen);
-            buf[len++] = '\r';
-            buf[len++] = '\n';
-            dst = sdscatlen(dst, buf, len);
-            dst = sdscatlen(dst, objectGetVal(o), objlen);
-            dst = sdscatlen(dst, "\r\n", 2);
-        }
+        o = getDecodedObject(argv[j]);
+        buf[0] = '$';
+        len = 1 + ll2string(buf + 1, sizeof(buf) - 1, sdslen(objectGetVal(o)));
+        buf[len++] = '\r';
+        buf[len++] = '\n';
+        dst = sdscatlen(dst, buf, len);
+        dst = sdscatlen(dst, objectGetVal(o), sdslen(objectGetVal(o)));
+        dst = sdscatlen(dst, "\r\n", 2);
+        decrRefCount(o);
     }
     return dst;
 }
