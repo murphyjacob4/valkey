@@ -98,4 +98,35 @@ start_server {tags {"querybuf slow"}} {
         $rd close
     }
 
+    test "pipelined many-argument command split across reads" {
+        proc resp {args} {
+            set s "*[llength $args]\r\n"
+            foreach a $args { append s "\$[string length $a]\r\n$a\r\n" }
+            return $s
+        }
+        set keys {}
+        set vals {}
+        for {set i 1} {$i <= 20} {incr i} {
+            r set k$i v$i
+            lappend keys k$i
+            lappend vals v$i
+        }
+        set mget [resp mget {*}$keys]
+        set rd [valkey_deferring_client]
+
+        # The second MGET is cut after a few arguments, leaving it partially
+        # parsed in the command queue with more than ARGV_INLINE_MAX arguments.
+        $rd write "$mget[string range $mget 0 40]"
+        $rd flush
+        assert_equal $vals [$rd read]
+
+        # Finishing it and pipelining more commands reuses the command queue.
+        $rd write "[string range $mget 41 end][resp echo foo][resp ping]"
+        $rd flush
+        assert_equal $vals [$rd read]
+        assert_equal foo [$rd read]
+        assert_equal PONG [$rd read]
+        $rd close
+    }
+
 }

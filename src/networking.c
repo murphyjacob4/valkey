@@ -4795,20 +4795,24 @@ static bool consumeCommandQueue(client *c) {
     c->slot = p->slot;
     c->qb_applied += p->input_bytes;
 
+    robj **queued_argv = p->argv;
     if (p->argv == p->argv_inline) {
         c->argv = c->argv_inline;
         c->argv_len = ARGV_INLINE_MAX;
-        for (int j = 0; j < p->argc; j++) {
-            if (p->argv_slice_mask & (1U << j)) {
-                c->argv_slice[j] = p->argv_slice[j];
-                c->argv_inline[j] = &c->argv_slice[j];
-            } else {
-                c->argv_inline[j] = p->argv_inline[j];
-            }
-        }
     } else {
         c->argv = p->argv;
         c->argv_len = p->argv_len;
+    }
+    /* The slice headers live in the queue entry, which is reused once the queue
+     * drains, so move them into the client. Only the first ARGV_INLINE_MAX args
+     * can be sliced or inline; a heap argv already holds the rest. */
+    for (int j = 0; j < min(p->argc, ARGV_INLINE_MAX); j++) {
+        if (p->argv_slice_mask & (1U << j)) {
+            c->argv_slice[j] = p->argv_slice[j];
+            c->argv[j] = &c->argv_slice[j];
+        } else {
+            c->argv[j] = queued_argv[j];
+        }
     }
 
     c->argv_slice_mask = p->argv_slice_mask;
