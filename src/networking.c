@@ -4315,6 +4315,24 @@ void clientStashBulkCutover(client *c) {
     c->bulk_cutover_offset = 0;
 }
 
+/* Parses a RESP multibulk or bulk length. Short, plain lengths (the common
+ * case) are parsed with scalar code: string2ll()'s vector load reads the bytes
+ * just before the digits, where the parser has just written the previous
+ * argument's slice header and terminator, and a masked load can't be
+ * store-forwarded, so it stalls until those stores retire. Anything else
+ * (sign, leading zero, long or invalid input) goes to string2ll(). */
+static inline int parseRespLength(const char *s, size_t len, long long *value) {
+    if (len == 0 || len > 9 || (s[0] == '0' && len > 1)) return string2ll(s, len, value);
+    long long v = 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned int digit = (unsigned char)s[i] - '0';
+        if (digit > 9) return string2ll(s, len, value);
+        v = v * 10 + digit;
+    }
+    *value = v;
+    return 1;
+}
+
 /* Incremental parsing of a command in the client's query buffer.
  *
  * Parser state related to the input buffer are per client and stored in the
@@ -4369,7 +4387,7 @@ static int parseMultibulk(client *c,
          * so go ahead and find out the multi bulk length. */
         serverAssertWithInfo(c, NULL, c->querybuf[c->qb_pos] == '*');
         size_t multibulklen_slen = newline - (c->querybuf + 1 + c->qb_pos);
-        ok = string2ll(c->querybuf + 1 + c->qb_pos, multibulklen_slen, &ll);
+        ok = parseRespLength(c->querybuf + 1 + c->qb_pos, multibulklen_slen, &ll);
         if (!ok || ll > INT_MAX) {
             return READ_FLAGS_ERROR_INVALID_MULTIBULK_LEN;
         } else if (ll > 10 && auth_required) {
@@ -4455,7 +4473,7 @@ static int parseMultibulk(client *c,
             }
 
             size_t bulklen_slen = newline - (c->querybuf + c->qb_pos + 1);
-            ok = string2ll(c->querybuf + c->qb_pos + 1, bulklen_slen, &ll);
+            ok = parseRespLength(c->querybuf + c->qb_pos + 1, bulklen_slen, &ll);
             if (!ok || ll < 0 || (!(is_replicated) && ll > server.proto_max_bulk_len)) {
                 return READ_FLAGS_ERROR_MBULK_INVALID_BULK_LEN;
             } else if (ll > 16384 && auth_required) {
