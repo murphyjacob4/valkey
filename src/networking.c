@@ -5074,6 +5074,15 @@ static bool readToQueryBuf(client *c) {
             return false;
         }
         c->bulk_cutover_offset += c->nread;
+        /* Bytes received for the big argument count towards the query buffer
+         * limit, exactly as they would if they were accumulating in the query
+         * buffer itself. */
+        size_t qb_memory = (c->querybuf ? sdslen(c->querybuf) : 0) + c->bulk_cutover_offset +
+                           (c->mstate ? c->mstate->argv_len_sums : 0);
+        if (qb_memory > server.client_max_querybuf_len ||
+            (qb_memory > 1024 * 1024 && (c->read_flags & READ_FLAGS_AUTH_REQUIRED))) {
+            c->read_flags |= READ_FLAGS_QB_LIMIT_REACHED;
+        }
         return (size_t)c->nread == to_read;
     }
 
