@@ -638,6 +638,7 @@ ENGINE_SERVER_OBJ = \
     throttle_token_bucket.o \
     stat_calc.o \
     throttle_repl.o \
+    repl_backlog_tier.o \
     throttle.o
 ENGINE_SERVER_OBJ+=$(ENGINE_TRACE_OBJ)
 ENGINE_CLI_NAME=$(ENGINE_NAME)-cli$(PROG_SUFFIX)

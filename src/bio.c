@@ -72,6 +72,7 @@
 #include "bio.h"
 #include "mutexqueue.h"
 #include "tls.h"
+#include "repl_backlog_tier.h"
 #include <stdatomic.h>
 
 static unsigned int bio_job_to_worker[] = {
@@ -82,6 +83,7 @@ static unsigned int bio_job_to_worker[] = {
     [BIO_RDB_SAVE] = 3,
     [BIO_TLS_RELOAD] = 4, /* only used when BUILD_TLS=yes */
     [BIO_CLUSTER_SAVE] = 5,
+    [BIO_REPL_TIER_WRITE] = 6,
 };
 
 typedef struct {
@@ -97,6 +99,7 @@ static bio_worker_data bio_workers[] = {
     {"bio_rdb_save"},
     {"bio_tls_reload"}, /* only used when BUILD_TLS=yes */
     {"bio_cluster_config_save"},
+    {"bio_repl_tier"},
 };
 static const bio_worker_data *const bio_worker_end = bio_workers + (sizeof bio_workers / sizeof *bio_workers);
 
@@ -150,6 +153,11 @@ typedef union bio_job {
         sds content;   /* Cluster config file content. */
         bool do_fsync; /* A flag to indicate that a fsync is required. */
     } cluster_save_args;
+
+    struct {
+        int type;
+        void *job; /* Batch to write, owned by repl_backlog_tier.c. */
+    } repl_tier_args;
 } bio_job;
 
 void *bioProcessBackgroundJobs(void *arg);
@@ -256,6 +264,12 @@ void bioCreateClusterConfigSaveJob(sds content, bool do_fsync) {
     bioSubmitJob(BIO_CLUSTER_SAVE, job);
 }
 
+void bioCreateReplTierWriteJob(void *tier_job) {
+    bio_job *job = allocBioJob(0);
+    job->repl_tier_args.job = tier_job;
+    bioSubmitJob(BIO_REPL_TIER_WRITE, job);
+}
+
 #define CONFIG_SAVE_LOG_ERROR_RATE 30 /* Seconds between errors logging. */
 void *bioProcessBackgroundJobs(void *arg) {
     bio_worker_data *const bwd = arg;
@@ -342,6 +356,10 @@ void *bioProcessBackgroundJobs(void *arg) {
                 atomic_store_explicit(&server.cluster_config_last_save_time, time(NULL), memory_order_relaxed);
                 last_save_error_log = 0;
             }
+        } else if (job_type == BIO_REPL_TIER_WRITE) {
+            /* The main thread polls bioPendingJobsOfType() to learn when the
+             * batch is done, so the counter decrement below publishes it. */
+            replTier_bioProcessWrite(job->repl_tier_args.job);
         } else {
             serverPanic("Wrong job type in bioProcessBackgroundJobs().");
         }

@@ -44,6 +44,7 @@
 #include "cluster_migrateslots.h"
 #include "io_threads.h"
 #include "rdb_transcoder.h"
+#include "repl_backlog_tier.h"
 
 #include <memory.h>
 #include <stddef.h>
@@ -399,6 +400,9 @@ void freeReplicationBacklog(void) {
     serverAssert(listLength(server.replicas) == 0);
     if (server.repl_backlog == NULL) return;
 
+    /* The disk tier extends the backlog, so it goes away with it. */
+    replTier_reset("replication backlog freed");
+
     /* Decrease the start buffer node reference count. */
     if (server.repl_backlog->ref_repl_buf_node) {
         replBufBlock *o = listNodeValue(server.repl_backlog->ref_repl_buf_node);
@@ -431,6 +435,9 @@ void createReplicationBacklogIndex(listNode *ln) {
 /* Rebase replication buffer blocks' offset since the initial
  * setting offset starts from 0 when primary restart. */
 void rebaseReplicationBuffer(long long base_repl_offset) {
+    /* The disk tier is addressed by replication offset, which is changing. */
+    replTier_reset("replication buffer rebased");
+
     raxFree(server.repl_backlog->blocks_index);
     server.repl_backlog->blocks_index = raxNew();
     server.repl_backlog->unindexed_count = 0;
@@ -627,11 +634,20 @@ void incrementalTrimReplicationBacklog(size_t max_blocks) {
         listNode *first = listFirst(server.repl_buffer_blocks);
         serverAssert(first == server.repl_backlog->ref_repl_buf_node);
         replBufBlock *fo = listNodeValue(first);
-        if (fo->refcount != 1) break;
-
         /* We don't try trim backlog if backlog valid size will be lessen than
          * setting backlog size once we release the first repl buffer block. */
         if (server.repl_backlog->histlen - (long long)fo->size <= server.repl_backlog_size) break;
+
+        /* With backlog tiering, replicas still reading this block are moved
+         * to the disk tier once the block is safely on disk, so a lagging
+         * replica never pins memory beyond the backlog. While the tier is
+         * active, it also holds a reference on the first block that is not on
+         * disk yet, so nothing leaves memory before it is on disk. A replica
+         * that disconnected recently may also need the block, in which case
+         * the tier is started for it. */
+        if (fo->refcount == 1 && replTier_retainBlock(first)) break;
+        if (fo->refcount != 1 && !replTier_unpinBlock(first)) break;
+        if (fo->refcount != 1) break;
 
         /* Decr refcount and release the first block later. */
         fo->refcount--;
@@ -668,6 +684,7 @@ void freeReplicaReferencedReplBuffer(client *replica) {
                                  replicationGetReplicaName(replica), (long long unsigned int)replica->id);
         }
     }
+    replTier_replicaFreed(replica);
     if (replica->repl_data->ref_repl_buf_node != NULL) {
         /* Decrease the start buffer node reference count. */
         replBufBlock *o = listNodeValue(replica->repl_data->ref_repl_buf_node);
@@ -757,6 +774,9 @@ void feedReplicationBuffer(char *s, size_t len) {
         while ((ln = listNext(&li))) {
             client *replica = ln->value;
             if (!canFeedReplicaReplBuffer(replica) && !(replica->flag.protected_rdb_channel)) continue;
+            /* Replicas fed from the disk tier don't reference the in-memory
+             * buffer until they catch up, see repl_backlog_tier.h. */
+            if (replica->repl_data->repl_tier_reader) continue;
             /* Update shared replication buffer start position. */
             if (replica->repl_data->ref_repl_buf_node == NULL) {
                 replica->repl_data->ref_repl_buf_node = start_node;
@@ -1010,6 +1030,13 @@ long long addReplyReplicationBacklog(client *c, long long offset) {
 
     serverLog(LL_DEBUG, "[PSYNC] Replica request offset: %lld", offset);
 
+    /* The offset was already trimmed from the in-memory backlog but is still
+     * in the disk tier (primaryTryPartialResynchronization checked this). */
+    if (offset < server.repl_backlog->offset && replTier_canServePsync(offset)) {
+        serverLog(LL_DEBUG, "[PSYNC] Serving from the replication backlog disk tier");
+        return replTier_attachPsyncReader(c, offset);
+    }
+
     if (server.repl_backlog->histlen == 0) {
         serverLog(LL_DEBUG, "[PSYNC] Backlog history len is zero");
         return 0;
@@ -1156,9 +1183,18 @@ int primaryTryPartialResynchronization(client *c, long long psync_offset) {
         goto need_full_resync;
     }
 
+    /* Offsets already trimmed from the in-memory backlog may still be served
+     * from the replication backlog disk tier. The tier is sent raw (via
+     * sendfile), so it isn't used for compressed links, and dual-channel
+     * replicas keep their data pinned in memory anyway. */
+    int psync_from_tier = server.repl_backlog && psync_offset < server.repl_backlog->offset &&
+                          replTier_canServePsync(psync_offset) &&
+                          replicaNegotiatedCompressionAlgorithm(c->repl_data->replica_capa) == ALGO_NONE &&
+                          c->repl_data->associated_rdb_client_id == 0;
+
     /* We still have the data our replica is asking for? */
-    if (!server.repl_backlog || psync_offset < server.repl_backlog->offset ||
-        psync_offset > (server.repl_backlog->offset + server.repl_backlog->histlen)) {
+    if (!psync_from_tier && (!server.repl_backlog || psync_offset < server.repl_backlog->offset ||
+                             psync_offset > (server.repl_backlog->offset + server.repl_backlog->histlen))) {
         if (!server.repl_backlog) {
             serverLog(LL_NOTICE,
                       "Unable to partial resync with replica %s for lack of backlog (Replica request was: %s:%lld).",
@@ -1469,6 +1505,7 @@ void syncCommand(client *c) {
 
         if (primaryTryPartialResynchronization(c, psync_offset) == C_OK) {
             server.stat_sync_partial_ok++;
+            replTier_psyncAccepted(psync_offset);
             return; /* No full resync needed, return. */
         } else {
             char *primary_replid = objectGetVal(c->argv[1]);
@@ -5972,11 +6009,12 @@ void replicationCron(void) {
     /* Sanity check replication buffer, the first block of replication buffer blocks
      * must be referenced by someone, since it will be freed when not referenced,
      * otherwise, server will OOM. also, its refcount must not be more than
-     * replicas number + 1(replication backlog). */
+     * replicas number + 1(replication backlog) + 1(backlog tier, if active). */
     if (listLength(server.repl_buffer_blocks) > 0) {
         replBufBlock *o = listNodeValue(listFirst(server.repl_buffer_blocks));
         serverAssert(o->refcount > 0 &&
-                     o->refcount <= (int)listLength(server.replicas) + 1 + (int)raxSize(server.replicas_waiting_psync));
+                     o->refcount <= (int)listLength(server.replicas) + 1 + (int)raxSize(server.replicas_waiting_psync) +
+                                        (replTier_isActive() ? 1 : 0));
     }
 
     /* Refresh the number of replicas with lag <= min-replicas-max-lag. */

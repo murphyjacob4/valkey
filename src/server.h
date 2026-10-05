@@ -1346,6 +1346,12 @@ typedef struct ClientReplicationData {
                                            see the definition of replBufBlock. */
     size_t ref_block_pos;                /* Access position of referenced buffer block,
                                            i.e. the next offset to send. */
+    int repl_tier_reader;                /* If true, the replica is fed from the replication
+                                            backlog disk tier and ref_repl_buf_node is NULL.
+                                            See repl_backlog_tier.h. */
+    long long repl_tier_offset;          /* Next repl offset to send from the disk tier. */
+    int repl_tier_evicted;               /* Disconnected for repl-backlog-tiering-max-size:
+                                            leaves no PSYNC hold on the tier. */
     sds replica_nodeid;                  /* Node id in cluster mode. */
 
     replicaCompressionState *repl_compression; /* Primary-side compression state for this link, or NULL for plaintext. */

@@ -715,6 +715,9 @@ int trySendWriteToIOThreads(client *c) {
     if (!clientHasPendingReplies(c)) return C_ERR;
     /* For simplicity, avoid offloading non-online replicas */
     if (getClientType(c) == CLIENT_TYPE_REPLICA && c->repl_data->repl_state != REPLICA_STATE_ONLINE) return C_ERR;
+    /* Replicas fed from the replication backlog disk tier are written with
+     * sendfile() from the main thread, which owns the tier state. */
+    if (getClientType(c) == CLIENT_TYPE_REPLICA && c->repl_data->repl_tier_reader) return C_ERR;
     /* We can't offload debugged clients as the main-thread may read at the same time  */
     if (c->flag.lua_debug) return C_ERR;
     /* Avoid offloading writes to IO thread for the slot migration export job while snapshotting.

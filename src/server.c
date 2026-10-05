@@ -56,6 +56,7 @@
 #include "scripting_engine.h"
 #include "throttle.h"
 #include "throttle_repl.h"
+#include "repl_backlog_tier.h"
 #include "util.h"
 #include "forkless.h"
 
@@ -1770,6 +1771,8 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
 
     run_with_period(100) throttleRepl_adjustThrottling();
 
+    run_with_period(1000) replTier_cron();
+
     /* Run the Cluster cron. */
     if (server.cluster_enabled) {
         run_with_period(CLUSTER_CRON_PERIOD_MS) clusterCron();
@@ -2065,6 +2068,10 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
          * wake them up ASAP. */
         if (listLength(server.clients_waiting_acks) && prev_fsynced_reploff != server.fsynced_reploff) dont_sleep = 1;
     }
+
+    /* Spill batched replication data to the backlog disk tier, if any, so
+     * that replicas fed from disk can make progress below. */
+    replTier_beforeSleep();
 
     /* Handle writes with pending output buffers. */
     int client_writes = handleClientsWithPendingWrites();
@@ -7035,6 +7042,9 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                                         replica->repl_data->repl_compression->compressed_bytes,
                                         replica->repl_data->repl_compression->uncompressed_bytes);
                 }
+                if (replica->repl_data->repl_tier_reader) {
+                    info = sdscatprintf(info, ",backlog_tier_offset=%lld", replica->repl_data->repl_tier_offset);
+                }
                 info = sdscat(info, "\r\n");
                 replica_id++;
             }
@@ -7052,6 +7062,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "repl_backlog_size:%lld\r\n", server.repl_backlog_size,
                 "repl_backlog_first_byte_offset:%lld\r\n", server.repl_backlog ? server.repl_backlog->offset : 0,
                 "repl_backlog_histlen:%lld\r\n", server.repl_backlog ? server.repl_backlog->histlen : 0));
+        info = replTier_sdscatInfo(info);
     }
 
     /* CPU */

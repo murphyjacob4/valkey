@@ -40,6 +40,7 @@
 #include "compression_stream.h"
 #include "throttle.h"
 #include "throttle_repl.h"
+#include "repl_backlog_tier.h"
 #include "stat_calc.h"
 #include "module.h"
 #include "connection.h"
@@ -1804,6 +1805,8 @@ void deferredAfterErrorReply(client *c, list *errors) {
  * Basically increase referenced buffer block node reference count. */
 void copyReplicaOutputBuffer(client *dst, client *src) {
     serverAssert(src->bufpos == 0 && listLength(src->reply) == 0);
+    /* Only online replicas can be fed from the backlog disk tier. */
+    serverAssert(!src->repl_data->repl_tier_reader);
 
     if (src->repl_data->ref_repl_buf_node == NULL) return;
     dst->repl_data->ref_repl_buf_node = src->repl_data->ref_repl_buf_node;
@@ -1826,6 +1829,9 @@ int clientHasPendingReplies(client *c) {
             c->repl_data->repl_compression->out_buf_pos < sdslen(c->repl_data->repl_compression->out_buf)) {
             return 1;
         }
+
+        /* Replicas fed from the disk tier don't reference the shared buffer. */
+        if (c->repl_data->repl_tier_reader) return replTier_hasPendingData(c);
 
         if (c->repl_data->ref_repl_buf_node == NULL) return 0;
 
@@ -2710,6 +2716,11 @@ static void postWriteToReplica(client *c) {
 
     server.stat_net_repl_output_bytes += c->nwritten;
 
+    if (c->repl_data->repl_tier_reader) {
+        replTier_postWriteToReplica(c);
+        return;
+    }
+
     if (compression) {
         /* An IO thread may send the batch but cannot update replication block
          * refcounts while the main thread appends and trims them. Advance the
@@ -2882,6 +2893,14 @@ static void writeToReplicaCompressed(client *c) {
 
 static void writeToReplica(client *c) {
     serverAssert(c->bufpos == 0 && listLength(c->reply) == 0);
+
+    /* Replicas that fell behind may be fed from the replication backlog disk
+     * tier. Tier readers are never offloaded to IO threads. Once everything on
+     * disk was sent, they resume from the in-memory buffer below. */
+    if (c->repl_data->repl_tier_reader && !replTier_maybePromoteReader(c)) {
+        replTier_writeToReplica(c);
+        return;
+    }
 
     /* Compressed replicas use the framed write path; the decision lives here so
      * callers do not branch on the per-replica compression state. */

@@ -40,6 +40,7 @@
 #include "eval.h"
 #include "lrulfu.h"
 #include "throttle_repl.h"
+#include "repl_backlog_tier.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -3460,6 +3461,7 @@ standardConfig static_configs[] = {
     createBoolConfig("repl-diskless-sync", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, server.repl_diskless_sync, 1, NULL, NULL),
     createBoolConfig("dual-channel-replication-enabled", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, server.dual_channel_replication, 0, NULL, NULL),
     createBoolConfig("repl-throttling-enabled", NULL, MODIFIABLE_CONFIG, throttleRepl_config.repl_throttling_enabled, 0, NULL, NULL),
+    createBoolConfig("repl-backlog-tiering-enabled", NULL, MODIFIABLE_CONFIG, replTier_config.enabled, 0, NULL, NULL),
     createBoolConfig("aof-rewrite-incremental-fsync", NULL, MODIFIABLE_CONFIG, server.aof_rewrite_incremental_fsync, 1, NULL, NULL),
     createBoolConfig("no-appendfsync-on-rewrite", NULL, MODIFIABLE_CONFIG, server.aof_no_fsync_on_rewrite, 0, NULL, NULL),
     createBoolConfig("cluster-require-full-coverage", NULL, MODIFIABLE_CONFIG, server.cluster_require_full_coverage, 1, NULL, updateClusterState),
@@ -3653,6 +3655,8 @@ standardConfig static_configs[] = {
     /* Unsigned Long Long configs */
     createULongLongConfig("maxmemory", NULL, MODIFIABLE_CONFIG, 0, ULLONG_MAX, server.maxmemory, 0, MEMORY_CONFIG, NULL, updateMaxmemory),
     createULongLongConfig("cluster-link-sendbuf-limit", NULL, MODIFIABLE_CONFIG, 0, ULLONG_MAX, server.cluster_link_msg_queue_limit_bytes, 0, MEMORY_CONFIG, NULL, NULL),
+    createULongLongConfig("repl-backlog-tiering-batch-size", NULL, MODIFIABLE_CONFIG, 16 * 1024, LLONG_MAX, replTier_config.batch_size, 1024 * 1024, MEMORY_CONFIG, NULL, NULL), /* Default: 1mb */
+    createULongLongConfig("repl-backlog-tiering-max-size", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, replTier_config.max_size, 0, MEMORY_CONFIG, NULL, NULL),                       /* Default: unlimited */
 
     /* Size_t configs */
     createSizeTConfig("hash-max-listpack-entries", "hash-max-ziplist-entries", MODIFIABLE_CONFIG, 0, LONG_MAX, server.hash_max_listpack_entries, 512, INTEGER_CONFIG, NULL, NULL),
@@ -3672,7 +3676,8 @@ standardConfig static_configs[] = {
     createSSizeTConfig("slot-migration-max-failover-repl-bytes", NULL, MODIFIABLE_CONFIG, -1, SSIZE_MAX, server.slot_migration_max_failover_repl_bytes, 0, MEMORY_CONFIG | SIGNED_MEMORY_CONFIG, NULL, NULL),
 
     /* Other configs */
-    createTimeTConfig("repl-backlog-ttl", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.repl_backlog_time_limit, 60 * 60, INTEGER_CONFIG, NULL, NULL), /* Default: 1 hour */
+    createTimeTConfig("repl-backlog-ttl", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.repl_backlog_time_limit, 60 * 60, INTEGER_CONFIG, NULL, NULL),     /* Default: 1 hour */
+    createTimeTConfig("repl-backlog-tiering-retention", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, replTier_config.retention, 60, INTEGER_CONFIG, NULL, NULL), /* Default: 1 minute */
     createOffTConfig("auto-aof-rewrite-min-size", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.aof_rewrite_min_size, 64 * 1024 * 1024, MEMORY_CONFIG, NULL, NULL),
     createOffTConfig("loading-process-events-interval-bytes", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1024, INT_MAX, server.loading_process_events_interval_bytes, 1024 * 1024 * 2, INTEGER_CONFIG, NULL, NULL),
 

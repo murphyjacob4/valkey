@@ -212,6 +212,13 @@
 #define rdb_fsync_range(fd, off, size) fsync(fd)
 #endif
 
+/* Linux sendfile(2) can copy from a regular file straight into a socket
+ * without bouncing the data through user space. Other platforms have
+ * incompatible signatures, so we only use it on Linux. */
+#if defined(__linux__)
+#define HAVE_SENDFILE 1
+#endif
+
 /* Check if we can use setproctitle().
  * BSD systems have support for it, we provide an implementation for
  * Linux and macOS. */
