@@ -1356,7 +1356,6 @@ typedef struct ClientReplicationData {
     char *replica_addr;                  /* Optionally given by REPLCONF ip-address */
     int replica_version;                 /* Version on the form 0xMMmmpp. */
     short replica_capa;                  /* Replica capabilities: REPLICA_CAPA_* bitwise OR. */
-    int using_cob;                       /* Networking uses private COB instead of shared repl buffer. */
     _Atomic(int) forkless_pending_close; /* Main thread asks the forkless save to hand this replica
                                           * back for closing. Atomic (relaxed) since both threads access it without a lock. */
     short replica_req;                   /* Replica requirements: REPLICA_REQ_* */

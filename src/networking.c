@@ -460,24 +460,14 @@ void installClientWriteHandler(client *c) {
  * If we fail and there is more data to write, compared to what the socket
  * buffers can hold, then we'll really install the handler. */
 void putClientInPendingWriteQueue(client *c) {
-    /* Client is in a state where its output may be scheduled for writing. */
-    int ready_to_write = !c->repl_data ||
-                         c->repl_data->repl_state == REPL_STATE_NONE ||
-                         (isReplicaReadyForReplData(c) && !c->repl_data->repl_start_cmd_stream_on_ack);
-    /* Slot migration may forbid installing the write handler right now. */
-    int slot_migration_allows = clusterSlotMigrationShouldInstallWriteHandler(c);
-    /* During a forkless socket full-sync a WAIT_BGSAVE_END replica has sync
-     * framing/header (and later the footer) buffered in its COB by the main
-     * thread; schedule it for writing so the event loop flushes that COB. */
-    int forkless_socket_sync = c->repl_data &&
-                               c->repl_data->repl_state == REPLICA_STATE_WAIT_BGSAVE_END &&
-                               server.rdb_write_target == RDB_WRITE_TARGET_SOCKET &&
-                               server.cur_bgsave_type == RDB_BGSAVE_TYPE_FORKLESS;
-
     /* Schedule the client to write the output buffers to the socket only
      * if not already done and, for replicas, if the replica can actually receive
      * writes at this stage. */
-    if (!c->flag.pending_write && ((ready_to_write && slot_migration_allows) || forkless_socket_sync)) {
+    if (!c->flag.pending_write &&
+        (!c->repl_data ||
+         c->repl_data->repl_state == REPL_STATE_NONE ||
+         (isReplicaReadyForReplData(c) && !c->repl_data->repl_start_cmd_stream_on_ack)) &&
+        clusterSlotMigrationShouldInstallWriteHandler(c)) {
         /* Here instead of installing the write handler, we just flag the
          * client and put it into a list of clients that have something
          * to write to the socket. This way before re-entering the event
@@ -779,10 +769,8 @@ void _addReplyToBufferOrList(client *c, const char *s, size_t len) {
     /* Replicas should normally not cause any writes to the reply buffer. In case a rogue replica sent a command on the
      * replication link that caused a reply to be generated we'll simply disconnect it.
      * Note this is the simplest way to check a command added a response. Replication links are used to write data but
-     * not for responses, so we should normally never get here on a replica client.
-     * Exception: during forkless-save-to-socket, we use the COB to send RDB data to replicas. */
-    if (getClientType(c) == CLIENT_TYPE_REPLICA &&
-        !(c->repl_data && c->repl_data->using_cob)) {
+     * not for responses, so we should normally never get here on a replica client. */
+    if (getClientType(c) == CLIENT_TYPE_REPLICA) {
         sds cmdname = c->lastcmd ? c->lastcmd->fullname : NULL;
         logInvalidUseAndFreeClientAsync(c, "Replica generated a reply to command '%s'",
                                         cmdname ? cmdname : "<unknown>");
@@ -1867,11 +1855,6 @@ void copyReplicaOutputBuffer(client *dst, client *src) {
  * the socket. */
 int clientHasPendingReplies(client *c) {
     if (getClientType(c) == CLIENT_TYPE_REPLICA) {
-        /* Replicas using private COB (during forkless-save-to-socket) check
-         * the private buffer, not the shared replication buffer. */
-        if (c->repl_data && c->repl_data->using_cob) {
-            return c->bufpos || listLength(c->reply);
-        }
         /* Replicas use global shared replication buffer instead of
          * private output buffer. */
         serverAssert(c->bufpos == 0 && listLength(c->reply) == 0);
@@ -3553,11 +3536,10 @@ int postWriteToClient(client *c) {
     c->io_last_bufpos = 0;
     /* Update total number of writes on server */
     server.stat_total_writes_processed++;
-
-    if (getClientType(c) == CLIENT_TYPE_REPLICA && !(c->repl_data && c->repl_data->using_cob)) {
-        postWriteToReplica(c);
-    } else {
+    if (getClientType(c) != CLIENT_TYPE_REPLICA) {
         _postWriteToClient(c);
+    } else {
+        postWriteToReplica(c);
     }
 
     if (c->write_flags & WRITE_FLAGS_WRITE_ERROR) {
@@ -3603,7 +3585,7 @@ int writeToClient(client *c) {
     c->nwritten = 0;
     c->write_flags = 0;
 
-    if (getClientType(c) == CLIENT_TYPE_REPLICA && !(c->repl_data && c->repl_data->using_cob)) {
+    if (getClientType(c) == CLIENT_TYPE_REPLICA) {
         writeToReplica(c);
     } else {
         _writeToClient(c);
