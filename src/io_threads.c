@@ -775,7 +775,6 @@ int trySendWriteToIOThreads(client *c) {
         } else {
             c->io_last_bufpos = (size_t)c->bufpos;
         }
-        computeCobFlushStopPosition(c, &c->io_last_reply_block, &c->io_last_bufpos);
     }
 
     serverAssert(c->bufpos > 0 || c->io_last_bufpos > 0 || is_shared_buffer_replica);

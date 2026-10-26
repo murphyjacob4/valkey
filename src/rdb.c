@@ -4975,6 +4975,13 @@ int rdbWriteHeader(rio *rdb, int req, int rdbver, int rdbflags, rdbSaveInfo *rsi
  * Returns C_OK on success, C_ERR on error. */
 int rdbWriteFooter(rio *rdb, int req) {
     if (!(req & REPLICA_REQ_RDB_EXCLUDE_DATA) && rdbSaveModulesAux(rdb, VALKEYMODULE_AUX_AFTER_RDB) == -1) return C_ERR;
+    return rdbWriteEofAndChecksum(rdb);
+}
+
+/* Write the EOF opcode and checksum that end an RDB. Unlike rdbWriteFooter this
+ * runs no module callbacks, so it may be called from a background thread.
+ * Returns C_OK on success, C_ERR on error. */
+int rdbWriteEofAndChecksum(rio *rdb) {
     if (rdbSaveType(rdb, RDB_OPCODE_EOF) == -1) return C_ERR;
     /* RDB checksum field. It will be zero if checksum computation is disabled, the
      * loading code skips the check in this case. */

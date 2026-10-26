@@ -63,6 +63,11 @@ void replicationDiscardCachedPrimary(void);
 void replicationResurrectCachedPrimary(connection *conn);
 void replicationResurrectProvisionalPrimary(void);
 void replicationSendAck(void);
+
+/* Replica side: the last +FULLRESYNC carried offset -1 (forkless full sync), so
+ * the offset must be taken from the RDB aux fields once it is loaded. */
+static int full_sync_offset_in_rdb = 0;
+
 static int replicaPutOnline(client *replica);
 static void replicaStartCommandStream(client *replica);
 int cancelReplicationHandshake(int reconnect);
@@ -567,10 +572,10 @@ int canFeedReplicaReplBuffer(client *replica) {
     /* Don't feed replicas that are still waiting for BGSAVE to start. */
     if (replica->repl_data->repl_state == REPLICA_STATE_WAIT_BGSAVE_START) return 0;
 
-    /* Don't feed replicas that are syncing via forkless-save-to-socket. Replication
-     * data is inlined into the RDB stream by the iterator, so the shared replication
-     * buffer is not needed for these clients. */
-    if (replica->flag.forkless_managed && isForklessSaveInProgress()) return 0;
+    /* Don't feed replicas that are syncing via forkless-save-to-socket while the
+     * iterator still inlines replication data into the RDB stream. Once it is
+     * done, they accumulate the shared buffer like any WAIT_BGSAVE_END replica. */
+    if (replica->flag.forkless_managed && forklessIteratorOwnsReplication()) return 0;
 
     return 1;
 }
@@ -832,9 +837,6 @@ static void replicationFeedSelectDb(int dictid) {
     decrRefCount(selectcmd);
 
     server.replicas_eldb = dictid;
-
-    /* Mirror the SELECT into any forkless-save replica COB, in RDB format */
-    forklessAddRdbSelectToReplicaCob(dictid);
 }
 
 /* Propagate write commands to replication stream.
@@ -913,10 +915,6 @@ void replicationFeedReplicas(int dictid, robj **argv, int argc) {
     }
     feedReplicationBuffer(frame, sdslen(frame));
     sdsfree(frame);
-
-    /* Mirror this command into any forkless-save replica COB, in RDB-inline
-     * format. */
-    forklessAddReplicationCommandToReplicaCob(argc, argv);
 }
 
 /* This is a debugging function that gets called when we detect something
@@ -1413,8 +1411,8 @@ int startBgsaveForReplication(int mincapa, int req, int rdbver) {
 
     /* Set up this cohort's replicas for full resync before the save, in one place
      * for every path. Forkless socket starts at offset -1, since the real offset is
-     * sent via REPLCONF psync-offset at the end of the RDB transfer. On failure the
-     * error label unwinds the setup. */
+     * only known when the iterator finishes; it is sent in the RDB aux fields. On
+     * failure the error label unwinds the setup. */
     long long offset =
         (chosen_save_type == RDB_BGSAVE_TYPE_FORKLESS && socket_target) ? -1 : getPsyncInitialOffset();
     setupCohortReplicasForFullResync(req, rdbver, sync_compression_algo, offset);
@@ -1448,12 +1446,6 @@ int startBgsaveForReplication(int mincapa, int req, int rdbver) {
         }
     }
     if (server.debug_pause_after_fork) debugPauseProcess();
-
-    /* The save started successfully; force the next replicated command to
-     * re-emit a SELECT so the live stream that follows the RDB (whether mirrored
-     * into the save COB or served from the shared backlog) is DB-framed and the
-     * replica does not desync. */
-    server.replicas_eldb = -1;
 
     /* Remember that dump.rdb was generated for replication so that we can later
      * delete the file if needed. Note that we don't set the flag if the feature is
@@ -1921,10 +1913,7 @@ void replconfCommand(client *c) {
              * quick check first (instead of waiting for the next ACK. */
             if (server.child_type == CHILD_TYPE_RDB && c->repl_data->repl_state == REPLICA_STATE_WAIT_BGSAVE_END)
                 checkChildrenDone();
-            if (c->repl_data->repl_start_cmd_stream_on_ack && c->repl_data->repl_state == REPLICA_STATE_ONLINE) {
-                resumeReplicaCobFlush(c);
-                replicaStartCommandStream(c);
-            }
+            if (c->repl_data->repl_start_cmd_stream_on_ack && c->repl_data->repl_state == REPLICA_STATE_ONLINE) replicaStartCommandStream(c);
             if (c->repl_data->repl_state == REPLICA_STATE_BG_RDB_LOAD) {
                 if (!replicaPutOnline(c)) freeClientAsync(c);
             }
@@ -2019,45 +2008,12 @@ void replconfCommand(client *c) {
 
             if (c->repl_data->replica_nodeid) sdsfree(c->repl_data->replica_nodeid);
             c->repl_data->replica_nodeid = sdsdup(objectGetVal(c->argv[j + 1]));
-        } else if (!strcasecmp(objectGetVal(c->argv[j]), "psync-offset")) {
-            if (!(c->flag.primary)) {
-                serverLog(LL_DEBUG, "REPLCONF PSYNC-OFFSET was called from a non primary client. Ignoring it.");
-                return;
-            }
-            long long offset;
-            if ((getLongLongFromObject(c->argv[j + 1], &offset) != C_OK)) {
-                serverLog(LL_WARNING, "Unable to parse psync replication offset");
-                return;
-            }
-            if (server.wait_for_psync_offset) {
-                serverLog(LL_NOTICE,
-                          "Received a request to update primary reploff for psync, new psync offset: %lld.", offset);
-                server.primary_initial_offset = offset;
-                server.primary_repl_offset = offset;
-                server.repl_backlog->offset = server.primary_repl_offset + 1;
-                server.wait_for_psync_offset = 0;
-                server.primary->repl_data->read_reploff = offset + sdslen(c->querybuf) - c->qb_applied;
-                server.skip_psync_offset = 1;
-            } else {
-                serverLog(LL_WARNING, "Received unexpected request to update primary reploff for psync. Ignoring it.");
-            }
-            /* Note: this command does not reply anything! */
-            return;
         } else {
             addReplyErrorFormat(c, "Unrecognized REPLCONF option: %s", (char *)objectGetVal(c->argv[j]));
             return;
         }
     }
     addReply(c, shared.ok);
-}
-
-/* Resume sending data to a replica after ACK received. */
-void resumeReplicaCobFlush(client *replica) {
-    serverAssert(getClientType(replica) == CLIENT_TYPE_REPLICA);
-    if (!replica->repl_data->stop_send_data_until_ack) return;
-    replica->repl_data->stop_send_data_until_ack = 0;
-
-    putClientInPendingWriteQueue(replica);
 }
 
 /* This function puts a replica in the online state, and should be called just
@@ -2071,7 +2027,6 @@ void resumeReplicaCobFlush(client *replica) {
  * the return value indicates that the replica should be disconnected.
  * */
 static int replicaPutOnline(client *replica) {
-    resumeReplicaCobFlush(replica);
     if (replica->flag.repl_rdbonly) {
         replica->repl_data->repl_state = REPLICA_STATE_RDB_TRANSMITTED;
         /* The client asked for RDB only so we should close it ASAP */
@@ -2879,6 +2834,26 @@ static void captureReplFullSyncCompleteDuration(void) {
     }
 }
 
+/* A forkless full sync announces offset -1 in +FULLRESYNC, since the offset is
+ * only known once the primary finishes iterating its keyspace. The primary
+ * sends it, with the replication ID, in the RDB's replication aux fields, so
+ * the replica never holds the dataset without its offset. Adopt it before the
+ * primary client is created. */
+static int replicaAdoptFullSyncOffsetFromRdb(rdbSaveInfo *rsi) {
+    if (!full_sync_offset_in_rdb) return C_OK;
+    full_sync_offset_in_rdb = 0;
+    if (!rsi->repl_id_is_set || rsi->repl_offset < 0 ||
+        memcmp(rsi->repl_id, server.primary_replid, CONFIG_RUN_ID_SIZE) != 0) {
+        serverLog(LL_WARNING, "PRIMARY <-> REPLICA sync: the RDB doesn't carry a valid offset for replication ID %s",
+                  server.primary_replid);
+        return C_ERR;
+    }
+    server.primary_initial_offset = rsi->repl_offset;
+    serverLog(LL_NOTICE, "Full resync offset from RDB: %s:%lld", server.primary_replid,
+              server.primary_initial_offset);
+    return C_OK;
+}
+
 void replicaAfterLoadPrimaryRDB(connection *conn, rdbSaveInfo *rsi, int disk_based_sync) {
     /* Final setup of the connected replica <- primary link */
     if (conn == server.repl_rdb_transfer_s) {
@@ -3200,7 +3175,8 @@ read_from_socket:
     }
 
     replicaBeforeLoadPrimaryRDB(conn, 1);
-    if (replicaLoadPrimaryRDBFromSocket(conn, buf, eofmark, &usemark, &rsi) == C_ERR) {
+    if (replicaLoadPrimaryRDBFromSocket(conn, buf, eofmark, &usemark, &rsi) == C_ERR ||
+        replicaAdoptFullSyncOffsetFromRdb(&rsi) == C_ERR) {
         serverLog(LL_WARNING, "Failed to load RDB");
         cancelReplicationHandshake(1);
         return;
@@ -4114,9 +4090,7 @@ int replicaSendPsyncCommand(connection *conn) {
      * right value, so that this information will be propagated to the
      * client structure representing the primary into server.primary. */
     server.primary_initial_offset = -1;
-
-    /* Reset skip_psync_offset when a new sync starts. */
-    server.skip_psync_offset = 0;
+    full_sync_offset_in_rdb = 0;
 
     if (server.repl_rdb_channel_state != REPL_DUAL_CHANNEL_STATE_NONE) {
         /* While in dual channel replication, we should use our prepared repl id and offset. */
@@ -4215,11 +4189,9 @@ int replicaProcessPsyncReply(connection *conn) {
             memcpy(server.primary_replid, replid, offset - replid - 1);
             server.primary_replid[CONFIG_RUN_ID_SIZE] = '\0';
             server.primary_initial_offset = strtoll(offset, NULL, 10);
-            /* Primary sends repl offset -1 for forkless full sync */
-            if (server.primary_initial_offset == -1) {
-                server.wait_for_psync_offset = 1;
-                server.primary_initial_offset = 0;
-            }
+            /* Primary sends repl offset -1 for forkless full sync: the offset is
+             * carried by the RDB's replication aux fields instead. */
+            full_sync_offset_in_rdb = (server.primary_initial_offset == -1);
             serverLog(LL_NOTICE, "Full resync from primary: %s:%lld", server.primary_replid,
                       server.primary_initial_offset);
         }
@@ -5028,7 +5000,6 @@ int connectWithPrimary(void) {
 
     server.repl_transfer_lastio = server.unixtime;
     server.repl_state = REPL_STATE_CONNECTING;
-    server.wait_for_psync_offset = 0;
     serverLog(LL_NOTICE, "PRIMARY <-> REPLICA sync started");
     return C_OK;
 }
@@ -5944,7 +5915,7 @@ void handleBioThreadFinishedRDBDownload(void) {
     debugServerAssert(conn);
 
     replicaBeforeLoadPrimaryRDB(conn, 0);
-    if (replicaLoadPrimaryRDBFromDisk(&rsi) == C_ERR) {
+    if (replicaLoadPrimaryRDBFromDisk(&rsi) == C_ERR || replicaAdoptFullSyncOffsetFromRdb(&rsi) == C_ERR) {
         serverLog(LL_WARNING, "Failed to load RDB");
         cancelReplicationHandshake(1);
         return;
