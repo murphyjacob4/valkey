@@ -373,3 +373,127 @@ tags {"check-rdb network external:skip logreqres:skip"} {
         }
     }
 }
+
+tags {"check-rdb network external:skip logreqres:skip"} {
+    start_server {overrides {save "" forkless-infrastructure-enabled yes forkless-policy prefer-forkless repl-diskless-sync yes repl-diskless-sync-delay 0}} {
+        set primary [srv 0 client]
+        set primary_host [srv 0 host]
+        set primary_port [srv 0 port]
+
+        for {set i 0} {$i < 100} {incr i} {
+            $primary set init:$i val:$i
+        }
+        $primary config set rdb-key-save-delay 20000
+
+        start_server {overrides {save "" repl-diskless-load disabled}} {
+            set replica [srv 0 client]
+
+            test "valkey-check-rdb accepts a replica dump.rdb containing opcode 242" {
+                set loglines [count_log_lines -1]
+                $replica replicaof $primary_host $primary_port
+                wait_for_condition 100 20 {
+                    [s -1 rdb_bgsave_in_progress] == 1
+                } else {
+                    fail "Forkless sync save did not start"
+                }
+
+                # Give the main-thread feeder one tick to queue the initial keys
+                # so overwriting them emits inline RDB_OPCODE_UPDATE (0xF2) commands.
+                after 50
+                for {set i 0} {$i < 20} {incr i} {
+                    $primary set init:$i updated:$i
+                }
+                $primary config set rdb-key-save-delay 0
+
+                wait_for_sync $replica
+                waitForBgsave $primary
+                wait_for_log_messages -1 {"*Starting BGSAVE for SYNC with target: replicas sockets*method: forkless*"} $loglines 50 20
+
+                set dump_rdb [server_rdb_path $replica]
+                set data [read_binary_file $dump_rdb]
+                set update_pos [string first "\xf2*3\r\n\$3\r\n" $data]
+                assert {$update_pos != -1}
+
+                set failed [catch {
+                    exec $::VALKEY_CHECK_RDB_BIN $dump_rdb --stats --format info
+                } result]
+                assert_equal 0 $failed
+                assert_match {*Checksum OK*} $result
+                assert_match {*RDB looks OK!*} $result
+
+                # Corrupting the RESP framing of an inline command in dump.rdb is rejected.
+                set corrupt_frame_rdb [tmpfile check-rdb-242-corrupt-frame.rdb]
+                binary scan [string index $data [expr {$update_pos + 1}]] cu orig_prefix_byte
+                set corrupt_frame_data [string replace $data [expr {$update_pos + 1}] [expr {$update_pos + 1}] [binary format c [expr {$orig_prefix_byte ^ 1}]]]
+                write_binary_file $corrupt_frame_rdb $corrupt_frame_data
+                set failed [catch {exec $::VALKEY_CHECK_RDB_BIN $corrupt_frame_rdb} result]
+                assert_equal 1 $failed
+                assert_match {*Malformed inline replication command in RDB*} $result
+                assert_no_match {*RDB looks OK*} $result
+
+                # Corrupting a payload byte inside an inline command keeps framing valid
+                # and is caught by the trailing RDB CRC check.
+                set corrupt_crc_rdb [tmpfile check-rdb-242-corrupt-crc.rdb]
+                binary scan [string index $data [expr {$update_pos + 9}]] cu orig_payload_byte
+                set corrupt_crc_data [string replace $data [expr {$update_pos + 9}] [expr {$update_pos + 9}] [binary format c [expr {$orig_payload_byte ^ 1}]]]
+                write_binary_file $corrupt_crc_rdb $corrupt_crc_data
+                set failed [catch {exec $::VALKEY_CHECK_RDB_BIN $corrupt_crc_rdb} result]
+                assert_equal 1 $failed
+                assert_match {*RDB CRC error*} $result
+                assert_no_match {*RDB looks OK*} $result
+            } {} {needs:debug}
+        }
+    }
+
+    start_server {overrides {save ""}} {
+        r set k v
+        r save
+        set base_data [read_binary_file [server_rdb_path r]]
+        set prefix [string range $base_data 0 end-9]
+        set zero_tail "\xff\x00\x00\x00\x00\x00\x00\x00\x00"
+
+        test "valkey-check-rdb rejects malformed and truncated opcode 242 frames" {
+            # Non-array RESP prefix after opcode 242.
+            set bad_prefix_rdb [tmpfile check-rdb-242-bad-prefix.rdb]
+            write_binary_file $bad_prefix_rdb "$prefix\xf2+OK\r\n$zero_tail"
+            set failed [catch {exec $::VALKEY_CHECK_RDB_BIN $bad_prefix_rdb} result]
+            assert_equal 1 $failed
+            assert_match {*Malformed inline replication command in RDB*} $result
+            assert_match {*While doing: read-inline-cmd*} $result
+            assert_no_match {*RDB looks OK*} $result
+
+            # Corrupted bulk string terminator (not \r\n).
+            set bad_crlf_rdb [tmpfile check-rdb-242-bad-crlf.rdb]
+            write_binary_file $bad_crlf_rdb "$prefix\xf2*3\r\n\$3\r\nSET\r\n\$1\r\nk\r\n\$3\r\nbadXX$zero_tail"
+            set failed [catch {exec $::VALKEY_CHECK_RDB_BIN $bad_crlf_rdb} result]
+            assert_equal 1 $failed
+            assert_match {*Malformed inline replication command in RDB*} $result
+            assert_no_match {*RDB looks OK*} $result
+
+            # Truncated mid-argument hitting EOF.
+            set truncated_rdb [tmpfile check-rdb-242-truncated.rdb]
+            write_binary_file $truncated_rdb "$prefix\xf2*3\r\n\$3\r\nSET\r\n\$10\r\nshort"
+            set failed [catch {exec $::VALKEY_CHECK_RDB_BIN $truncated_rdb} result]
+            assert_equal 1 $failed
+            assert_match {*Unexpected EOF reading RDB file*} $result
+            assert_match {*While doing: read-inline-cmd*} $result
+            assert_no_match {*RDB looks OK*} $result
+
+            # Opcode 242 in an RDB version older than 81 or a foreign REDIS header.
+            set old_ver_rdb [tmpfile check-rdb-242-old-ver.rdb]
+            set inline "\xf2*3\r\n\$3\r\nSET\r\n\$1\r\nk\r\n\$1\r\nv\r\n"
+            write_binary_file $old_ver_rdb "VALKEY080[string range $prefix 9 end]$inline$zero_tail"
+            set failed [catch {exec $::VALKEY_CHECK_RDB_BIN $old_ver_rdb} result]
+            assert_equal 1 $failed
+            assert_match {*Opcode 242 requires RDB version 81 or newer*} $result
+            assert_no_match {*RDB looks OK*} $result
+
+            set foreign_rdb [tmpfile check-rdb-242-foreign.rdb]
+            write_binary_file $foreign_rdb "REDIS0012[string range $prefix 9 end]$inline$zero_tail"
+            set failed [catch {exec $::VALKEY_CHECK_RDB_BIN $foreign_rdb} result]
+            assert_equal 1 $failed
+            assert_match {*Unknown object type 242 in RDB file with foreign version 12*} $result
+            assert_no_match {*RDB looks OK*} $result
+        }
+    }
+}

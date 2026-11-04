@@ -123,6 +123,7 @@ static void rdbCheckPrintOffset(const char *msg) {
 #define RDB_CHECK_DOING_READ_AUX 7
 #define RDB_CHECK_DOING_READ_MODULE_AUX 8
 #define RDB_CHECK_DOING_READ_FUNCTIONS 9
+#define RDB_CHECK_DOING_READ_INLINE_CMD 10
 
 #define OUTPUT_FORMAT_INFO 0
 #define OUTPUT_FORMAT_TABLE 1
@@ -139,6 +140,7 @@ char *rdb_check_doing_string[] = {
     "read-aux",
     "read-module-aux",
     "read-functions",
+    "read-inline-cmd",
 };
 
 char *rdb_type_string[] = {
@@ -836,6 +838,31 @@ int redis_check_rdb(char *rdbfilename, FILE *fp) {
                 goto err;
             }
             rdbstate.functions_num++;
+            continue;
+        } else if (type == RDB_OPCODE_UPDATE) {
+            if (rdbIsForeignVersion(rdbver)) {
+                rdbCheckError("Unknown object type %d in RDB file with foreign version %d", type, rdbver);
+                goto err;
+            }
+            if (rdbver < 81) {
+                rdbCheckError("Opcode %d requires RDB version 81 or newer", type);
+                goto err;
+            }
+            robj **argv = NULL;
+            int argc = 0;
+            rdbstate.doing = RDB_CHECK_DOING_READ_INLINE_CMD;
+            respParseResult pr = parseRespCommandFromRio(rdb, &argc, &argv);
+            if (pr == RESP_PARSE_EOF) goto eoferr;
+            if (pr == RESP_PARSE_FMTERR) {
+                rdbCheckError("Malformed inline replication command in RDB");
+                goto err;
+            }
+            if (pr == RESP_PARSE_OOM) {
+                rdbCheckError("Out of memory reading inline replication command in RDB");
+                goto err;
+            }
+            for (int i = 0; i < argc; i++) decrRefCount(argv[i]);
+            zfree(argv);
             continue;
         } else if (rdbIsForeignVersion(rdbver) &&
                    type >= RDB_FOREIGN_TYPE_MIN &&

@@ -3733,6 +3733,10 @@ static char *rdbRioReadLine(void *ctx, char *buf, int size) {
     return buf;
 }
 
+respParseResult parseRespCommandFromRio(rio *rdb, int *argc_out, robj ***argv_out) {
+    return parseRespCommandFromReader(rdbRioReader, rdbRioReadLine, rdb, argc_out, argv_out);
+}
+
 /* Load an RDB file from the rio stream 'rdb'. We return one of the following:
  * - RDB_OK On success
  * - RDB_INCOMPATIBLE If the RDB has an invalid signature or version
@@ -3819,7 +3823,7 @@ static int rdbLoadRioInternal(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadi
             }
             robj **argv = NULL;
             int argc = 0;
-            respParseResult pr = parseRespCommandFromReader(rdbRioReader, rdbRioReadLine, rdb, &argc, &argv);
+            respParseResult pr = parseRespCommandFromRio(rdb, &argc, &argv);
             if (pr == RESP_PARSE_EOF) goto eoferr;
             if (pr == RESP_PARSE_FMTERR) goto inlinefmterr;
             if (pr == RESP_PARSE_OOM) goto inlineoomerr;
