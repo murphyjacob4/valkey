@@ -306,6 +306,7 @@ respParseResult parseRespCommandFromReader(size_t (*read_fn)(void *ctx, void *bu
                                            int *argc_out,
                                            robj ***argv_out);
 struct client *createAOFClient(void);
+bool isInlineReplicationCommand(const struct serverCommand *cmd);
 loadCommandResult loadCommandFromArgv(client *fakeClient, robj **argv, int argc, loadCommandSource source, sds *err);
 
 #endif

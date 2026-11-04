@@ -1951,8 +1951,8 @@ start_server {overrides {forkless-infrastructure-enabled yes forkless-policy pre
 }
 
 # The inline-replication opcode runs the command it carries through a fake
-# client with ACL checks bypassed, so a command that is neither a write nor
-# may-replicate (here an admin CONFIG SET) must be rejected, not executed.
+# client with ACL checks bypassed, so any command outside the inline
+# replication allowlist must be rejected, not executed.
 set inband_path [tmpdir "server.rdb-inband-opcode"]
 start_server [list overrides [list "dir" $inband_path] keep_persistence true] {
     r set somekey someval
@@ -1971,20 +1971,27 @@ if {[expr {$eof_byte & 0xff}] != 0xff} {
     error "Expected RDB EOF opcode 0xFF before checksum"
 }
 set prefix [string range $data 0 end-9]
-set inline "\xF2*4\r\n\$6\r\nCONFIG\r\n\$3\r\nSET\r\n\$3\r\ndir\r\n\$4\r\n/tmp\r\n"
 set tail "\xFF\x00\x00\x00\x00\x00\x00\x00\x00"
-set fd [open $inband_dump wb]
-fconfigure $fd -translation binary
-puts -nonewline $fd $prefix$inline$tail
-close $fd
+foreach {label inline} {
+    "CONFIG SET" "\xF2*4\r\n\$6\r\nCONFIG\r\n\$3\r\nSET\r\n\$3\r\ndir\r\n\$4\r\n/tmp\r\n"
+    "EVAL"       "\xF2*3\r\n\$4\r\nEVAL\r\n\$8\r\nreturn 1\r\n\$1\r\n0\r\n"
+    "PUBLISH"    "\xF2*3\r\n\$7\r\nPUBLISH\r\n\$4\r\nchan\r\n\$3\r\nmsg\r\n"
+    "MIGRATE"    "\xF2*6\r\n\$7\r\nMIGRATE\r\n\$9\r\n127.0.0.1\r\n\$1\r\n9\r\n\$7\r\nsomekey\r\n\$1\r\n0\r\n\$3\r\n100\r\n"
+    "BLPOP"      "\xF2*3\r\n\$5\r\nBLPOP\r\n\$7\r\nlistkey\r\n\$1\r\n0\r\n"
+} {
+    set fd [open $inband_dump wb]
+    fconfigure $fd -translation binary
+    puts -nonewline $fd $prefix$inline$tail
+    close $fd
 
-start_server_and_kill_it [list "dir" $inband_path "rdb-version-check" "relaxed"] {
-    test {Server rejects an on-disk RDB whose inline opcode carries a non-replicable command} {
-        wait_for_condition 50 100 {
-            [string match {*inline command*not a replicable write*} \
-                [exec tail -20 < [dict get $srv stdout]]]
-        } else {
-            fail "Server loaded an RDB whose inline opcode carried a non-replicable command"
+    start_server_and_kill_it [list "dir" $inband_path "rdb-version-check" "relaxed"] {
+        test "Server rejects an on-disk RDB whose inline opcode carries $label" {
+            wait_for_condition 50 100 {
+                [string match {*inline command*not a replicable write*} \
+                    [exec tail -20 < [dict get $srv stdout]]]
+            } else {
+                fail "Server loaded an RDB whose inline opcode carried $label"
+            }
         }
     }
 }

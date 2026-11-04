@@ -2447,9 +2447,9 @@ void bgIteration_handleCommandReplication(int dbid,
     if (!bgIteration_iterationActive()) return;
     serverAssert(onServerMainThread());
 
-    /* Some commands are replicated which are not writes (like publish) these can be ignored.
-     *  Be careful with MULTI which is not a write command, but must be replicated. */
-    if (!isWriteCmd(cmd) && cmd->proc != multiCommand) return;
+    /* Ignore commands outside the inline replication allowlist (such as PUBLISH),
+     * while keeping PFCOUNT and MULTI/EXEC transaction framing. */
+    if (!isInlineReplicationCommand(cmd)) return;
 
     if (BGITERATION_DEBUG) {
         sds sdsArgv = createSdsFromClientArgv(argc, argv);
