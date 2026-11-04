@@ -7894,13 +7894,10 @@ int moduleVerifyAllAllowAtomicSlotMigrationOrReply(client *c) {
     return C_OK;
 }
 
-/* Returns 0 if any loaded module did not declare
- * VALKEYMODULE_OPTIONS_HANDLE_FORKLESS, in which case forkless operations
- * should be blocked. Every module must opt in: a module that accesses a key for
- * write during a forkless operation must acknowledge the possible behavior
- * change, and a module that registers a data type must also confirm its RDB save
- * callback is thread-safe. */
-int moduleAllModulesHandleForkless(void) {
+/* Returns the name of the first loaded module that did not declare
+ * VALKEYMODULE_OPTIONS_HANDLE_FORKLESS, or NULL if all loaded modules
+ * handle forkless operations. */
+const char *moduleFirstWithoutForklessSupport(void) {
     listIter li;
     listNode *ln;
 
@@ -7908,10 +7905,20 @@ int moduleAllModulesHandleForkless(void) {
     while ((ln = listNext(&li)) != NULL) {
         struct ValkeyModule *module = listNodeValue(ln);
         if (!(module->options & VALKEYMODULE_OPTIONS_HANDLE_FORKLESS)) {
-            return 0;
+            return module->name;
         }
     }
-    return 1;
+    return NULL;
+}
+
+/* Returns 0 if any loaded module did not declare
+ * VALKEYMODULE_OPTIONS_HANDLE_FORKLESS, in which case forkless operations
+ * should be blocked. Every module must opt in: a module that accesses a key for
+ * write during a forkless operation must acknowledge the possible behavior
+ * change, and a module that registers a data type must also confirm its RDB save
+ * callback is thread-safe. */
+int moduleAllModulesHandleForkless(void) {
+    return moduleFirstWithoutForklessSupport() == NULL;
 }
 
 /* Returns true if any previous IO API failed.
