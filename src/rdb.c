@@ -3817,6 +3817,11 @@ static int rdbLoadRioInternal(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadi
                 serverLog(LL_WARNING, "Inline RDB commands are not supported with swapdb loading");
                 goto loaderr;
             }
+            if (!moduleAllModulesHandleForkless()) {
+                serverLog(LL_WARNING, "Inline RDB commands are not supported when a loaded module "
+                                      "has not declared VALKEYMODULE_OPTIONS_HANDLE_FORKLESS");
+                goto loaderr;
+            }
             robj **argv = NULL;
             int argc = 0;
             respParseResult pr = parseRespCommandFromReader(rdbRioReader, rdbRioReadLine, rdb, &argc, &argv);

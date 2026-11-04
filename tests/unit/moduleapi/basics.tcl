@@ -233,3 +233,49 @@ start_server {tags {"modules" "external:skip"} overrides {save "" forkless-infra
         waitForBgsave r
     }
 }
+
+start_server {tags {"modules external:skip"} overrides {
+    save ""
+    forkless-infrastructure-enabled yes
+    forkless-policy prefer-forkless
+    repl-diskless-sync yes
+    repl-diskless-sync-delay 0
+}} {
+    set primary [srv 0 client]
+    set primary_host [srv 0 host]
+    set primary_port [srv 0 port]
+
+    start_server {overrides {
+        save ""
+        repl-diskless-load disabled
+    }} {
+        set replica [srv 0 client]
+
+        test "Replica rejects inline RDB commands if a non-forkless module is loaded after handshake" {
+            $primary debug populate 300 key 10
+            $primary config set rdb-key-save-delay 100000
+
+            $replica replicaof $primary_host $primary_port
+            wait_for_condition 100 20 {
+                [s -1 rdb_bgsave_in_progress] eq 1
+            } else {
+                fail "Primary did not start forkless RDB transfer"
+            }
+            assert_equal forkless [s -1 rdb_current_bgsave_type]
+
+            # Load a module without VALKEYMODULE_OPTIONS_HANDLE_FORKLESS on the
+            # replica after it already advertised capa inband-repl during handshake,
+            # and emit an inline write on the primary before the RDB finishes.
+            assert_equal OK [$replica module load $testmodule]
+            $primary set inline-key inline-val
+            $primary config set rdb-key-save-delay 0
+
+            wait_for_sync $replica
+            assert_equal inline-val [$replica get inline-key]
+            assert_equal 1 [count_log_message 0 "Inline RDB commands are not supported when a loaded module has not declared VALKEYMODULE_OPTIONS_HANDLE_FORKLESS"]
+            assert_equal 2 [s -1 sync_full]
+            assert_equal 1 [s -1 forkless_fallbacks_missing_inband_repl]
+            assert_equal 1 [s -1 total_forks]
+        } {} {needs:debug}
+    }
+}
