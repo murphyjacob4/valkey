@@ -2410,13 +2410,15 @@ int freeClient(client *c) {
 
     /* The forkless save's background thread may still be using this replica's
      * connection, so we must not free it here. Instead, remove it from the
-     * replica tracking now and mark it for close; the forkless save owns the
-     * client and frees it when it is safe to do so. */
+     * replica tracking now, mark it for close, and shut down the socket fd so a
+     * background thread blocked in connWrite wakes immediately; the forkless
+     * save owns the client and frees it when it is safe to do so. */
     if (c->flag.forkless_managed) {
         if (atomic_load_explicit(&c->repl_data->forkless_pending_close, memory_order_relaxed))
             return 0; /* Already marked, don't double-process. */
         retireForklessManagedReplica(c);
         atomic_store_explicit(&c->repl_data->forkless_pending_close, 1, memory_order_relaxed);
+        if (c->conn && c->conn->fd != -1) shutdown(c->conn->fd, SHUT_RDWR);
         return 0;
     }
 

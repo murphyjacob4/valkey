@@ -2697,6 +2697,49 @@ start_server {tags {"repl external:skip"} overrides {save {} forkless-infrastruc
     }
 }
 
+start_server {tags {"repl external:skip"} overrides {
+    save {}
+    rdbcompression no
+    forkless-infrastructure-enabled yes
+    forkless-policy prefer-forkless
+    repl-diskless-sync yes
+    repl-diskless-sync-delay 0
+    repl-timeout 60
+}} {
+    set primary [srv 0 client]
+    # Populate ~26 MB so the RDB stream overflows the socket buffers and blocks
+    # the forkless save thread inside connWrite when the peer stops reading.
+    $primary debug populate 800 key 32768
+
+    test "Freeing a forkless-managed replica unblocks a blocked forkless save thread" {
+        set loglines [count_log_lines 0]
+        set rd [valkey_deferring_client]
+        $rd replconf capa eof capa psync2 capa inband-repl
+        assert_equal {OK} [$rd read]
+        $rd replconf version [s valkey_version]
+        assert_equal {OK} [$rd read]
+        $rd psync ? -1
+
+        wait_for_log_messages 0 {"*forkless-save: background processor started*"} $loglines 50 100
+        # Give the save thread time to fill the socket buffers and block in connWrite.
+        after 300
+        assert_equal 1 [s rdb_bgsave_in_progress]
+
+        # Freeing the replica must shut down its socket so connWrite unblocks
+        # immediately rather than waiting for the 60s repl-timeout.
+        assert_equal 1 [$primary client kill type replica]
+        wait_for_condition 50 100 {
+            [s rdb_bgsave_in_progress] == 0
+        } else {
+            catch {$rd close}
+            fail "Forkless save stayed blocked after CLIENT KILL"
+        }
+        wait_for_log_messages 0 {"*forkless-save: client(*) closed by primary*"} $loglines 50 100
+        assert_equal 0 [s total_forks]
+        catch {$rd close}
+    }
+}
+
 foreach kind {multi eval} {
     start_server {tags {"repl external:skip"} overrides {save {} forkless-infrastructure-enabled yes forkless-policy prefer-forkless repl-diskless-sync-delay 0}} {
         set primary [srv 0 client]
