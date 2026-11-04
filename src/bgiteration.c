@@ -2493,6 +2493,8 @@ void bgIteration_handleCommandReplication(int dbid,
      * naturally as we can only "complete" the iteration during the feeding process - and feeding
      * is only performed when handling timer events (after the LUA/MULTI has completed).  */
 
+    bool hasCmdReplicationFlags = (server.in_call > 0 && iteratorReplicationFlagsWereUpdated);
+
     listIter li;
     listNode *node;
     listRewind(allIterators, &li);
@@ -2524,7 +2526,7 @@ void bgIteration_handleCommandReplication(int dbid,
                  *       handle it as a "missing key" below.  If we were to try to handle it as a
                  *       standard "missing key", we would get the DBID incorrect. */
 
-            } else if (listLength(curCmdMissingKeys) > 0 &&
+            } else if (hasCmdReplicationFlags && listLength(curCmdMissingKeys) > 0 &&
                        cmd->proc != multiCommand && cmd->proc != execCommand) {
                 /* MULTI/EXEC are ignored because they are injected around a transaction by
                  * propagateToBgIteration without passing through bgIteration_blockClientIfRequired.
@@ -2599,13 +2601,13 @@ void bgIteration_handleCommandReplication(int dbid,
          *  if the key still exists (indicating EXPIRE/EVICT) we evaluate it specially. */
         bool shouldReplicateDelCommand = false;
         bool isDelCommand = isDeleteCmd(cmd);
+        bool isOutOfCallHdel = (cmd->proc == hdelCommand && !hasCmdReplicationFlags);
         if (isDelCommand) {
             sds key = objectGetVal(argv[1]);
             dbEntry *de = dbFind(server.db[dbid], key);
             serverAssert(de == NULL); // dbEntry should be removed before replication (self-check)
             if (it->keyset_iter->isKeyInScope(it->keyset_iter, key)) {
-                bool blockClientIfRequiredWasCalled = (server.in_call > 0);
-                if (blockClientIfRequiredWasCalled && iteratorReplicationFlagsWereUpdated) {
+                if (hasCmdReplicationFlags) {
                     // Here we know that the DEL is related to the running command
                     shouldReplicateDelCommand = it->cur_cmd_may_replicate;
                 } else {
@@ -2620,10 +2622,22 @@ void bgIteration_handleCommandReplication(int dbid,
                     }
                 }
             }
+        } else if (isOutOfCallHdel) {
+            /* Active hash-field expiry propagates HDEL outside call() before any
+             * empty-hash dbDelete, so the iterator's replication flags are stale
+             * and the hash entry is still present in server.db[dbid]. */
+            sds key = objectGetVal(argv[1]);
+            if (it->keyset_iter->isKeyInScope(it->keyset_iter, key)) {
+                dbEntry *de = server.db[dbid] ? dbFind(server.db[dbid], key) : NULL;
+                if (iteratorHasPassedKey(it, dbid, key, de)) {
+                    shouldReplicateDelCommand = true;
+                }
+            }
         }
 
         bool replicate = (it->iteration_flags & BGITERATOR_FLAG_REPLICATION &&
-                          ((!isDelCommand && it->cur_cmd_may_replicate) || shouldReplicateDelCommand));
+                          ((!isDelCommand && !isOutOfCallHdel && it->cur_cmd_may_replicate) ||
+                           shouldReplicateDelCommand));
 
         if (replicate) {
             /* We will replicate the command in these cases:
