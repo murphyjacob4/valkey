@@ -770,3 +770,57 @@ tags "modules aof" {
     }
     }
 }
+
+tags "modules" {
+    foreach load_mode {disabled on-empty-db} {
+        start_server [list tags {"external:skip"} overrides [list \
+            save "" \
+            loadmodule "$testmodule forkless" \
+            forkless-infrastructure-enabled yes \
+            forkless-policy prefer-forkless \
+            repl-diskless-sync yes \
+            repl-diskless-sync-delay 0]] {
+            set primary [srv 0 client]
+            set primary_host [srv 0 host]
+            set primary_port [srv 0 port]
+
+            start_server [list tags {"external:skip"} overrides [list \
+                save "" \
+                loadmodule "$testmodule forkless" \
+                repl-diskless-load $load_mode]] {
+                set replica [srv 0 client]
+
+                test "Replica fails RDB load cleanly on duplicate key from timer RM_Replicate ($load_mode)" {
+                    $primary debug populate 300 key 10
+                    $primary config set rdb-key-save-delay 100000
+
+                    $replica replicaof $primary_host $primary_port
+                    wait_for_condition 100 20 {
+                        [s -1 rdb_bgsave_in_progress] eq 1
+                    } else {
+                        fail "Primary did not start forkless RDB transfer"
+                    }
+                    assert_equal forkless [s -1 rdb_current_bgsave_type]
+
+                    # Make cur_cmd_may_replicate true on the iterator without leaving
+                    # curCmdMissingKeys populated, then fire a module timer that calls
+                    # RM_Replicate on unscanned keys so the inline SET precedes their
+                    # regular RDB entries.
+                    $primary function flush
+                    $primary propagate-test.timer-dup 300
+                    wait_for_condition 100 10 {
+                        [$primary propagate-test.timer-dup-fired] eq 1
+                    } else {
+                        fail "Module timer did not fire during forkless save"
+                    }
+                    $primary config set rdb-key-save-delay 0
+
+                    wait_for_sync $replica 100 100
+                    assert_equal [$primary dbsize] [$replica dbsize]
+                    assert {[count_log_message 0 "RDB has duplicated key"] >= 1}
+                    assert {[s -1 sync_full] >= 2}
+                } {} {needs:debug}
+            }
+        }
+    }
+}
