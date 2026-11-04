@@ -40,6 +40,8 @@
 #include "valkeymodule.h"
 #include <pthread.h>
 #include <errno.h>
+#include <stdio.h>
+#include <strings.h>
 
 #define UNUSED(V) ((void) V)
 
@@ -338,19 +340,66 @@ int propagateTestIncr(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc)
     return VALKEYMODULE_OK;
 }
 
-int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
-    VALKEYMODULE_NOT_USED(argv);
-    VALKEYMODULE_NOT_USED(argc);
+typedef struct {
+    int dbid;
+    int count;
+} TimerDupData;
 
+static volatile int timer_dup_fired = 0;
+
+void timerDupHandler(ValkeyModuleCtx *ctx, void *data) {
+    TimerDupData *d = data;
+    ValkeyModule_SelectDb(ctx, d->dbid);
+    for (int i = 0; i < d->count; i++) {
+        char keybuf[64];
+        snprintf(keybuf, sizeof(keybuf), "key:%d", i);
+        ValkeyModule_Replicate(ctx, "SET", "cc", keybuf, "from-timer");
+    }
+    ValkeyModule_Free(d);
+    timer_dup_fired = 1;
+}
+
+int propagateTestTimerDupCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    if (argc != 2) return ValkeyModule_WrongArity(ctx);
+    long long count;
+    if (ValkeyModule_StringToLongLong(argv[1], &count) != VALKEYMODULE_OK || count <= 0)
+        return ValkeyModule_ReplyWithError(ctx, "ERR invalid count");
+    TimerDupData *d = ValkeyModule_Alloc(sizeof(*d));
+    d->dbid = ValkeyModule_GetSelectedDb(ctx);
+    d->count = (int)count;
+    timer_dup_fired = 0;
+    ValkeyModule_CreateTimer(ctx, 1, timerDupHandler, d);
+    ValkeyModule_ReplyWithSimpleString(ctx, "OK");
+    return VALKEYMODULE_OK;
+}
+
+int propagateTestTimerDupFiredCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    VALKEYMODULE_NOT_USED(argv);
+    if (argc != 1) return ValkeyModule_WrongArity(ctx);
+    ValkeyModule_ReplyWithLongLong(ctx, timer_dup_fired);
+    return VALKEYMODULE_OK;
+}
+
+int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
     if (ValkeyModule_Init(ctx,"propagate-test",1,VALKEYMODULE_APIVER_1)
             == VALKEYMODULE_ERR) return VALKEYMODULE_ERR;
 
     detached_ctx = ValkeyModule_GetDetachedThreadSafeContext(ctx);
 
     /* This option tests skip command validation for ValkeyModule_Replicate */
-    ValkeyModule_SetModuleOptions(ctx, VALKEYMODULE_OPTIONS_SKIP_COMMAND_VALIDATION);
+    int options = VALKEYMODULE_OPTIONS_SKIP_COMMAND_VALIDATION;
+    int forkless = 0;
+    for (int i = 0; i < argc; i++) {
+        const char *s = ValkeyModule_StringPtrLen(argv[i], NULL);
+        if (!strcasecmp(s, "forkless")) {
+            options |= VALKEYMODULE_OPTIONS_HANDLE_FORKLESS;
+            forkless = 1;
+        }
+    }
+    ValkeyModule_SetModuleOptions(ctx, options);
 
-    if (ValkeyModule_SubscribeToKeyspaceEvents(ctx, VALKEYMODULE_NOTIFY_ALL, KeySpace_NotificationGeneric) == VALKEYMODULE_ERR)
+    if (!forkless &&
+        ValkeyModule_SubscribeToKeyspaceEvents(ctx, VALKEYMODULE_NOTIFY_ALL, KeySpace_NotificationGeneric) == VALKEYMODULE_ERR)
         return VALKEYMODULE_ERR;
 
     if (ValkeyModule_CreateCommand(ctx,"propagate-test.timer",
@@ -412,6 +461,16 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
                 propagateTestObeyed,
                 "",1,1,1) == VALKEYMODULE_ERR)
             return VALKEYMODULE_ERR;
+
+    if (ValkeyModule_CreateCommand(ctx, "propagate-test.timer-dup",
+                                   propagateTestTimerDupCommand,
+                                   "", 0, 0, 0) == VALKEYMODULE_ERR)
+        return VALKEYMODULE_ERR;
+
+    if (ValkeyModule_CreateCommand(ctx, "propagate-test.timer-dup-fired",
+                                   propagateTestTimerDupFiredCommand,
+                                   "", 0, 0, 0) == VALKEYMODULE_ERR)
+        return VALKEYMODULE_ERR;
 
     return VALKEYMODULE_OK;
 }
