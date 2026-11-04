@@ -185,8 +185,12 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
 
     /* Opt in to forkless only on request: LAZYFREELINK.INSERT does not handle
      * the NULL key OpenKey can return while a forkless save runs. */
-    if (argc == 1 && !strcmp(ValkeyModule_StringPtrLen(argv[0], NULL), "forkless")) {
-        ValkeyModule_SetModuleOptions(ctx, VALKEYMODULE_OPTIONS_HANDLE_FORKLESS);
+    if (argc >= 1 && !strcmp(ValkeyModule_StringPtrLen(argv[0], NULL), "forkless")) {
+        int options = VALKEYMODULE_OPTIONS_HANDLE_FORKLESS;
+        if (argc == 2 && !strcmp(ValkeyModule_StringPtrLen(argv[1], NULL), "swapdb")) {
+            options |= VALKEYMODULE_OPTIONS_HANDLE_IO_ERRORS | VALKEYMODULE_OPTIONS_HANDLE_REPL_ASYNC_LOAD;
+        }
+        ValkeyModule_SetModuleOptions(ctx, options);
     }
 
     /* We only allow our module to be loaded when the core version is greater than the version of my module */

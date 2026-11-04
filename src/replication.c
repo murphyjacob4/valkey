@@ -2817,6 +2817,15 @@ void replicaBeforeLoadPrimaryRDB(connection *conn, int use_diskless_load) {
         }
         killRDBChild();
     }
+    if (isForklessSaveInProgress()) {
+        if (!use_diskless_load) {
+            serverLog(LL_NOTICE,
+                      "Replica is about to load the RDB file received from the "
+                      "primary, but there is a forkless RDB save in progress. "
+                      "Cancelling it and removing its temp file to avoid any race");
+        }
+        forklessSaveCancel();
+    }
 
     /* Before loading the DB into memory we need to delete the readable
      * handler; otherwise, it will get called recursively since
