@@ -4488,7 +4488,17 @@ int syncWithPrimaryHandleSendHandshakeState(connection *conn) {
         argc++;
     }
     /* Inline commands require direct loading and modules that handle forkless operations. */
-    if (server.repl_diskless_load != REPL_DISKLESS_LOAD_SWAPDB && moduleAllModulesHandleForkless()) {
+    const char *non_forkless_module = NULL;
+    if (server.repl_diskless_load == REPL_DISKLESS_LOAD_SWAPDB) {
+        serverLog(LL_NOTICE,
+                  "Skipping %s capability for forkless sync because repl-diskless-load is set to swapdb.",
+                  REPLICA_CAPA_INBAND_REPL_STR);
+    } else if ((non_forkless_module = moduleFirstWithoutForklessSupport()) != NULL) {
+        serverLog(LL_NOTICE,
+                  "Skipping %s capability for forkless sync because module '%s' does not declare "
+                  "VALKEYMODULE_OPTIONS_HANDLE_FORKLESS.",
+                  REPLICA_CAPA_INBAND_REPL_STR, non_forkless_module);
+    } else {
         argv[argc] = "capa";
         lens[argc] = strlen("capa");
         argc++;
