@@ -3804,8 +3804,9 @@ static int rdbLoadRioInternal(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadi
         }
 
         /* Inline replication commands run on load. The opcode is honored on any
-         * RDB 81 or newer load, but loadCommandFromArgv only runs the embedded command if it is
-         * a write command or one that may replicate (e.g. PUBLISH, EVAL). This
+         * RDB 81 or newer load, but loadCommandFromArgv only runs the embedded
+         * command if isInlineReplicationCommand allows it (non-blocking write
+         * commands excluding MIGRATE, PFCOUNT, and MULTI/EXEC framing). This
          * prevents a crafted RDB from invoking arbitrary commands through the
          * fake client, which bypasses ACL checks. */
         if (type == RDB_OPCODE_UPDATE) {

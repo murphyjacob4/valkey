@@ -1647,6 +1647,19 @@ err:
  * With LOAD_CMD_SOURCE_INLINE_REPL the caller is replaying individual
  * replicated commands, so MULTI/EXEC are skipped rather than queued into a
  * transaction, and only commands a primary replicates are allowed. */
+/* Return true if 'cmd' may appear in the RDB inline replication stream
+ * (RDB_OPCODE_UPDATE). Both the forkless producer and the RDB loader call
+ * this helper so the replica only accepts commands a primary actually emits:
+ * non-blocking write commands (excluding MIGRATE), PFCOUNT, and MULTI/EXEC
+ * transaction framing. Scripts (EVAL/FCALL) are excluded because primaries
+ * propagate their resulting write commands rather than the script call. */
+bool isInlineReplicationCommand(const struct serverCommand *cmd) {
+    if (cmd->proc == multiCommand || cmd->proc == execCommand) return true;
+    if (cmd->flags & CMD_BLOCKING) return false;
+    if (cmd->proc == migrateCommand) return false;
+    return (cmd->flags & CMD_WRITE) || cmd->proc == pfcountCommand;
+}
+
 loadCommandResult loadCommandFromArgv(client *fakeClient, robj **argv, int argc, loadCommandSource source, sds *err) {
     struct serverCommand *cmd;
 
@@ -1671,10 +1684,10 @@ loadCommandResult loadCommandFromArgv(client *fakeClient, robj **argv, int argc,
         return LOAD_CMD_OK;
     }
 
-    /* Inline replication only runs commands a primary replicates. Otherwise a
-     * crafted RDB could run any command through the fake client, which bypasses
-     * ACL checks. */
-    if (source == LOAD_CMD_SOURCE_INLINE_REPL && !(cmd->flags & (CMD_WRITE | CMD_MAY_REPLICATE))) {
+    /* Inline replication only runs commands a primary actually emits during
+     * forkless sync. Otherwise a crafted RDB could run arbitrary commands
+     * through the fake client, which bypasses ACL checks. */
+    if (source == LOAD_CMD_SOURCE_INLINE_REPL && !isInlineReplicationCommand(cmd)) {
         *err = sdscatfmt(sdsempty(), "command '%s' is not a replicable write", cmd->fullname);
         freeClientArgv(fakeClient);
         return LOAD_CMD_ERR;

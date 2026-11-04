@@ -2464,6 +2464,84 @@ start_server {tags {"repl external:skip tls:skip"} overrides {save {}}} {
             catch {exec kill $pid}
         }
     }
+
+    start_server {overrides {save {} repl-diskless-load disabled}} {
+        set replica [srv 0 client]
+        $replica select 0
+
+        proc encode_inline_op {cmd_argv} {
+            set resp "\xF2*[llength $cmd_argv]\r\n"
+            foreach arg $cmd_argv {
+                append resp "\$[string length $arg]\r\n$arg\r\n"
+            }
+            return $resp
+        }
+
+        test "Replica rejects forbidden commands in RDB inline opcode" {
+            foreach cmd_argv {
+                {EVAL "return redis.call('set','injected','1')" 0}
+                {EVAL_RO "return 1" 0}
+                {FCALL myfn 0}
+                {FCALL_RO myfn 0}
+                {MIGRATE 127.0.0.1 9 somekey 0 100}
+                {CLUSTER SETSLOT 0 STABLE}
+                {CLUSTER SYNCSLOTS RELEASE}
+                {BLPOP listkey 0}
+                {PUBLISH chan msg}
+            } {
+                set forbidden_payload "$prefix[encode_inline_op $cmd_argv]\xFF\x00\x00\x00\x00\x00\x00\x00\x00"
+                set payload_file [tmpfile forbidden-inline-payload]
+                write_binary_file $payload_file $forbidden_payload
+                set port [find_available_port $::baseport $::portcount]
+                set pid [exec [info nameofexecutable] tests/helpers/fake_primary.tcl \
+                             $port $payload_file [string length $forbidden_payload] &]
+                wait_for_condition 50 50 {
+                    [ping_server 127.0.0.1 $port]
+                } else {
+                    fail "Failed to start fake primary for [lindex $cmd_argv 0]"
+                }
+                set loglines [count_log_lines 0]
+                $replica replicaof 127.0.0.1 $port
+                wait_for_log_messages 0 {"*Error applying inline command from RDB stream: command '*' is not a replicable write*"} $loglines 100 50
+                assert_equal down [s 0 master_link_status]
+                assert_equal {} [$replica get injected]
+                $replica replicaof no one
+                catch {exec kill $pid}
+            }
+        }
+
+        test "Replica accepts allowed commands in RDB inline opcode" {
+            set allowed_inline ""
+            foreach cmd_argv {
+                {MULTI}
+                {SET allowed yes}
+                {PFADD hll_inline elem1}
+                {PFCOUNT hll_inline}
+                {EXEC}
+            } {
+                append allowed_inline [encode_inline_op $cmd_argv]
+            }
+            set allowed_payload "$prefix$allowed_inline\xFF\x00\x00\x00\x00\x00\x00\x00\x00"
+            set payload_file [tmpfile allowed-inline-payload]
+            write_binary_file $payload_file $allowed_payload
+            set stream_file [tmpfile allowed-inline-stream]
+            write_binary_file $stream_file "*1\r\n\$4\r\nPING\r\n"
+            set port [find_available_port $::baseport $::portcount]
+            set pid [exec [info nameofexecutable] tests/helpers/fake_primary.tcl \
+                         $port $payload_file [string length $allowed_payload] $stream_file &]
+            wait_for_condition 50 50 {
+                [ping_server 127.0.0.1 $port]
+            } else {
+                fail "Failed to start fake primary for allowed inline commands"
+            }
+            $replica replicaof 127.0.0.1 $port
+            wait_for_sync $replica
+            assert_equal yes [$replica get allowed]
+            assert_equal 1 [$replica pfcount hll_inline]
+            $replica replicaof no one
+            catch {exec kill $pid}
+        }
+    }
 }
 
 # Live writes that arrive after the bg iterator has finished scanning the

@@ -2762,13 +2762,14 @@ typedef int *commandDbIdArgs(robj **argv, int argc, int *count);
  * This is the meaning of the flags:
  *
  * CMD_WRITE:       Write command (may modify the key space).
- *                  WARNING: a command marked CMD_WRITE (or CMD_MAY_REPLICATE)
- *                  is accepted by the RDB inline-replication opcode
- *                  (RDB_OPCODE_UPDATE) and will be executed through a fake
- *                  client, with ACL checks bypassed, when such an RDB is
- *                  loaded - including a persisted dump.rdb or AOF preamble, not
- *                  only a live replication stream. Only mark a command with
- *                  these flags if it is safe to run unconditionally on load.
+ *                  WARNING: a non-blocking command marked CMD_WRITE (other than
+ *                  MIGRATE) is accepted by the RDB inline-replication opcode
+ *                  (RDB_OPCODE_UPDATE, see isInlineReplicationCommand) and will
+ *                  be executed through a fake client, with ACL checks bypassed,
+ *                  when such an RDB is loaded - including a persisted dump.rdb
+ *                  or AOF preamble, not only a live replication stream. Only
+ *                  mark a command with this flag if it is safe to run
+ *                  unconditionally on load.
  *
  * CMD_READONLY:    Commands just reading from keys without changing the content.
  *                  Note that commands that don't read from the keyspace such as
@@ -2818,12 +2819,9 @@ typedef int *commandDbIdArgs(robj **argv, int argc, int *count);
  *                      Examples include PUBLISH, which replicates pubsub messages,and
  *                      EVAL, which may execute write commands, which are replicated,
  *                      or may just execute read commands. A command cannot be marked
- *                      both CMD_WRITE and CMD_MAY_REPLICATE
- *                      WARNING: like CMD_WRITE, a command marked CMD_MAY_REPLICATE
- *                      is accepted by the RDB inline-replication opcode and runs
- *                      on load through a fake client with ACL checks bypassed. Only
- *                      mark a command with it if it is safe to run unconditionally
- *                      on load.
+ *                      both CMD_WRITE and CMD_MAY_REPLICATE. Commands marked only
+ *                      CMD_MAY_REPLICATE (except PFCOUNT) are rejected by the RDB
+ *                      inline-replication opcode (see isInlineReplicationCommand).
  *
  * CMD_SENTINEL:    This command is present in sentinel mode.
  *
