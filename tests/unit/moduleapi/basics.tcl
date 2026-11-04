@@ -233,3 +233,46 @@ start_server {tags {"modules" "external:skip"} overrides {save "" forkless-infra
         waitForBgsave r
     }
 }
+
+start_server {tags {"modules external:skip"} overrides {save {} forkless-infrastructure-enabled yes forkless-policy prefer-forkless repl-diskless-sync yes repl-diskless-sync-delay 0}} {
+    set primary [srv 0 client]
+    set primary_host [srv 0 host]
+    set primary_port [srv 0 port]
+    populate 1000 primary 100 0
+    set digest [$primary debug digest]
+
+    start_server {overrides {save {} repl-diskless-load disabled}} {
+        set replica [srv 0 client]
+
+        test "Replica with module lacking HANDLE_FORKLESS makes full sync fall back to fork" {
+            $replica module load $testmodule
+            $primary config resetstat
+            set forks [s -1 total_forks]
+
+            $replica replicaof $primary_host $primary_port
+            wait_for_sync $replica
+
+            assert_equal 1 [s -1 sync_full]
+            assert_equal 1 [s -1 forkless_fallbacks_missing_inband_repl]
+            assert_equal 0 [s -1 forkless_fallbacks_module]
+            assert_morethan [s -1 total_forks] $forks
+            assert_equal $digest [$replica debug digest]
+
+            # Reloading the module with HANDLE_FORKLESS allows forkless sync.
+            $replica replicaof no one
+            $replica flushall
+            assert_equal {OK} [$replica module unload test]
+            assert_equal {OK} [$replica module load $testmodule forkless]
+            $primary config resetstat
+            set forks [s -1 total_forks]
+
+            $replica replicaof $primary_host $primary_port
+            wait_for_sync $replica
+
+            assert_equal 1 [s -1 sync_full]
+            assert_equal 0 [s -1 forkless_fallbacks_missing_inband_repl]
+            assert_equal $forks [s -1 total_forks]
+            assert_equal $digest [$replica debug digest]
+        } {} {needs:debug}
+    }
+}
