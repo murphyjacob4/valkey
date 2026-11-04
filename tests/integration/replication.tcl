@@ -2385,6 +2385,59 @@ start_server {tags {"repl external:skip tls:skip"} overrides {forkless-infrastru
     }
 }
 
+start_server {tags {"repl external:skip"} overrides {
+    forkless-infrastructure-enabled yes
+    forkless-policy prefer-forkless
+    repl-diskless-sync no
+    rdbcompression no
+    rdb-save-incremental-fsync yes
+    save ""
+}} {
+    set primary [srv 0 client]
+
+    test "Forkless disk-based full sync keeps the RDB in the OS page cache" {
+        if {$::tcl_platform(os) ne "Linux" || [auto_execok fincore] eq ""} {
+            skip "fincore on Linux is required to inspect RDB page cache residency"
+        }
+
+        # Populate ~25 MB (~6 x 4 MB REDIS_AUTOSYNC_BYTES chunks) so incremental
+        # fsync cache reclamation evicts most of the file when enabled.
+        $primary debug populate 750 key 32768
+
+        # A regular forkless BGSAVE (without RDBFLAGS_KEEP_CACHE) must reclaim
+        # the synced chunks from page cache. Skip if the underlying filesystem
+        # ignores POSIX_FADV_DONTNEED (e.g. tmpfs).
+        $primary bgsave
+        waitForBgsave $primary
+        assert_equal forkless [s rdb_last_bgsave_type]
+        lassign [exec fincore --bytes --noheadings -o RES,SIZE [server_rdb_path $primary]] bgsave_res bgsave_size
+        if {$bgsave_res > $bgsave_size / 2} {
+            skip "Filesystem does not reclaim page cache on POSIX_FADV_DONTNEED"
+        }
+
+        # Trigger a forkless disk-based replication save and keep the deferring
+        # replica client paused before reading the RDB bulk stream so closeRepldbfd
+        # has not reclaimed the cache yet.
+        set loglines [count_log_lines 0]
+        set forks_before [s total_forks]
+        set rd [valkey_deferring_client]
+        $rd replconf capa eof capa psync2
+        assert_equal {OK} [$rd read]
+        $rd replconf version [s valkey_version]
+        assert_equal {OK} [$rd read]
+        $rd psync ? -1
+
+        wait_for_log_messages 0 {"*Starting BGSAVE for SYNC with target: disk*method: forkless*"} $loglines 100 100
+        waitForBgsave $primary
+        assert_equal forkless [s rdb_last_bgsave_type]
+        assert_equal $forks_before [s total_forks]
+
+        lassign [exec fincore --bytes --noheadings -o RES,SIZE [server_rdb_path $primary]] sync_res sync_size
+        catch {$rd close}
+        assert_morethan $sync_res [expr {$sync_size * 3 / 4}]
+    }
+}
+
 start_server {tags {"repl external:skip tls:skip"} overrides {save ""}} {
     set src [srv 0 client]
     $src set k v
