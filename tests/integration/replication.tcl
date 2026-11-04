@@ -2781,3 +2781,55 @@ foreach load_mode {disabled on-empty-db} {
         }
     }
 }
+
+start_server {tags {"repl external:skip"} overrides {save {} forkless-infrastructure-enabled yes forkless-policy prefer-forkless repl-diskless-sync yes repl-diskless-sync-delay 0 hz 100}} {
+    set primary [srv 0 client]
+    $primary debug set-active-expire 0
+    $primary select 0
+    $primary hset myhash perm val f_ttl [string repeat x 16384]
+    $primary hpexpire myhash 1 fields 1 f_ttl
+    after 10
+    $primary select 2
+    $primary debug populate 2000
+    $primary select 0
+
+    start_server {overrides {save {}}} {
+        set replica [srv 0 client]
+
+        test {Forkless sync propagates HDEL from active hash field expiry} {
+            $primary config set rdb-key-save-delay 2000
+            $replica replicaof [srv -1 host] [srv -1 port]
+            wait_for_condition 50 100 {
+                [s -1 rdb_bgsave_in_progress] == 1
+            } else {
+                fail "Forkless save didn't start"
+            }
+            assert_equal forkless [s -1 rdb_current_bgsave_type]
+
+            # Give the background iterator time to serialize DB 0 (myhash with
+            # the expired-but-unreclaimed field) and move on to DB 2.
+            after 100
+            assert_equal 1 [s -1 rdb_bgsave_in_progress]
+
+            # Re-enable active expiry while the forkless sync is still running
+            # so active field expiry reclaims f_ttl and emits HDEL.
+            set expired_before [s -1 expired_fields]
+            $primary debug set-active-expire 1
+            wait_for_condition 100 20 {
+                [s -1 expired_fields] > $expired_before
+            } else {
+                fail "Primary did not actively expire hash field during forkless sync"
+            }
+            assert_equal 1 [s -1 rdb_bgsave_in_progress]
+            $primary config set rdb-key-save-delay 0
+
+            wait_for_sync $replica
+            wait_for_ofs_sync $primary $replica
+            $replica select 0
+            assert_equal [$primary dump myhash] [$replica dump myhash]
+            assert_equal [$primary memory usage myhash samples 0] [$replica memory usage myhash samples 0]
+            assert_match {*db0:*keys_with_volatile_items=0*} [$replica info keyspace]
+            assert_equal 0 [s -1 total_forks]
+        } {} {needs:debug}
+    }
+}
