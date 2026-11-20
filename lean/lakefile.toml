@@ -1,0 +1,9 @@
+name = "valkey_raft"
+defaultTargets = ["ValkeyRaft", "explore"]
+
+[[lean_lib]]
+name = "ValkeyRaft"
+
+[[lean_exe]]
+name = "explore"
+root = "Explore"
