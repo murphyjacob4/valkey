@@ -631,11 +631,14 @@ test "Raft config-append: A2 pipelined voter changes cannot commit entry with ol
         set base_commit [CI 0 cluster_raft_commit_index]
         set term [CI 0 cluster_raft_current_term]
 
-        # B stops acking so ADD_VOTER C stays uncommitted.
+        # B and C both stop acking so ADD_VOTER C stays uncommitted even under
+        # config-on-append (where V(S_p) = {A, B, C}, quorum 2/3, so C's own
+        # ack would legitimately commit ADD_VOTER C!). D and E ack idx_c so
+        # D is caught up to idx_c.
         set rd_c [valkey_deferring_client]
         $rd_c CLUSTER ADDVOTER $c_id
         set idx_c [expr {$base_commit + 1}]
-        rca_ack_all_up_to [list $fd_c $fd_d $fd_e] $idx_c 5000
+        rca_ack_all_up_to [list $fd_d $fd_e] $idx_c 5000
         assert_equal $base_commit [CI 0 cluster_raft_commit_index]
 
         # Attempt to pipeline a second uncommitted voter change (ADD_VOTER D).
@@ -646,8 +649,8 @@ test "Raft config-append: A2 pipelined voter changes cannot commit entry with ol
 
         # Check whether the leader immediately rejected ADD_VOTER D (new design)
         # or appended it (base).
-        set got_d_on_c [rca_try_recv_matching $fd_c "AE *ADD_VOTER $d_id*" 500]
-        if {$got_d_on_c eq ""} {
+        set got_d_on_e [rca_try_recv_matching $fd_e "AE *ADD_VOTER $d_id*" 500]
+        if {$got_d_on_e eq ""} {
             # New design rejected pipelined ADD_VOTER D before append!
             set d_rejected 1
             assert_error "*" {$rd_d read}
@@ -662,8 +665,8 @@ test "Raft config-append: A2 pipelined voter changes cannot commit entry with ol
             # to confirm it commits a SLOT_CHANGE using only old quorum {A, B}
             # while {C, D, E} (a 3/5 majority of the new voters) never got it.
             set idx_d [expr {$idx_c + 1}]
-            rca_reply_ae_ack $fd_c $got_d_on_c 0
-            rca_ack_all_up_to [list $fd_d $fd_e] $idx_d 5000
+            rca_reply_ae_ack $fd_e $got_d_on_e 0
+            rca_ack_all_up_to [list $fd_c $fd_d] $idx_d 5000
 
             set rd_e [valkey_deferring_client]
             $rd_e CLUSTER ADDVOTER $e_id
@@ -1076,10 +1079,12 @@ test "Raft config-append: at most one uncommitted voter change allowed" {
         set base_commit [CI 0 cluster_raft_commit_index]
         set idx_c [expr {$base_commit + 1}]
 
-        # Propose ADD_VOTER C while B does not ack -> stays uncommitted.
+        # Propose ADD_VOTER C while B and C do not ack -> stays uncommitted
+        # under V(S_p) = {A, B, C} (quorum 2/3). Let learner D ack idx_c so D
+        # is caught up.
         set rd_c [valkey_deferring_client]
         $rd_c CLUSTER ADDVOTER $c_id
-        rca_ack_all_up_to [list $fd_c $fd_d] $idx_c 5000
+        rca_ack_all_up_to [list $fd_d] $idx_c 5000
         assert_equal $base_commit [CI 0 cluster_raft_commit_index]
         set entries_after_c [CI 0 cluster_raft_log_entries]
 
@@ -1429,8 +1434,12 @@ test "Raft config-append: CLUSTER FORGET of a voter chains DEL_VOTER then NODE_F
         assert_no_match "*NODE_FORGET $b_id*" $ae1
 
         # Ack DEL_VOTER B from C -> effective voters {A, C} commit DEL_VOTER B.
+        # Do not drain fd_c here because committing DEL_VOTER B immediately
+        # triggers the chained NODE_FORGET B AE on fd_c.
         rca_reply_ae_ack $fd_c $ae1 0
-        rca_drive_commit [list $fd_c] $del_idx 0 5000
+        wait_for_condition 50 50 {[CI 0 cluster_raft_commit_index] >= $del_idx} else {
+            fail "DEL_VOTER B did not commit"
+        }
 
         # Next entry replicated MUST be NODE_FORGET B.
         set forget_idx [expr {$del_idx + 1}]
@@ -1497,6 +1506,34 @@ test "Raft config-append: INSTALL_SNAPSHOT rebuilds projected voter set" {
 
         close $fd_b
         close $fd_a
+    }
+}
+
+# ==========================================================================
+# Step 3 adversarial regression: remote PROPOSE to an unbootstrapped singleton
+# must be rejected instead of corrupting S_p / crashing clusterRaftAssertLearnerRole
+# ==========================================================================
+test "Raft config-append: fresh singleton rejects remote PROPOSE before bootstrap" {
+    start_server {overrides {cluster-enabled yes cluster-protocol raft cluster-node-timeout 1000}} {
+        set cport [expr {[srv 0 port] + 10000}]
+        set x_id [string repeat "x" 40]
+        set x_addr "127.0.0.1:9961@19961,,tls-port=0,shard-id=[string repeat 5 40]"
+
+        set in_x [rca_connect_fake_node 127.0.0.1 $cport $x_id $x_addr]
+        rca_send $in_x "PROPOSE NODE_JOIN $x_id $x_addr learner"
+        assert_match "REJECT *" [rca_try_recv_matching $in_x "REJECT *" 1000]
+        assert_equal 0 [CI 0 cluster_raft_log_entries]
+
+        rca_send $in_x "PROPOSE NOOP"
+        assert_match "REJECT *" [rca_try_recv_matching $in_x "REJECT *" 1000]
+        assert_equal 0 [CI 0 cluster_raft_log_entries]
+
+        # Wait past multiple cron ticks to confirm no assertion crash.
+        after 300
+        assert_equal PONG [R 0 PING]
+        assert_equal "leader" [CI 0 cluster_raft_role]
+
+        close $in_x
     }
 }
 
