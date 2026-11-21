@@ -256,6 +256,9 @@ typedef struct {
     /* Election */
     int votes_received;
     int pre_votes_received;
+    dict *votes_granted;     /* Deduplicated voter IDs that granted VOTE in current_term */
+    dict *pre_votes_granted; /* Deduplicated voter IDs that granted PRE_VOTE */
+    uint64_t ae_ack_index;   /* Index to report in deferred AE_ACK */
     mstime_t election_timeout;            /* Randomized timeout */
     mstime_t last_heartbeat;              /* Last time we heard from leader */
     mstime_t pre_vote_started;            /* Last time we started a pre-vote round */
@@ -490,6 +493,14 @@ static int clusterRaftCountAppliedVoters(void);
 static void clusterRaftSyncAppliedSize(void);
 static bool raftParseAddressForValidation(const char *addr_str, char *out_shard_id, bool *has_shard_id);
 static bool raftEntryInUncommittedTail(int type, sds data);
+static bool raftProjIsVoter(const char *node_id);
+static int raftProjVoterCount(void);
+static int raftProjQuorum(void);
+static bool raftProjIsSingleVoterMyself(void);
+static bool raftEntryIsVoterChange(raftLogEntry *e);
+static bool raftHasUncommittedVoterChange(void);
+static bool raftLeaderCommittedInCurrentTerm(void);
+static void clusterRaftSyncRoleWithProj(void);
 
 static void clusterRaftRandomizeElectionTimeout(void) {
     mstime_t base = server.cluster_node_timeout;
@@ -497,12 +508,9 @@ static void clusterRaftRandomizeElectionTimeout(void) {
     RAFT_STATE()->election_timeout = base + (rand() % base);
 }
 
-static int clusterRaftQuorum(void) {
-    return server.cluster->size / 2 + 1;
-}
-
-/* True if there are any nodes other than myself without the JOINING flag. */
+/* True if there are any peer members in S_a (non-JOINING) or in S_p. */
 static bool clusterRaftHasPeerMembers(void) {
+    clusterRaftState *rs = RAFT_STATE();
     dictIterator *di = dictGetSafeIterator(server.cluster->nodes);
     dictEntry *de;
     while ((de = dictNext(di)) != NULL) {
@@ -513,11 +521,23 @@ static bool clusterRaftHasPeerMembers(void) {
         }
     }
     dictReleaseIterator(di);
+    if (rs && rs->proj) {
+        di = dictGetSafeIterator(rs->proj->nodes);
+        while ((de = dictNext(di)) != NULL) {
+            raftProjNode *pn = dictGetVal(de);
+            if (memcmp(pn->name, myself->name, CLUSTER_NAMELEN) != 0) {
+                dictReleaseIterator(di);
+                return true;
+            }
+        }
+        dictReleaseIterator(di);
+    }
     return false;
 }
 
 static bool clusterRaftIsSingleton(void) {
-    return server.cluster->size <= 1 && !clusterRaftHasPeerMembers();
+    clusterRaftState *rs = RAFT_STATE();
+    return rs->last_applied == 0 && raftLogLastIndex() == 0 && !clusterRaftHasPeerMembers();
 }
 
 /* True between sending TIMEOUT_NOW and stepping down or giving up. The
@@ -528,15 +548,24 @@ static bool clusterRaftTransferSent(void) {
            rs->role == RAFT_ROLE_LEADER && rs->transfer_term == rs->current_term;
 }
 
-/* Step down on higher term / lost quorum.
- * Voters become followers; learners and joiners keep their role. */
+/* Step down on higher term / lost quorum / self-demotion.
+ * Effective voters in S_p become followers; non-voters become learners;
+ * joiners stay joiners. */
 static void clusterRaftStepDown(mstime_t now, const char *reason) {
     clusterRaftState *rs = RAFT_STATE();
     enum raftRole old_role = rs->role;
     clusterRaftDeferPendingProposals();
-    if (rs->role != RAFT_ROLE_LEARNER && rs->role != RAFT_ROLE_JOINER)
-        rs->role = RAFT_ROLE_FOLLOWER;
+    if (rs->role != RAFT_ROLE_JOINER) {
+        if (dictSize(rs->proj->nodes) == 0 && rs->last_applied == 0) {
+            rs->role = RAFT_ROLE_FOLLOWER;
+        } else {
+            rs->role = raftProjIsVoter(myself->name) ? RAFT_ROLE_FOLLOWER : RAFT_ROLE_LEARNER;
+        }
+    }
+    dictEmpty(rs->votes_granted, NULL);
+    dictEmpty(rs->pre_votes_granted, NULL);
     rs->votes_received = 0;
+    rs->pre_votes_received = 0;
     memset(rs->voted_for, 0, CLUSTER_NAMELEN);
     memset(rs->leader, 0, CLUSTER_NAMELEN);
     clusterRaftRandomizeElectionTimeout();
@@ -547,19 +576,20 @@ static void clusterRaftStepDown(mstime_t now, const char *reason) {
 }
 
 /* Return non-zero if the leader still has a recently responsive voting
- * quorum based on follower AE_ACK timing. */
+ * quorum in the effective voter set V(S_p) based on follower AE_ACK timing. */
 static int clusterRaftLeaderHasFreshQuorum(mstime_t now) {
     clusterRaftState *rs = RAFT_STATE();
-    if (rs->role != RAFT_ROLE_LEADER || server.cluster->size <= 1) return 1;
+    if (rs->role != RAFT_ROLE_LEADER) return 1;
+    if (raftProjVoterCount() == 0 || raftProjIsSingleVoterMyself()) return 1;
 
-    int fresh = 1; /* Self */
-    int quorum = clusterRaftQuorum();
+    int fresh = raftProjIsVoter(myself->name) ? 1 : 0;
+    int quorum = raftProjQuorum();
     dictIterator *di = dictGetSafeIterator(server.cluster->nodes);
     dictEntry *de;
     while ((de = dictNext(di)) != NULL) {
         clusterNode *node = dictGetVal(de);
         if (node == myself) continue;
-        if (!nodeIsVoter(node)) continue;
+        if (!raftProjIsVoter(node->name)) continue;
         clusterNodeRaftData *rd = RAFT_NODE(node);
         if (rd->last_ack_time > 0 &&
             now - rd->last_ack_time <= server.cluster_node_timeout) {
@@ -577,6 +607,10 @@ static void clusterRaftSingletonStepDown(void) {
     clusterRaftDeferPendingProposals();
     rs->role = RAFT_ROLE_JOINER;
     rs->joiner_since = monotonicMs();
+    dictEmpty(rs->votes_granted, NULL);
+    dictEmpty(rs->pre_votes_granted, NULL);
+    rs->votes_received = 0;
+    rs->pre_votes_received = 0;
     memset(rs->leader, 0, CLUSTER_NAMELEN);
     memset(rs->voted_for, 0, CLUSTER_NAMELEN);
     clusterRaftRandomizeElectionTimeout();
@@ -1253,6 +1287,86 @@ static bool raftProjValidateShardEpoch(raftProjState *p, const char *shard_id, u
     return epoch == current;
 }
 
+static bool raftProjIsVoter(const char *node_id) {
+    clusterRaftState *rs = RAFT_STATE();
+    if (!rs || !rs->proj || !node_id) return false;
+    raftProjNode *pn = raftProjLookupNode(rs->proj, node_id, CLUSTER_NAMELEN);
+    return pn && !pn->is_learner;
+}
+
+static int raftProjVoterCount(void) {
+    clusterRaftState *rs = RAFT_STATE();
+    return (rs && rs->proj) ? rs->proj->voter_count : 0;
+}
+
+static int raftProjQuorum(void) {
+    return raftProjVoterCount() / 2 + 1;
+}
+
+static bool raftProjIsSingleVoterMyself(void) {
+    clusterNode *me = server.cluster->myself;
+    return me && raftProjVoterCount() == 1 && raftProjIsVoter(me->name);
+}
+
+static bool raftEntryIsVoterChange(raftLogEntry *e) {
+    if (!e) return false;
+    if (e->type == RAFT_ENTRY_ADD_VOTER || e->type == RAFT_ENTRY_DEL_VOTER) return true;
+    if (e->type == RAFT_ENTRY_NODE_JOIN) {
+        int argc;
+        sds *argv = sdssplitlen(e->data, sdslen(e->data), " ", 1, &argc);
+        bool is_voter = argv && argc >= 3 && !strcasecmp(argv[2], "voter");
+        if (argv) sdsfreesplitres(argv, argc);
+        return is_voter;
+    }
+    return false;
+}
+
+static bool raftHasUncommittedVoterChange(void) {
+    clusterRaftState *rs = RAFT_STATE();
+    for (uint64_t i = 0; i < rs->log_count; i++) {
+        raftLogEntry *e = rs->log[i];
+        if (e->index <= rs->commit_index) continue;
+        if (raftEntryIsVoterChange(e)) return true;
+    }
+    return false;
+}
+
+static bool raftLeaderCommittedInCurrentTerm(void) {
+    clusterRaftState *rs = RAFT_STATE();
+    return rs->commit_index > 0 && raftLogTermAt(rs->commit_index) == rs->current_term;
+}
+
+/* Synchronize non-leader Raft role with the effective voter set V(S_p).
+ * Under config-on-append, uncommitted ADD_VOTER(myself) or DEL_VOTER(myself)
+ * takes effect immediately on append and rolls back on truncation.
+ * Leaders remain RAFT_ROLE_LEADER while replicating an uncommitted
+ * DEL_VOTER(myself) and step down once it commits/applies. */
+static void clusterRaftSyncRoleWithProj(void) {
+    clusterRaftState *rs = RAFT_STATE();
+    clusterNode *me = server.cluster->myself;
+    if (!me || !rs || !rs->proj) return;
+    if (rs->role == RAFT_ROLE_JOINER || rs->role == RAFT_ROLE_LEADER) return;
+
+    if (dictSize(rs->proj->nodes) == 0) {
+        if (rs->last_applied > 0) rs->role = RAFT_ROLE_LEARNER;
+        return;
+    }
+
+    if (raftProjIsVoter(me->name)) {
+        if (rs->role == RAFT_ROLE_LEARNER) {
+            rs->role = RAFT_ROLE_FOLLOWER;
+        }
+    } else {
+        if (rs->role != RAFT_ROLE_LEARNER) {
+            dictEmpty(rs->votes_granted, NULL);
+            dictEmpty(rs->pre_votes_granted, NULL);
+            rs->votes_received = 0;
+            rs->pre_votes_received = 0;
+            rs->role = RAFT_ROLE_LEARNER;
+        }
+    }
+}
+
 /* Pure validation of a nodes.conf address string without mutating cluster state.
  * Optionally extracts shard-id if present. */
 static bool raftParseAddressForValidation(const char *addr_str, char *out_shard_id, bool *has_shard_id) {
@@ -1864,6 +1978,12 @@ static RaftProposalResult raftValidateEntryOnState(raftProjState *p, uint8_t typ
         argv = sdssplitlen(data, sdslen(data), " ", 1, &argc);
         if (!argv || argc != 1 || sdslen(argv[0]) != CLUSTER_NAMELEN) goto reject;
 
+        if (leader_append_checks) {
+            if (raftHasUncommittedVoterChange() || !raftLeaderCommittedInCurrentTerm()) {
+                goto reject;
+            }
+        }
+
         raftProjNode *pn = raftProjLookupNode(p, argv[0], CLUSTER_NAMELEN);
         if (!pn || !pn->is_learner) goto reject;
 
@@ -1879,6 +1999,12 @@ static RaftProposalResult raftValidateEntryOnState(raftProjState *p, uint8_t typ
     case RAFT_ENTRY_DEL_VOTER: {
         argv = sdssplitlen(data, sdslen(data), " ", 1, &argc);
         if (!argv || argc != 1 || sdslen(argv[0]) != CLUSTER_NAMELEN) goto reject;
+
+        if (leader_append_checks) {
+            if (raftHasUncommittedVoterChange() || !raftLeaderCommittedInCurrentTerm()) {
+                goto reject;
+            }
+        }
 
         raftProjNode *pn = raftProjLookupNode(p, argv[0], CLUSTER_NAMELEN);
         if (!pn || pn->is_learner || p->voter_count <= 1) goto reject;
@@ -2083,7 +2209,7 @@ static clusterNode *clusterRaftSelectTransferTarget(void) {
         clusterNode *node = dictGetVal(de);
         if (node == myself || !node->link) continue;
         if (nodeFailed(node)) continue;
-        if (!nodeIsVoter(node) || (node->flags & CLUSTER_NODE_HANDSHAKE)) continue;
+        if (!raftProjIsVoter(node->name) || (node->flags & CLUSTER_NODE_HANDSHAKE)) continue;
         uint64_t mi = RAFT_NODE(node)->match_index;
         if (!best || mi > best_match) {
             best = node;
@@ -2126,7 +2252,7 @@ static void clusterRaftMaybeSendTimeoutNow(void) {
     }
 
     clusterNode *target = clusterLookupNode(rs->transfer_target, CLUSTER_NAMELEN);
-    if (!target || !target->link || nodeFailed(target) || !nodeIsVoter(target)) {
+    if (!target || !target->link || nodeFailed(target) || !raftProjIsVoter(target->name)) {
         serverLog(LL_NOTICE, "Leadership transfer aborted: target %.40s is no longer available.",
                   rs->transfer_target);
         rs->transfer_deadline = 0;
@@ -2169,6 +2295,7 @@ static void raftLogAppend(raftLogEntry *e) {
     rs->log[rs->log_count++] = e;
     if (!rs->proj_loading && rs->proj) {
         raftProjApplyEntry(rs->proj, e->type, e->data);
+        clusterRaftSyncRoleWithProj();
     }
     /* Schedule persistence in next beforeSleep. */
     if (!rs->todo_persist_log) {
@@ -2197,6 +2324,7 @@ static void raftLogTruncateFrom(uint64_t index) {
     }
     if (truncated && !rs->proj_loading) {
         raftProjRebuild();
+        clusterRaftSyncRoleWithProj();
     }
     /* Truncated entries may already be on disk; a full rewrite is needed
      * to remove them. */
@@ -2379,10 +2507,11 @@ static void raftLogApply(raftLogEntry *e) {
 
                 int was_joiner = (rs->role == RAFT_ROLE_JOINER);
                 if (first_join) {
-                    if (learner)
-                        rs->role = RAFT_ROLE_LEARNER;
-                    else if (was_joiner)
-                        rs->role = RAFT_ROLE_FOLLOWER;
+                    if (was_joiner) {
+                        rs->role = raftProjIsVoter(myself->name) ? RAFT_ROLE_FOLLOWER : RAFT_ROLE_LEARNER;
+                    } else {
+                        clusterRaftSyncRoleWithProj();
+                    }
                 }
 
                 if (was_joiner) {
@@ -2666,11 +2795,11 @@ static void clusterRaftBroadcastAppendEntries(void) {
 }
 
 /* AE_ACK <term> <success> <last-log-index> */
-static void clusterRaftSendAppendEntriesResponse(clusterLink *link, uint64_t term, int success) {
+static void clusterRaftSendAppendEntriesResponse(clusterLink *link, uint64_t term, int success, uint64_t last_index) {
     long long offset = nodeIsReplica(myself) ? replicationGetReplicaOffset() : server.primary_repl_offset;
     sds msg = wireNewMsg("AE_ACK");
     msg = sdscatfmt(msg, " %U %i %U %I", (unsigned long long)term, success,
-                    (unsigned long long)raftLogLastIndex(), (long long)offset);
+                    (unsigned long long)last_index, (long long)offset);
     msg = wireFinishMsg(msg);
     clusterRaftSendMsg(link, msg);
 }
@@ -2699,7 +2828,7 @@ static int clusterRaftProcessAppendEntries(clusterLink *link, int argc, sds *arg
     int entry_count = atoi(argv[6]);
 
     if (msg_term < rs->current_term) {
-        clusterRaftSendAppendEntriesResponse(link, rs->current_term, 0);
+        clusterRaftSendAppendEntriesResponse(link, rs->current_term, 0, raftLogLastIndex());
         return 1;
     }
 
@@ -2714,12 +2843,15 @@ static int clusterRaftProcessAppendEntries(clusterLink *link, int argc, sds *arg
      * term >= 1, so 0 means we don't know the entry and never matches. */
     uint64_t local_prev_term = raftLogTermAt(prev_log_index);
     if (prev_log_index > 0 && (local_prev_term == 0 || local_prev_term != prev_log_term)) {
-        clusterRaftSendAppendEntriesResponse(link, rs->current_term, 0);
+        clusterRaftSendAppendEntriesResponse(link, rs->current_term, 0, raftLogLastIndex());
         return 1;
     }
 
-    /* Append new entries, handling conflicts. */
+    /* Append new entries, handling conflicts. Never truncate on a matching
+     * prefix (delayed shorter AE, Raft §5.3). */
     uint64_t new_index = prev_log_index + 1;
+    uint64_t last_matched = prev_log_index;
+    bool truncated = false;
     for (int i = 0; i < entry_count && i < entry_line_count; i++, new_index++) {
         int eargc;
         sds *eargv = sdssplitlen(entry_lines[i], sdslen(entry_lines[i]), " ", 1, &eargc);
@@ -2741,10 +2873,12 @@ static int clusterRaftProcessAppendEntries(clusterLink *link, int argc, sds *arg
         if (existing && existing->term != e_term) {
             /* Conflict: truncate from here and append. */
             raftLogTruncateFrom(new_index);
+            truncated = true;
             existing = NULL;
         }
         if (existing || new_index <= rs->last_applied) {
             sdsfree(e_data); /* Already have this entry, or applied and trimmed. */
+            last_matched = new_index;
             continue;
         }
         if (new_index != raftLogLastIndex() + 1) {
@@ -2755,12 +2889,16 @@ static int clusterRaftProcessAppendEntries(clusterLink *link, int argc, sds *arg
             break;
         }
         raftLogAppend(raftLogCreate(e_term, new_index, e_type, e_data));
+        last_matched = new_index;
     }
 
-    /* Update commit index and apply. */
+    /* Update commit index and apply (Raft Figure 2, Rule 5: clamp to
+     * last_matched so a delayed shorter AE never commits an unverified tail). */
     if (leader_commit > rs->commit_index) {
-        rs->commit_index = leader_commit;
-        if (rs->commit_index > raftLogLastIndex()) rs->commit_index = raftLogLastIndex();
+        uint64_t new_commit = leader_commit;
+        if (new_commit > last_matched) new_commit = last_matched;
+        if (new_commit > raftLogLastIndex()) new_commit = raftLogLastIndex();
+        if (new_commit > rs->commit_index) rs->commit_index = new_commit;
     }
     raftApplyCommitted();
 
@@ -2772,6 +2910,9 @@ static int clusterRaftProcessAppendEntries(clusterLink *link, int argc, sds *arg
 
     /* Defer AE_ACK until after persistence in beforeSleep. This ensures
      * entries are on stable storage before the leader counts our ACK. */
+    if (!rs->todo_send_ae_ack || truncated || last_matched > rs->ae_ack_index) {
+        rs->ae_ack_index = last_matched;
+    }
     rs->todo_send_ae_ack = 1;
     return 1;
 }
@@ -2819,10 +2960,11 @@ static int clusterRaftProcessAppendEntriesResponse(clusterLink *link, int argc, 
     }
 
     if (success) {
-        /* Follower accepted — update matchIndex/nextIndex. */
-        rd->match_index = follower_last_index;
-        if (!rd->replicating || rd->next_index < follower_last_index + 1)
-            rd->next_index = follower_last_index + 1;
+        /* Follower accepted — update matchIndex/nextIndex monotonically. */
+        if (follower_last_index > rd->match_index)
+            rd->match_index = follower_last_index;
+        if (!rd->replicating || rd->next_index < rd->match_index + 1)
+            rd->next_index = rd->match_index + 1;
         rd->replicating = 1;
         /* Installed: a newer snapshot needn't wait for the resend timeout. */
         if (follower_last_index >= rd->last_snapshot_index) rd->last_snapshot_time = 0;
@@ -2831,27 +2973,32 @@ static int clusterRaftProcessAppendEntriesResponse(clusterLink *link, int argc, 
             clusterRaftMaybeSendTimeoutNow();
         }
 
-        /* Check if we can advance commitIndex (Raft paper §5.3/§5.4). */
-        for (uint64_t i = rs->log_count; i > 0; i--) {
-            uint64_t idx = rs->log[i - 1]->index;
-            if (idx <= rs->commit_index) break;
-            if (rs->log[i - 1]->term != rs->current_term) continue;
+        /* Check if we can advance commitIndex (Raft paper §5.3/§5.4), counting
+         * only members of the effective voter set V(S_p). A leader removed from
+         * V(S_p) does not count itself. */
+        int voter_count = raftProjVoterCount();
+        int quorum = raftProjQuorum();
+        if (voter_count > 0) {
+            for (uint64_t i = rs->log_count; i > 0; i--) {
+                uint64_t idx = rs->log[i - 1]->index;
+                if (idx <= rs->commit_index) break;
+                if (rs->log[i - 1]->term != rs->current_term) continue;
 
-            int matches = 1; /* Myself, the leader, always a voter */
-            dictIterator *di = dictGetSafeIterator(server.cluster->nodes);
-            dictEntry *de;
-            while ((de = dictNext(di)) != NULL) {
-                clusterNode *peer = dictGetVal(de);
-                if (peer == myself) continue;
-                if (!nodeIsVoter(peer)) continue;
-                if (RAFT_NODE(peer)->match_index >= idx) matches++;
-            }
-            dictReleaseIterator(di);
+                int matches = raftProjIsVoter(myself->name) ? 1 : 0;
+                dictIterator *di = dictGetSafeIterator(server.cluster->nodes);
+                dictEntry *de;
+                while ((de = dictNext(di)) != NULL) {
+                    clusterNode *peer = dictGetVal(de);
+                    if (peer == myself) continue;
+                    if (!raftProjIsVoter(peer->name)) continue;
+                    if (RAFT_NODE(peer)->match_index >= idx) matches++;
+                }
+                dictReleaseIterator(di);
 
-            int quorum = clusterRaftQuorum();
-            if (matches >= quorum) {
-                rs->commit_index = idx;
-                break;
+                if (matches >= quorum) {
+                    rs->commit_index = idx;
+                    break;
+                }
             }
         }
 
@@ -2929,6 +3076,7 @@ static int clusterRaftProcessInstallSnapshot(clusterLink *link, int argc, sds *a
 
     /* If we're already past the snapshot, ignore. */
     if (snap_index <= rs->last_applied) {
+        rs->ae_ack_index = raftLogLastIndex();
         rs->todo_send_ae_ack = 1;
         return 1;
     }
@@ -2939,6 +3087,7 @@ static int clusterRaftProcessInstallSnapshot(clusterLink *link, int argc, sds *a
     if (raftLogTermAt(snap_index) == snap_term) {
         if (snap_index > rs->commit_index) rs->commit_index = snap_index;
         raftApplyCommitted();
+        rs->ae_ack_index = raftLogLastIndex();
         rs->todo_send_ae_ack = 1;
         return 1;
     }
@@ -2964,14 +3113,14 @@ static int clusterRaftProcessInstallSnapshot(clusterLink *link, int argc, sds *a
             serverLog(LL_WARNING, "Rejecting INSTALL_SNAPSHOT from %.40s: invalid node line: %s",
                       argv[1], config_lines[i]);
             dictRelease(seen);
-            clusterRaftSendAppendEntriesResponse(link, rs->current_term, 0);
+            clusterRaftSendAppendEntriesResponse(link, rs->current_term, 0, raftLogLastIndex());
             return 1;
         }
     }
     if (!sender_included) {
         serverLog(LL_WARNING, "Rejecting INSTALL_SNAPSHOT from %.40s: the sender isn't included", argv[1]);
         dictRelease(seen);
-        clusterRaftSendAppendEntriesResponse(link, rs->current_term, 0);
+        clusterRaftSendAppendEntriesResponse(link, rs->current_term, 0, raftLogLastIndex());
         return 1;
     }
 
@@ -3101,9 +3250,10 @@ static int clusterRaftProcessInstallSnapshot(clusterLink *link, int argc, sds *a
     serverLog(LL_NOTICE, "Installed snapshot from %.40s (index=%llu, term=%llu).",
               argv[1], (unsigned long long)snap_index, (unsigned long long)snap_term);
 
-    /* Recompute cluster size (number of applied voters) and rebuild S_p. */
+    /* Recompute cluster size (number of applied voters), rebuild S_p, and sync role. */
     clusterRaftSyncAppliedSize();
     raftProjRebuild();
+    clusterRaftSyncRoleWithProj();
 
     rs->todo_save_config = 1;
     rs->todo_connect_nodes = 1;
@@ -3111,6 +3261,7 @@ static int clusterRaftProcessInstallSnapshot(clusterLink *link, int argc, sds *a
         rs->todo_full_sync = 1;
         myself->repl_offset = 0; /* As when applying SET_REPLICA_OF. */
     }
+    rs->ae_ack_index = snap_index;
     rs->todo_send_ae_ack = 1;
     rs->todo_update_replication = 1;
     rs->todo_update_slot_coverage = 1;
@@ -3164,9 +3315,19 @@ static void clusterRaftSendPreVoteResponse(clusterLink *link, uint64_t term, int
     clusterRaftSendMsg(link, msg);
 }
 
+static int raftRecordVote(dict *set, const char *node_id) {
+    sds key = sdsnewlen(node_id, CLUSTER_NAMELEN);
+    if (dictFind(set, key) == NULL) {
+        dictAdd(set, key, NULL);
+    } else {
+        sdsfree(key);
+    }
+    return (int)dictSize(set);
+}
+
 static int clusterRaftCanGrantVote(clusterRaftState *rs, uint64_t candidate_last_index, uint64_t candidate_last_term) {
     if (rs->role == RAFT_ROLE_JOINER) return 0;
-    if (nodeIsLearner(myself)) return 0;
+    if (!raftProjIsVoter(myself->name)) return 0;
 
     /* Deny vote if we recently heard from the leader (leader lease).
      * Use the base node-timeout, not the randomized election timeout —
@@ -3198,11 +3359,8 @@ static int clusterRaftProcessPreVoteRequest(clusterLink *link, int argc, sds *ar
     uint64_t candidate_last_term = strtoull(argv[4], NULL, 10);
     int granted = 0;
 
-    clusterNode *candidate = clusterLookupNode(argv[1], CLUSTER_NAMELEN);
-    if (candidate && nodeIsLearner(candidate)) {
-        granted = 0;
-    } else if (msg_term > rs->current_term &&
-               clusterRaftCanGrantVote(rs, candidate_last_index, candidate_last_term)) {
+    if (msg_term > rs->current_term &&
+        clusterRaftCanGrantVote(rs, candidate_last_index, candidate_last_term)) {
         granted = 1;
     }
 
@@ -3228,10 +3386,10 @@ static int clusterRaftProcessPreVoteResponse(clusterLink *link, int argc, sds *a
     if (rs->role != RAFT_ROLE_PRE_CANDIDATE) return 1;
     if (msg_term != rs->current_term + 1) return 1;
 
-    if (granted && link->node && nodeIsVoter(link->node)) {
-        rs->pre_votes_received++;
-        int quorum = clusterRaftQuorum();
-        if (rs->pre_votes_received >= quorum) {
+    if (granted && link->node && raftProjIsVoter(link->node->name)) {
+        rs->pre_votes_received = raftRecordVote(rs->pre_votes_granted, link->node->name);
+        int quorum = raftProjQuorum();
+        if (raftProjVoterCount() > 0 && rs->pre_votes_received >= quorum) {
             clusterRaftStartElection();
         }
     }
@@ -3253,18 +3411,13 @@ static int clusterRaftProcessRequestVote(clusterLink *link, int argc, sds *argv)
 
     if (msg_term < rs->current_term) {
         /* Stale term. */
-    } else {
-        clusterNode *candidate = clusterLookupNode(argv[1], CLUSTER_NAMELEN);
-        if (candidate && nodeIsLearner(candidate)) {
-            /* Learners are replicated to but cannot become Raft leaders. */
-        } else if ((clusterRaftIsVotedForNone() || memcmp(rs->voted_for, argv[1], CLUSTER_NAMELEN) == 0) &&
-                   clusterRaftCanGrantVote(rs, candidate_last_index, candidate_last_term)) {
-            granted = 1;
-            memcpy(rs->voted_for, argv[1], CLUSTER_NAMELEN);
-            rs->last_heartbeat = monotonicMs(); /* Reset election timer */
-            rs->todo_save_config = 1;
-            serverLog(LL_NOTICE, "Voted for %.40s in term %llu.", argv[1], (unsigned long long)msg_term);
-        }
+    } else if ((clusterRaftIsVotedForNone() || memcmp(rs->voted_for, argv[1], CLUSTER_NAMELEN) == 0) &&
+               clusterRaftCanGrantVote(rs, candidate_last_index, candidate_last_term)) {
+        granted = 1;
+        memcpy(rs->voted_for, argv[1], CLUSTER_NAMELEN);
+        rs->last_heartbeat = monotonicMs(); /* Reset election timer */
+        rs->todo_save_config = 1;
+        serverLog(LL_NOTICE, "Voted for %.40s in term %llu.", argv[1], (unsigned long long)msg_term);
     }
 
     if (granted) {
@@ -3290,8 +3443,6 @@ static void clusterRaftBecomeLeader(void) {
     if (listLength(rs->pending_proposals) > 0)
         rs->todo_retry_proposals = 1;
 
-    if (server.cluster->size <= 1) return;
-
     /* Initialize nextIndex for each peer (Raft paper §5.3). */
     uint64_t last = raftLogLastIndex();
     dictIterator *di = dictGetSafeIterator(server.cluster->nodes);
@@ -3313,12 +3464,14 @@ static void clusterRaftBecomeLeader(void) {
         }
     }
     dictReleaseIterator(di);
-    /* Append a no-op entry to commit prior-term entries (§5.4.2)
-     * and establish the new term in the log. */
+    /* Always append a no-op entry to commit prior-term entries (§5.4.2) and
+     * establish the new term in the log (required before any voter change). */
     uint64_t noop_idx = raftLogLastIndex() + 1;
     raftLogAppend(raftLogCreate(rs->current_term, noop_idx, RAFT_ENTRY_NOOP, sdsempty()));
     /* Immediate heartbeat to assert leadership. */
-    clusterRaftBroadcastAppendEntries();
+    if (clusterRaftHasPeerMembers()) {
+        clusterRaftBroadcastAppendEntries();
+    }
 }
 
 static int clusterRaftProcessRequestVoteResponse(clusterLink *link, int argc, sds *argv) {
@@ -3334,10 +3487,10 @@ static int clusterRaftProcessRequestVoteResponse(clusterLink *link, int argc, sd
     if (rs->role != RAFT_ROLE_CANDIDATE) return 1;
     if (msg_term != rs->current_term) return 1;
 
-    if (granted && link->node && nodeIsVoter(link->node)) {
-        rs->votes_received++;
-        int quorum = clusterRaftQuorum();
-        if (rs->votes_received >= quorum) {
+    if (granted && link->node && raftProjIsVoter(link->node->name)) {
+        rs->votes_received = raftRecordVote(rs->votes_granted, link->node->name);
+        int quorum = raftProjQuorum();
+        if (raftProjVoterCount() > 0 && rs->votes_received >= quorum) {
             clusterRaftBecomeLeader();
         }
     }
@@ -3346,9 +3499,10 @@ static int clusterRaftProcessRequestVoteResponse(clusterLink *link, int argc, sd
 
 static void clusterRaftStartPreVote(void) {
     clusterRaftState *rs = RAFT_STATE();
-    if (!nodeIsVoter(myself)) return;
+    if (!raftProjIsVoter(myself->name)) return;
     rs->role = RAFT_ROLE_PRE_CANDIDATE;
-    rs->pre_votes_received = 1; /* Self pre-vote */
+    dictEmpty(rs->pre_votes_granted, NULL);
+    rs->pre_votes_received = raftRecordVote(rs->pre_votes_granted, myself->name);
     rs->pre_vote_started = monotonicMs();
     clusterRaftRandomizeElectionTimeout();
 
@@ -3360,24 +3514,25 @@ static void clusterRaftStartPreVote(void) {
     while ((de = dictNext(di)) != NULL) {
         clusterNode *node = dictGetVal(de);
         if (node == myself || !node->link) continue;
-        if (!nodeIsVoter(node)) continue;
+        if (!raftProjIsVoter(node->name)) continue;
         clusterRaftSendPreVoteRequest(node->link, candidate_term);
     }
     dictReleaseIterator(di);
 
-    int quorum = clusterRaftQuorum();
-    if (rs->pre_votes_received >= quorum) {
+    int quorum = raftProjQuorum();
+    if (raftProjVoterCount() > 0 && rs->pre_votes_received >= quorum) {
         clusterRaftStartElection();
     }
 }
 
 static void clusterRaftStartElection(void) {
     clusterRaftState *rs = RAFT_STATE();
-    if (!nodeIsVoter(myself)) return;
+    if (!raftProjIsVoter(myself->name)) return;
     rs->current_term++;
     rs->role = RAFT_ROLE_CANDIDATE;
     memcpy(rs->voted_for, myself->name, CLUSTER_NAMELEN);
-    rs->votes_received = 1; /* Vote for self */
+    dictEmpty(rs->votes_granted, NULL);
+    rs->votes_received = raftRecordVote(rs->votes_granted, myself->name);
     clusterRaftRandomizeElectionTimeout();
     rs->last_heartbeat = monotonicMs();
     rs->todo_save_config = 1;
@@ -3387,9 +3542,9 @@ static void clusterRaftStartElection(void) {
 
     serverLog(LL_NOTICE, "Starting Raft election (term %llu).", (unsigned long long)rs->current_term);
 
-    /* Single-node: already have quorum. */
-    int quorum = clusterRaftQuorum();
-    if (rs->votes_received >= quorum) {
+    /* Single-voter: already have quorum. */
+    int quorum = raftProjQuorum();
+    if (raftProjVoterCount() > 0 && rs->votes_received >= quorum) {
         clusterRaftBecomeLeader();
     }
 }
@@ -3413,6 +3568,8 @@ static void clusterRaftInit(void) {
     rs->last_repl_offsets_broadcast = monotonicMs();
     rs->todo_update_slot_coverage = 1;
     rs->shard_epochs = dictCreate(&raftShardEpochDictType);
+    rs->votes_granted = dictCreate(&raftShardEpochDictType);
+    rs->pre_votes_granted = dictCreate(&raftShardEpochDictType);
     rs->proj = raftProjCreate();
     server.cluster->size = 0; /* Incremented by NODE_JOIN apply */
 }
@@ -3424,21 +3581,22 @@ static void clusterRaftInitLast(void) {
      * JOINING, to prevent it from committing entries before joining a
      * cluster. Cleared when our own NODE_JOIN is applied (in a multi-node
      * cluster). A singleton that has been in a log, e.g. after the other
-     * nodes were forgotten, keeps its state and elects itself, since the
-     * election timeout only runs when there are other nodes. */
+     * nodes were forgotten, keeps its state and elects itself if it is the
+     * sole voter in V(S_p), since the election timeout only runs when there
+     * are other nodes. */
     clusterRaftState *rs = RAFT_STATE();
-    if (dictSize(server.cluster->nodes) <= 1 && rs->last_applied == 0) {
+    if (dictSize(server.cluster->nodes) <= 1 && rs->last_applied == 0 && rs->log_count == 0) {
         myself->flags |= CLUSTER_NODE_JOINING;
         server.cluster->size = 0;
-    } else if (dictSize(server.cluster->nodes) == 1 && nodeIsVoter(myself)) {
+    } else if (dictSize(server.cluster->nodes) == 1 && raftProjIsSingleVoterMyself()) {
         clusterRaftStartElection();
     }
 
     /* Fresh single-node cluster: become leader immediately. A node that
-     * already applied log entries, such as after NODE_FORGET of ourselves,
-     * is not a fresh singleton and stays a learner. */
+     * already applied log entries or persisted a log tail is not a fresh
+     * singleton. */
     if (dictSize(server.cluster->nodes) == 1 && server.cluster->size == 0 &&
-        rs->last_applied == 0) {
+        rs->last_applied == 0 && rs->log_count == 0) {
         myself->flags &= ~CLUSTER_NODE_LEARNER;
         rs->role = RAFT_ROLE_LEADER;
         if (rs->current_term == 0) rs->current_term = 1;
@@ -3604,10 +3762,21 @@ static void clusterRaftRetryProposals(int include_pending) {
     }
 }
 
-/* myself: RAFT_ROLE_LEARNER <=> CLUSTER_NODE_LEARNER. */
+/* myself: non-leader role tracks effective voter status in V(S_p). */
 static void clusterRaftAssertLearnerRole(void) {
     clusterRaftState *rs = RAFT_STATE();
-    serverAssert((rs->role == RAFT_ROLE_LEARNER) == nodeIsLearner(myself));
+    if (rs->role == RAFT_ROLE_JOINER) return;
+    if (rs->role == RAFT_ROLE_LEADER) {
+        if (raftProjIsVoter(myself->name)) return;
+        if (dictSize(rs->proj->nodes) == 0 && rs->last_applied == 0 && raftLogLastIndex() == 0) return;
+        serverAssert(raftHasUncommittedVoterChange());
+        return;
+    }
+    if (dictSize(rs->proj->nodes) == 0) {
+        if (rs->last_applied > 0) serverAssert(rs->role == RAFT_ROLE_LEARNER);
+        return;
+    }
+    serverAssert((rs->role == RAFT_ROLE_LEARNER) == !raftProjIsVoter(myself->name));
 }
 
 /* Drop JOINING nodes that never got NODE_JOIN and have no live link.
@@ -3678,9 +3847,9 @@ static void clusterRaftCron(void) {
         memcpy(rs->leader, myself->name, CLUSTER_NAMELEN);
     }
 
-    if (dictSize(server.cluster->nodes) > 1) {
+    if (dictSize(server.cluster->nodes) > 1 || dictSize(rs->proj->nodes) > 1) {
         /* Follower/candidate: check election timeout. */
-        if (nodeIsVoter(myself) &&
+        if (raftProjIsVoter(myself->name) &&
             (rs->role == RAFT_ROLE_FOLLOWER || rs->role == RAFT_ROLE_CANDIDATE) &&
             now - rs->last_heartbeat > rs->election_timeout) {
             clusterRaftStartPreVote();
@@ -3688,7 +3857,9 @@ static void clusterRaftCron(void) {
 
         if (rs->role == RAFT_ROLE_PRE_CANDIDATE &&
             now - rs->pre_vote_started > rs->election_timeout) {
-            rs->role = RAFT_ROLE_FOLLOWER;
+            dictEmpty(rs->pre_votes_granted, NULL);
+            rs->pre_votes_received = 0;
+            rs->role = raftProjIsVoter(myself->name) ? RAFT_ROLE_FOLLOWER : RAFT_ROLE_LEARNER;
             clusterRaftRandomizeElectionTimeout();
             rs->last_heartbeat = now;
         }
@@ -3881,9 +4052,11 @@ static void clusterRaftBeforeSleep(bool blocked) {
      * writes the entries still in the log. */
     raftLogTrimApplied();
 
-    /* Singleton leader: commit after persistence (quorum = 1). */
-    if (rs->role == RAFT_ROLE_LEADER && server.cluster->size <= 1 &&
-        raftLogLastIndex() > rs->commit_index) {
+    /* Single-voter leader (V(S_p) == {myself}): commit after persistence
+     * (quorum = 1), only when the last entry is from the current term. */
+    if (rs->role == RAFT_ROLE_LEADER && raftProjIsSingleVoterMyself() &&
+        raftLogLastIndex() > rs->commit_index &&
+        raftLogTermAt(raftLogLastIndex()) == rs->current_term) {
         rs->commit_index = raftLogLastIndex();
         raftApplyCommitted();
         /* If we have any peer member (voter or learner), replicate the new commit index. */
@@ -3926,7 +4099,7 @@ static void clusterRaftBeforeSleep(bool blocked) {
         /* AE arrives on the inbound link (leader connects to us). */
         clusterLink *link = leader ? (leader->inbound_link ? leader->inbound_link : leader->link) : NULL;
         if (link) {
-            clusterRaftSendAppendEntriesResponse(link, rs->current_term, 1);
+            clusterRaftSendAppendEntriesResponse(link, rs->current_term, 1, rs->ae_ack_index);
         }
     }
 
@@ -3947,7 +4120,7 @@ static void clusterRaftBeforeSleep(bool blocked) {
         while ((de = dictNext(di)) != NULL) {
             clusterNode *node = dictGetVal(de);
             if (node == myself || !node->link) continue;
-            if (!nodeIsVoter(node)) continue;
+            if (!raftProjIsVoter(node->name)) continue;
             clusterRaftSendRequestVote(node->link);
         }
         dictReleaseIterator(di);
@@ -4014,7 +4187,7 @@ static void clusterRaftBeforeSleep(bool blocked) {
 
 static void clusterRaftPrepareShutdown(void) {
     clusterRaftState *rs = RAFT_STATE();
-    if (rs->role != RAFT_ROLE_LEADER || server.cluster->size <= 1) return;
+    if (rs->role != RAFT_ROLE_LEADER || raftProjVoterCount() == 0 || raftProjIsSingleVoterMyself()) return;
 
     clusterNode *best = clusterRaftSelectTransferTarget();
     if (best) {
@@ -4061,6 +4234,8 @@ static void clusterRaftHandleServerShutdown(void) {
     zfree(rs->log);
     sdsfree(rs->my_last_committed_info);
     dictRelease(rs->shard_epochs);
+    dictRelease(rs->votes_granted);
+    dictRelease(rs->pre_votes_granted);
     raftProjFree(rs->proj);
     zfree(rs);
     server.cluster->protocol_data = NULL;
@@ -4141,7 +4316,7 @@ static int clusterRaftProcessMessage(struct clusterLink *link) {
         /* Leader transfer: immediately start an election. */
         uint64_t term = strtoull(argv[1], NULL, 10);
         clusterRaftState *rs = RAFT_STATE();
-        if (nodeIsVoter(myself) && term >= rs->current_term && rs->role == RAFT_ROLE_FOLLOWER) {
+        if (raftProjIsVoter(myself->name) && term >= rs->current_term && rs->role == RAFT_ROLE_FOLLOWER) {
             serverLog(LL_NOTICE, "Received TIMEOUT_NOW (term %llu), starting election.",
                       (unsigned long long)term);
             clusterRaftStartElection();
@@ -4527,13 +4702,11 @@ static void clusterRaftPostLoad(void) {
     /* Schedule a full rewrite to produce a clean file (removes any
      * incomplete trailing line from a short write). */
     rs->todo_save_config = 1;
-    /* Restore cluster size from loaded nodes and rebuild S_p from S_a + tail. */
+    /* Restore cluster size from loaded nodes, rebuild S_p from S_a + tail,
+     * and sync Raft role with V(S_p). */
     clusterRaftSyncAppliedSize();
     raftProjRebuild();
-    /* Sync Raft role with the persisted LEARNER flag for myself.
-     * Note: global `myself` is not set yet when postLoad runs. */
-    if (server.cluster->myself && nodeIsLearner(server.cluster->myself))
-        rs->role = RAFT_ROLE_LEARNER;
+    clusterRaftSyncRoleWithProj();
     /* If we're a replica, start replication. */
     if (server.cluster->myself &&
         nodeIsReplica(server.cluster->myself) &&
@@ -4786,8 +4959,7 @@ static void clusterRaftSlotChange(slotRange *ranges, int numranges, clusterNode 
 
     /* Singleton with empty log: apply locally without proposing.
      * The entries will be proposed when the first node joins. */
-    if (rs->role == RAFT_ROLE_LEADER && server.cluster->size <= 1 &&
-        raftLogLastIndex() == 0) {
+    if (rs->role == RAFT_ROLE_LEADER && clusterRaftIsSingleton()) {
         for (int i = 0; i < numranges; i++) {
             for (int j = ranges[i].start_slot; j <= ranges[i].end_slot; j++) {
                 if (target) {
@@ -5087,7 +5259,7 @@ static void clusterRaftApplyAddVoter(sds data) {
 
     node->flags &= ~CLUSTER_NODE_LEARNER;
     clusterRaftSyncAppliedSize();
-    if (node == myself && rs->role == RAFT_ROLE_LEARNER) rs->role = RAFT_ROLE_FOLLOWER;
+    if (node == myself) clusterRaftSyncRoleWithProj();
     rs->todo_save_config = 1;
     sdsfreesplitres(argv, argc);
 }
@@ -5112,7 +5284,16 @@ static void clusterRaftApplyDelVoter(sds data) {
 
     node->flags |= CLUSTER_NODE_LEARNER;
     clusterRaftSyncAppliedSize();
-    if (node == myself && rs->role != RAFT_ROLE_LEADER) rs->role = RAFT_ROLE_LEARNER;
+    if (node == myself) {
+        if (rs->role == RAFT_ROLE_LEADER) {
+            /* Broadcast the committed DEL_VOTER before stepping down so
+             * remaining voters observe commit_index immediately. */
+            clusterRaftBroadcastAppendEntries();
+            clusterRaftStepDown(monotonicMs(), "demoted to learner");
+        } else {
+            clusterRaftSyncRoleWithProj();
+        }
+    }
     rs->todo_save_config = 1;
     sdsfreesplitres(argv, argc);
 }
@@ -5259,7 +5440,7 @@ static void clusterRaftForgetNode(const char *node_id, size_t id_len, void *ctx,
     if (id_len == CLUSTER_NAMELEN && memcmp(node_id, rs->leader, CLUSTER_NAMELEN) == 0) {
         clusterNode *leader_node = clusterLookupNode(node_id, id_len);
         /* The leader would need another voter to hand off to. */
-        if (leader_node && !nodeFailed(leader_node) && server.cluster->size <= 1) {
+        if (leader_node && !nodeFailed(leader_node) && raftProjVoterCount() <= 1) {
             if (callback) callback(ctx, "no eligible voting member available for leadership transfer");
             return;
         }
@@ -5461,6 +5642,10 @@ static void clusterRaftResetCluster(int hard) {
     }
     listEmpty(rs->deferred_meets);
     rs->current_term = 0;
+    dictEmpty(rs->votes_granted, NULL);
+    dictEmpty(rs->pre_votes_granted, NULL);
+    rs->votes_received = 0;
+    rs->pre_votes_received = 0;
     memset(rs->leader, 0, CLUSTER_NAMELEN);
     memset(rs->voted_for, 0, CLUSTER_NAMELEN);
     rs->commit_index = 0;
