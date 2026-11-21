@@ -187,7 +187,18 @@ typedef struct {
     mstime_t propose_time; /* Last time it was sent to the leader, for expiry */
     int retries;           /* Remaining epoch-retry attempts */
     int deferred;          /* Waiting for epoch advance before re-propose */
+    int forget_voter;      /* CLUSTER FORGET of a voter: use FORGET_VOTER while target is voter */
 } raftPendingProposal;
+
+/* Chained forget on the leader: forgetting a voter requires DEL_VOTER,
+ * wait for commit, then NODE_FORGET. */
+typedef struct {
+    char node_id[CLUSTER_NAMELEN];
+    uint64_t shard_epoch;
+    uint64_t del_voter_index; /* 0 = waiting for own-term commit / no uncommitted voter change */
+    uint64_t term;            /* Leader term in which this chained forget was queued */
+    char requester[CLUSTER_NAMELEN]; /* Originating follower, or all zeros for local leader client */
+} raftChainedForget;
 
 /* A pending meet tracks a CLUSTER MEET client waiting for the NODE_JOIN
  * to be committed. Matched by target ip:cport. */
@@ -221,6 +232,7 @@ typedef struct {
 
     /* Pending proposals waiting for commit. */
     list *pending_proposals; /* list of raftPendingProposal */
+    list *chained_forgets;   /* Leader: list of raftChainedForget (DEL_VOTER -> NODE_FORGET) */
 
     /* Pending MEET callbacks waiting for NODE_JOIN commit. */
     list *pending_meets;  /* CLUSTER MEET commands waiting for OK reply */
@@ -243,6 +255,7 @@ typedef struct {
     unsigned int todo_send_ae_ack : 1;
     unsigned int todo_send_vote_response : 1;
     unsigned int todo_broadcast_vote_request : 1;
+    unsigned int todo_process_chained_forgets : 1;
     uint64_t persist_log_from;     /* First index to persist in next batch */
     uint64_t last_rewrite_applied; /* last_applied at last full rewrite */
 
@@ -501,6 +514,10 @@ static bool raftEntryIsVoterChange(raftLogEntry *e);
 static bool raftHasUncommittedVoterChange(void);
 static bool raftLeaderCommittedInCurrentTerm(void);
 static void clusterRaftSyncRoleWithProj(void);
+static void clusterRaftClearChainedForgets(void);
+static void clusterRaftProcessChainedForgets(void);
+static RaftProposalResult clusterRaftValidateForgetVoterPreconditions(const char *node_id, uint64_t epoch);
+static void clusterRaftQueueChainedForget(const char *node_id, uint64_t epoch, const char *requester);
 
 static void clusterRaftRandomizeElectionTimeout(void) {
     mstime_t base = server.cluster_node_timeout;
@@ -566,6 +583,7 @@ static void clusterRaftStepDown(mstime_t now, const char *reason) {
     dictEmpty(rs->pre_votes_granted, NULL);
     rs->votes_received = 0;
     rs->pre_votes_received = 0;
+    clusterRaftClearChainedForgets();
     memset(rs->voted_for, 0, CLUSTER_NAMELEN);
     memset(rs->leader, 0, CLUSTER_NAMELEN);
     clusterRaftRandomizeElectionTimeout();
@@ -611,6 +629,7 @@ static void clusterRaftSingletonStepDown(void) {
     dictEmpty(rs->pre_votes_granted, NULL);
     rs->votes_received = 0;
     rs->pre_votes_received = 0;
+    clusterRaftClearChainedForgets();
     memset(rs->leader, 0, CLUSTER_NAMELEN);
     memset(rs->voted_for, 0, CLUSTER_NAMELEN);
     clusterRaftRandomizeElectionTimeout();
@@ -1037,6 +1056,7 @@ static void clusterRaftPropose(sds entry, void *ctx, void (*callback)(void *ctx,
         pp->ctime = monotonicMs();
         pp->propose_time = pp->ctime;
         pp->deferred = 0;
+        pp->forget_voter = 0;
         /* Entry types carrying shard epochs get automatic retry. */
         switch (type) {
         case RAFT_ENTRY_FAILOVER:
@@ -1835,9 +1855,25 @@ static RaftProposalResult raftValidateEntryOnState(raftProjState *p, uint8_t typ
     case RAFT_ENTRY_NODE_JOIN: {
         argv = sdssplitlen(data, sdslen(data), " ", 1, &argc);
         if (!argv || argc < 3 || sdslen(argv[0]) != CLUSTER_NAMELEN) goto reject;
-        if (strcasecmp(argv[2], "learner") != 0 && strcasecmp(argv[2], "voter") != 0) goto reject;
+        bool is_voter;
+        if (!strcasecmp(argv[2], "learner")) {
+            is_voter = false;
+        } else if (!strcasecmp(argv[2], "voter")) {
+            is_voter = true;
+        } else {
+            goto reject;
+        }
         if (!raftParseAddressForValidation(argv[1], NULL, NULL)) goto reject;
         if (raftProjLookupNode(p, argv[0], CLUSTER_NAMELEN) != NULL) goto reject;
+        if (is_voter) {
+            /* NODE_JOIN ... voter is only allowed as the empty-log bootstrap
+             * self-join of a singleton; every other node joins as a learner. */
+            if (dictSize(p->nodes) != 0) goto reject;
+            if (leader_append_checks &&
+                (raftLogLastIndex() != 0 || memcmp(argv[0], myself->name, CLUSTER_NAMELEN) != 0)) {
+                goto reject;
+            }
+        }
         break;
     }
     case RAFT_ENTRY_SLOT_CHANGE: {
@@ -1956,6 +1992,10 @@ static RaftProposalResult raftValidateEntryOnState(raftProjState *p, uint8_t typ
         raftProjNode *node = raftProjLookupNode(p, argv[0], CLUSTER_NAMELEN);
         if (!node) goto reject;
 
+        /* NODE_FORGET may only target a learner. Forgetting a voter requires
+         * DEL_VOTER first (chained by the leader for CLUSTER FORGET). */
+        if (!node->is_learner) goto reject;
+
         uint64_t epoch = 0;
         if (!raftParseUint64(argv[1], sdslen(argv[1]), &epoch)) goto reject;
         if (!raftProjValidateShardEpoch(p, node->shard_id, epoch)) {
@@ -1969,8 +2009,7 @@ static RaftProposalResult raftValidateEntryOnState(raftProjState *p, uint8_t typ
         }
 
         if (leader_append_checks && memcmp(node->name, myself->name, CLUSTER_NAMELEN) == 0) {
-            result = RAFT_RESULT_LEADER_TRANSFER;
-            goto done;
+            goto reject;
         }
         break;
     }
@@ -2130,6 +2169,216 @@ static int clusterRaftProcessPropose(clusterLink *link, int argc, sds *argv) {
     }
 
     sdsfree(entry);
+    return 1;
+}
+
+static void clusterRaftClearChainedForgets(void) {
+    clusterRaftState *rs = RAFT_STATE();
+    if (!rs || !rs->chained_forgets) return;
+    listIter li;
+    listNode *ln;
+    listRewind(rs->chained_forgets, &li);
+    while ((ln = listNext(&li)) != NULL) {
+        zfree(listNodeValue(ln));
+        listDelNode(rs->chained_forgets, ln);
+    }
+    rs->todo_process_chained_forgets = 0;
+}
+
+static RaftProposalResult clusterRaftValidateForgetVoterPreconditions(const char *node_id, uint64_t epoch) {
+    clusterRaftState *rs = RAFT_STATE();
+    raftProjNode *pn = raftProjLookupNode(rs->proj, node_id, CLUSTER_NAMELEN);
+    if (!pn) return RAFT_RESULT_REJECTED;
+    if (!raftProjValidateShardEpoch(rs->proj, pn->shard_id, epoch)) return RAFT_RESULT_STALE_EPOCH;
+    if (pn->replicaof[0] == '\0' && (pn->num_replicas > 0 || pn->numslots > 0)) {
+        serverLog(LL_WARNING, "NODE_FORGET rejected: can't forget a primary with replicas or assigned slots.");
+        return RAFT_RESULT_REJECTED;
+    }
+    if (!pn->is_learner && rs->proj->voter_count <= 1) return RAFT_RESULT_REJECTED;
+    return RAFT_RESULT_OK;
+}
+
+static void clusterRaftRejectChainedForget(raftChainedForget *cf, RaftProposalResult res) {
+    sds data = sdscatfmt(sdsnewlen(cf->node_id, CLUSTER_NAMELEN), " %U", (unsigned long long)cf->shard_epoch);
+    if (cf->requester[0] != '\0') {
+        clusterNode *req = clusterLookupNode(cf->requester, CLUSTER_NAMELEN);
+        clusterLink *link = req ? (req->inbound_link ? req->inbound_link : req->link) : NULL;
+        if (link) {
+            sds msg = wireNewMsg("REJECT");
+            msg = sdscatfmt(msg, " %s NODE_FORGET %S", raftProposalResultWireReason(res), data);
+            msg = wireFinishMsg(msg);
+            clusterRaftSendMsg(link, msg);
+        }
+    } else {
+        clusterRaftCompletePendingProposal(RAFT_ENTRY_NODE_FORGET, data, res);
+    }
+    sdsfree(data);
+}
+
+static void clusterRaftQueueChainedForget(const char *node_id, uint64_t epoch, const char *requester) {
+    clusterRaftState *rs = RAFT_STATE();
+    /* Avoid duplicate queued chained forgets for the same target. */
+    listIter li;
+    listNode *ln;
+    listRewind(rs->chained_forgets, &li);
+    while ((ln = listNext(&li)) != NULL) {
+        raftChainedForget *existing = listNodeValue(ln);
+        if (memcmp(existing->node_id, node_id, CLUSTER_NAMELEN) == 0 && existing->term == rs->current_term) {
+            return;
+        }
+    }
+    raftChainedForget *cf = zcalloc(sizeof(*cf));
+    memcpy(cf->node_id, node_id, CLUSTER_NAMELEN);
+    cf->shard_epoch = epoch;
+    cf->del_voter_index = 0;
+    cf->term = rs->current_term;
+    if (requester) memcpy(cf->requester, requester, CLUSTER_NAMELEN);
+    listAddNodeTail(rs->chained_forgets, cf);
+}
+
+/* Advance leader-chained voter forgets:
+ * Phase 1 (del_voter_index == 0): once leader committed in current term and no
+ *   voter change is uncommitted, append DEL_VOTER <target>.
+ * Phase 2 (del_voter_index > 0): once DEL_VOTER is committed & applied, append
+ *   NODE_FORGET <target> <epoch>. */
+static void clusterRaftProcessChainedForgets(void) {
+    clusterRaftState *rs = RAFT_STATE();
+    if (rs->role != RAFT_ROLE_LEADER || clusterRaftTransferSent()) return;
+    if (listLength(rs->chained_forgets) == 0) return;
+
+    listIter li;
+    listNode *ln;
+    listRewind(rs->chained_forgets, &li);
+    while ((ln = listNext(&li)) != NULL) {
+        raftChainedForget *cf = listNodeValue(ln);
+        if (cf->term != rs->current_term) {
+            zfree(cf);
+            listDelNode(rs->chained_forgets, ln);
+            continue;
+        }
+
+        raftProjNode *pn = raftProjLookupNode(rs->proj, cf->node_id, CLUSTER_NAMELEN);
+        if (!pn) {
+            zfree(cf);
+            listDelNode(rs->chained_forgets, ln);
+            continue;
+        }
+
+        if (cf->del_voter_index == 0 && !pn->is_learner) {
+            /* Wait until we can legally append a voter change. */
+            if (raftHasUncommittedVoterChange() || !raftLeaderCommittedInCurrentTerm()) {
+                continue;
+            }
+            RaftProposalResult pre = clusterRaftValidateForgetVoterPreconditions(cf->node_id, cf->shard_epoch);
+            if (pre != RAFT_RESULT_OK) {
+                clusterRaftRejectChainedForget(cf, pre);
+                zfree(cf);
+                listDelNode(rs->chained_forgets, ln);
+                continue;
+            }
+            sds id_data = sdsnewlen(cf->node_id, CLUSTER_NAMELEN);
+            pre = clusterRaftPreValidate(RAFT_ENTRY_DEL_VOTER, id_data);
+            if (pre != RAFT_RESULT_OK) {
+                sdsfree(id_data);
+                clusterRaftRejectChainedForget(cf, pre);
+                zfree(cf);
+                listDelNode(rs->chained_forgets, ln);
+                continue;
+            }
+            uint64_t idx = raftLogLastIndex() + 1;
+            raftLogAppend(raftLogCreate(rs->current_term, idx, RAFT_ENTRY_DEL_VOTER, id_data));
+            cf->del_voter_index = idx;
+            serverLog(LL_NOTICE, "Leader appended chained DEL_VOTER for %.40s (index %llu).",
+                      cf->node_id, (unsigned long long)idx);
+            if (clusterRaftHasPeerMembers()) rs->todo_broadcast_ae = 1;
+            continue;
+        }
+
+        if (cf->del_voter_index > 0 && rs->last_applied < cf->del_voter_index) {
+            /* Still waiting for DEL_VOTER to commit and apply. */
+            continue;
+        }
+
+        /* Target is now a learner (DEL_VOTER committed); append NODE_FORGET. */
+        sds forget_data = sdscatfmt(sdsnewlen(cf->node_id, CLUSTER_NAMELEN), " %U",
+                                    (unsigned long long)cf->shard_epoch);
+        RaftProposalResult res = clusterRaftPreValidate(RAFT_ENTRY_NODE_FORGET, forget_data);
+        if (res != RAFT_RESULT_OK) {
+            sdsfree(forget_data);
+            clusterRaftRejectChainedForget(cf, res);
+        } else {
+            uint64_t idx = raftLogLastIndex() + 1;
+            raftLogAppend(raftLogCreate(rs->current_term, idx, RAFT_ENTRY_NODE_FORGET, forget_data));
+            serverLog(LL_NOTICE, "Leader appended chained NODE_FORGET for %.40s (index %llu).",
+                      cf->node_id, (unsigned long long)idx);
+            if (clusterRaftHasPeerMembers()) rs->todo_broadcast_ae = 1;
+        }
+        zfree(cf);
+        listDelNode(rs->chained_forgets, ln);
+    }
+}
+
+/* FORGET_VOTER <node-id> <shard-epoch>
+ * Sent by a follower/learner executing CLUSTER FORGET on a voter. The leader
+ * chains DEL_VOTER -> wait for commit -> NODE_FORGET (or initiates a leader
+ * transfer first if the target is the leader itself). Raw PROPOSE NODE_FORGET
+ * targeting a voter is still rejected directly. */
+static int clusterRaftProcessForgetVoter(clusterLink *link, int argc, sds *argv) {
+    clusterRaftState *rs = RAFT_STATE();
+    if (argc != 3 || sdslen(argv[1]) != CLUSTER_NAMELEN) return 1;
+    if (rs->role != RAFT_ROLE_LEADER) return 1;
+    if (clusterRaftTransferSent()) return 1;
+
+    uint64_t epoch = 0;
+    if (!raftParseUint64(argv[2], sdslen(argv[2]), &epoch)) return 1;
+
+    sds data = sdscatfmt(sdsnewlen(argv[1], CLUSTER_NAMELEN), " %U", (unsigned long long)epoch);
+    raftProjNode *pn = raftProjLookupNode(rs->proj, argv[1], CLUSTER_NAMELEN);
+
+    /* If already a learner in S_p, handle as a direct NODE_FORGET. */
+    if (pn && pn->is_learner) {
+        RaftProposalResult pre = clusterRaftPreValidate(RAFT_ENTRY_NODE_FORGET, data);
+        if (pre != RAFT_RESULT_OK) {
+            if (link) {
+                sds msg = wireNewMsg("REJECT");
+                msg = sdscatfmt(msg, " %s NODE_FORGET %S", raftProposalResultWireReason(pre), data);
+                msg = wireFinishMsg(msg);
+                clusterRaftSendMsg(link, msg);
+            }
+            sdsfree(data);
+            return 1;
+        }
+        uint64_t idx = raftLogLastIndex() + 1;
+        raftLogAppend(raftLogCreate(rs->current_term, idx, RAFT_ENTRY_NODE_FORGET, data));
+        serverLog(LL_NOTICE, "Leader appended NODE_FORGET for %.40s (index %llu).",
+                  argv[1], (unsigned long long)idx);
+        if (clusterRaftHasPeerMembers()) rs->todo_broadcast_ae = 1;
+        return 1;
+    }
+
+    RaftProposalResult pre = clusterRaftValidateForgetVoterPreconditions(argv[1], epoch);
+    if (pre == RAFT_RESULT_OK && memcmp(argv[1], myself->name, CLUSTER_NAMELEN) == 0) {
+        if (!clusterRaftRequestLeaderTransfer()) {
+            serverLog(LL_NOTICE, "Rejecting FORGET_VOTER for myself: no eligible voter for leadership transfer.");
+            pre = RAFT_RESULT_REJECTED;
+        } else {
+            pre = RAFT_RESULT_LEADER_TRANSFER;
+        }
+    }
+    if (pre != RAFT_RESULT_OK) {
+        if (link) {
+            sds msg = wireNewMsg("REJECT");
+            msg = sdscatfmt(msg, " %s NODE_FORGET %S", raftProposalResultWireReason(pre), data);
+            msg = wireFinishMsg(msg);
+            clusterRaftSendMsg(link, msg);
+        }
+        sdsfree(data);
+        return 1;
+    }
+
+    clusterRaftQueueChainedForget(argv[1], epoch, link && link->node ? link->node->name : NULL);
+    clusterRaftProcessChainedForgets();
+    sdsfree(data);
     return 1;
 }
 
@@ -2691,6 +2940,9 @@ static void raftApplyCommitted(void) {
         raftLogApply(e);
         applied_any = true;
     }
+    if (applied_any && rs->role == RAFT_ROLE_LEADER && listLength(rs->chained_forgets) > 0) {
+        rs->todo_process_chained_forgets = 1;
+    }
     if (applied_any && server.cluster_raft_debug_apply_checks) {
         raftProjVerifyMatchesRebuild();
     }
@@ -3010,6 +3262,10 @@ static int clusterRaftProcessAppendEntriesResponse(clusterLink *link, int argc, 
             if (listLength(link->send_msg_queue) > 0) return 1;
             freeClusterLink(link);
             return 0;
+        }
+        if (rs->todo_process_chained_forgets) {
+            rs->todo_process_chained_forgets = 0;
+            clusterRaftProcessChainedForgets();
         }
         /* If commit advanced, broadcast so followers learn the new commit. */
         if (rs->last_applied > prev_commit) {
@@ -3560,6 +3816,7 @@ static void clusterRaftInit(void) {
     clusterRaftRandomizeElectionTimeout();
     rs->last_heartbeat = monotonicMs();
     rs->pending_proposals = listCreate();
+    rs->chained_forgets = listCreate();
     rs->pending_meets = listCreate();
     rs->deferred_meets = listCreate();
     listSetFreeMethod(rs->deferred_meets, sdsfreeVoid);
@@ -3694,6 +3951,13 @@ static void clusterRaftSendProposal(raftPendingProposal *pp, clusterLink *leader
         serverLog(LL_NOTICE, "Leader appended retried %s (index %llu).",
                   raftEntryTypeName(pp->type), (unsigned long long)idx);
         rs->todo_broadcast_ae = 1;
+    } else if (pp->forget_voter && pp->type == RAFT_ENTRY_NODE_FORGET &&
+               sdslen(pp->data) >= CLUSTER_NAMELEN && raftProjIsVoter(pp->data)) {
+        sds msg = wireNewMsg("FORGET_VOTER");
+        msg = sdscatlen(msg, " ", 1);
+        msg = sdscatlen(msg, pp->data, sdslen(pp->data));
+        msg = wireFinishMsg(msg);
+        clusterRaftSendMsg(leader_link, msg);
     } else {
         sds entry = sdscatfmt(sdsempty(), "%s %S",
                               raftEntryTypeName(pp->type), pp->data);
@@ -3741,6 +4005,37 @@ static void clusterRaftRetryProposals(int include_pending) {
         }
 
         if (rs->role == RAFT_ROLE_LEADER) {
+            if (pp->forget_voter && pp->type == RAFT_ENTRY_NODE_FORGET &&
+                sdslen(pp->data) >= CLUSTER_NAMELEN && raftProjIsVoter(pp->data)) {
+                int fargc;
+                sds *fargv = sdssplitlen(pp->data, sdslen(pp->data), " ", 1, &fargc);
+                uint64_t epoch = 0;
+                RaftProposalResult pre = RAFT_RESULT_REJECTED;
+                if (fargv && fargc == 2 && sdslen(fargv[0]) == CLUSTER_NAMELEN &&
+                    raftParseUint64(fargv[1], sdslen(fargv[1]), &epoch)) {
+                    pre = clusterRaftValidateForgetVoterPreconditions(fargv[0], epoch);
+                }
+                if (fargv) sdsfreesplitres(fargv, fargc);
+                if (pre == RAFT_RESULT_STALE_EPOCH && pp->retries > 0) {
+                    pp->retries--;
+                    pp->deferred = 1;
+                    rs->todo_retry_deferred = 1;
+                    continue;
+                }
+                if (pre != RAFT_RESULT_OK) {
+                    if (pp->callback) pp->callback(pp->ctx, raftProposalResultMsg(pre));
+                    sdsfree(pp->data);
+                    zfree(pp);
+                    listDelNode(rs->pending_proposals, ln);
+                    continue;
+                }
+                if (!clusterRaftTransferSent()) {
+                    pp->propose_time = monotonicMs();
+                    clusterRaftQueueChainedForget(pp->data, epoch, NULL);
+                    clusterRaftProcessChainedForgets();
+                }
+                continue;
+            }
             if (raftEntryInUncommittedTail(pp->type, pp->data)) continue;
             RaftProposalResult pre_result = clusterRaftPreValidate(pp->type, pp->data);
             if (pre_result == RAFT_RESULT_STALE_EPOCH && pp->retries > 0) {
@@ -4063,6 +4358,27 @@ static void clusterRaftBeforeSleep(bool blocked) {
         if (clusterRaftHasPeerMembers()) rs->todo_broadcast_ae = 1;
     }
 
+    if (rs->todo_process_chained_forgets) {
+        rs->todo_process_chained_forgets = 0;
+        clusterRaftProcessChainedForgets();
+        /* If a chained forget appended entries on a single-voter leader,
+         * persist and commit them in this same pass. */
+        if (rs->todo_persist_log) {
+            if (clusterRaftPersistNewLogEntries(rs->persist_log_from) == C_ERR) {
+                clusterSaveConfigOrDie(1);
+                rs->last_rewrite_applied = rs->last_applied;
+            }
+            rs->todo_persist_log = 0;
+        }
+        if (rs->role == RAFT_ROLE_LEADER && raftProjIsSingleVoterMyself() &&
+            raftLogLastIndex() > rs->commit_index &&
+            raftLogTermAt(raftLogLastIndex()) == rs->current_term) {
+            rs->commit_index = raftLogLastIndex();
+            raftApplyCommitted();
+            if (clusterRaftHasPeerMembers()) rs->todo_broadcast_ae = 1;
+        }
+    }
+
     /* Reconfigure replication before acking, so that the ack and the
      * failover ranking below see our offset after a SET_REPLICA_OF, e.g. 0
      * after moving to another shard, not the offset from before it. */
@@ -4217,6 +4533,8 @@ static void clusterRaftHandleServerShutdown(void) {
         zfree(pp);
     }
     listRelease(rs->pending_proposals);
+    clusterRaftClearChainedForgets();
+    listRelease(rs->chained_forgets);
     /* Free pending meets. */
     listRewind(rs->pending_meets, &li);
     while ((ln = listNext(&li)) != NULL) {
@@ -4296,6 +4614,8 @@ static int clusterRaftProcessMessage(struct clusterLink *link) {
         ret = clusterRaftProcessMeetRejected(link, argc, argv);
     } else if (!strcasecmp(argv[0], "PROPOSE")) {
         ret = clusterRaftProcessPropose(link, argc, argv);
+    } else if (!strcasecmp(argv[0], "FORGET_VOTER")) {
+        ret = clusterRaftProcessForgetVoter(link, argc, argv);
     } else if (!strcasecmp(argv[0], "REJECT")) {
         ret = clusterRaftProcessReject(link, argc, argv);
     } else if (!strcasecmp(argv[0], "AE")) {
@@ -5452,11 +5772,63 @@ static void clusterRaftForgetNode(const char *node_id, size_t id_len, void *ctx,
         return;
     }
     uint64_t epoch = clusterGetShardEpoch(node->shard_id);
-    sds entry = sdsnew("NODE_FORGET ");
-    entry = sdscatlen(entry, node_id, CLUSTER_NAMELEN);
-    entry = sdscatfmt(entry, " %U", (unsigned long long)epoch);
-    clusterRaftPropose(entry, ctx, callback);
-    sdsfree(entry);
+
+    /* NODE_FORGET is restricted to learners. If target is currently a voter
+     * in S_p, chain DEL_VOTER -> wait for commit -> NODE_FORGET on the leader. */
+    if (!raftProjIsVoter(node->name)) {
+        sds entry = sdsnew("NODE_FORGET ");
+        entry = sdscatlen(entry, node_id, CLUSTER_NAMELEN);
+        entry = sdscatfmt(entry, " %U", (unsigned long long)epoch);
+        clusterRaftPropose(entry, ctx, callback);
+        sdsfree(entry);
+        return;
+    }
+
+    sds data = sdscatfmt(sdsnewlen(node_id, CLUSTER_NAMELEN), " %U", (unsigned long long)epoch);
+    if (rs->role == RAFT_ROLE_LEADER) {
+        RaftProposalResult pre = clusterRaftValidateForgetVoterPreconditions(node->name, epoch);
+        if (pre != RAFT_RESULT_OK) {
+            if (callback) callback(ctx, raftProposalResultMsg(pre));
+            sdsfree(data);
+            return;
+        }
+    }
+
+    /* Track pending NODE_FORGET completion and retries across leader changes. */
+    raftPendingProposal *pp = zmalloc(sizeof(*pp));
+    pp->type = RAFT_ENTRY_NODE_FORGET;
+    pp->data = sdsdup(data);
+    pp->ctx = ctx;
+    pp->callback = callback;
+    pp->ctime = monotonicMs();
+    pp->propose_time = pp->ctime;
+    pp->retries = PROPOSAL_MAX_RETRIES;
+    pp->deferred = 0;
+    pp->forget_voter = 1;
+    listAddNodeTail(rs->pending_proposals, pp);
+
+    if (rs->role == RAFT_ROLE_LEADER) {
+        if (!clusterRaftTransferSent()) {
+            clusterRaftQueueChainedForget(node->name, epoch, NULL);
+            clusterRaftProcessChainedForgets();
+        }
+        sdsfree(data);
+    } else {
+        clusterNode *leader = clusterLookupNode(rs->leader, CLUSTER_NAMELEN);
+        if (!leader || !leader->link) {
+            rs->todo_retry_proposals = 1;
+            rs->todo_connect_nodes = 1;
+            sdsfree(data);
+            serverLog(LL_NOTICE, "FORGET_VOTER deferred: no outbound link to leader.");
+            return;
+        }
+        sds msg = wireNewMsg("FORGET_VOTER");
+        msg = sdscatlen(msg, " ", 1);
+        msg = sdscatlen(msg, data, sdslen(data));
+        msg = wireFinishMsg(msg);
+        clusterRaftSendMsg(leader->link, msg);
+        sdsfree(data);
+    }
 }
 
 static void clusterRaftSetReplicaOf(clusterNode *primary, void *ctx, void (*callback)(void *ctx, const char *error)) {
@@ -5646,6 +6018,7 @@ static void clusterRaftResetCluster(int hard) {
     dictEmpty(rs->pre_votes_granted, NULL);
     rs->votes_received = 0;
     rs->pre_votes_received = 0;
+    clusterRaftClearChainedForgets();
     memset(rs->leader, 0, CLUSTER_NAMELEN);
     memset(rs->voted_for, 0, CLUSTER_NAMELEN);
     rs->commit_index = 0;
