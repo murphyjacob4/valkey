@@ -74,6 +74,19 @@ PROPOSE <entry>
     Forwards a proposal from a follower to the leader. The entry
     uses the same format as log entries (type followed by data).
 
+FORGET_VOTER <node-id> <shard-epoch>
+    Sent by a follower or learner to the leader for CLUSTER FORGET
+    when the target is currently a voter. The leader chains DEL_VOTER,
+    waits for it to commit, and then appends NODE_FORGET (or transfers
+    leadership first if the target is the leader itself). Raw
+    PROPOSE NODE_FORGET targeting a voter is rejected.
+
+REJECT <reason> <type> <data...>
+    Sent by the leader to a proposing follower when append-time
+    validation rejects a proposal. <reason> is "conflict" (stale
+    shard epoch, retryable), "transfer" (leadership transfer in
+    progress), or "rejected" (terminal error).
+
 FAILOVER_PREPARE
     Sent by a replica to its primary to request a coordinated failover.
     The primary pauses writes and replies with FAILOVER_PAUSED. Not a
@@ -143,21 +156,27 @@ their data formats:
 ```
 NODE_JOIN <node-id> <address> <learner|voter>
     Add a node to the cluster. Applied when a new node is discovered
-    via MEET. New peers join as learners, so this entry does not change
-    quorum. The local singleton self-join uses voter mode.
+    via MEET. The "voter" mode is only allowed as the empty-log
+    bootstrap self-join of a singleton; every other node joins as a
+    learner so subsequent NODE_JOIN entries never change quorum.
 
 ADD_VOTER <node-id>
     Promote a learner to a voting follower after it has caught up with
-    the leader's log. This increments the voting cluster size.
+    the leader's log. This adds the node to the effective voter set on
+    append (and increments the applied voting cluster size on apply).
 
 DEL_VOTER <node-id>
-    Demote a voting follower to learner. The node stays in the cluster
-    and continues receiving AE, but no longer counts for quorum.
+    Demote a voting follower (or the leader itself) to learner. The
+    node stays in the cluster and continues receiving AE, but is
+    removed from the effective voter set on append.
 
 NODE_FORGET <node-id> <shard-epoch>
-    Remove a node from the cluster (CLUSTER FORGET). The epoch refers to
-    leaving node's shard and guards against removing a node whose
-    role changed (e.g., promoted to primary via a concurrent FAILOVER).
+    Remove a learner from the cluster (CLUSTER FORGET). Restricted to
+    learners so NODE_FORGET never changes the voter set; forgetting a
+    voter requires DEL_VOTER first (chained automatically by the
+    leader for CLUSTER FORGET). The epoch refers to the leaving node's
+    shard and guards against removing a node whose role changed (e.g.,
+    promoted to primary via a concurrent FAILOVER).
 
 SLOT_CHANGE <source-node-id-or-dash> <source-epoch> <target-node-id-or-dash> <target-epoch> <range> [<range> ...]
     Assign or remove slot ownership. A dash means "no owner" (delete
@@ -203,76 +222,72 @@ Ranges in SLOT_CHANGE use the same format as nodes.conf: `0-5460` or
 `5461`. A dash as source/target-id means "no owner" (delete slots) or "no
 primary" (promote to primary).
 
-### Why typed entries instead of a key-value store?
+### Two-state model, pure apply, and append-time validation
 
-An alternative design uses a generic key-value metadata store where
-each log entry is a key-value mutation with Compare-And-Swap (CAS)
-conflict detection.
+Cluster Raft maintains two topology states on every node:
 
-We use typed entries instead because each entry type has domain-specific
-apply logic that understands the semantics of the change. This
-eliminates the need for CAS because the apply function acts as the
-gatekeeper for conflicts.
+1. **Applied state (`S_a`)**: the cluster topology after applying
+   `log[1..lastApplied]` (stored in `server.cluster->nodes`, `slots`,
+   `shards`, `size`, and `rs->shard_epochs`, and persisted in the
+   snapshot section of `nodes.conf`).
+2. **Projected state (`S_p`)**: the topology after folding the entire
+   uncommitted log tail onto `S_a`:
+   `S_p = fold(apply, S_a, log[lastApplied+1..lastIndex])`.
+   `S_p` is updated incrementally on log append and rebuilt from
+   `S_a + log[lastApplied+1..lastIndex]` on truncation, snapshot
+   install, startup, self-forget, and cluster reset.
 
-Consider two replicas proposing failover for the same shard:
+**Pure apply:** `apply(S, entry) -> S'` is a total, deterministic
+function of `(S, entry)` only. Apply functions never read node-local
+volatile state (`rs->leader`, role, links, `match_index`, timers, or
+wall clock) and never silently turn committed entries into no-ops.
+Local side effects (reconfiguring replication for `myself`, closing
+links to a forgotten node, stepping down after a committed self-demotion)
+are allowed, but never affect replicated state.
 
-With CAS (key-value model):
-- Both proposals say "set shard primary, assuming current primary is X."
-- The leader must reject the second proposal at proposal time using CAS.
-- Without CAS, both get committed and both get applied, resulting in
-  two primaries.
+**Append-time validation only:** Before appending any entry (whether
+from a local command, a forwarded `PROPOSE`, or a retried proposal after
+leader change), the leader validates it against `S_p` (applied state
+plus the entire uncommitted tail, including entries inherited from older
+terms). Facts not in the log (learner caught up, node failed, link up)
+are checked at append time and, where they matter for the outcome,
+encoded in the entry (e.g., expected shard epochs). Because proposals
+are validated in log order against `S_p`, racing losers are rejected
+before append (`REJECT`) rather than committed as no-ops.
 
-With typed entries:
-- Both FAILOVER entries get committed in order.
-- Apply FAILOVER for replica A: shard has no primary → A becomes primary.
-- Apply FAILOVER for replica B: shard already has primary A → no-op.
-- The apply logic has domain knowledge to detect the conflict.
-
-This is simpler and more flexible:
-- No per-key index/term tracking needed.
-- Conflict resolution is in one place (the apply function).
-- Apply functions are naturally idempotent.
-- New entry types can define their own conflict rules.
-
-The trade-off is that conflicting entries still consume log space even
-when their effect is a no-op. This is acceptable because metadata
-changes are infrequent.
+**Debug-only apply checks:** The hidden `DEBUG_CONFIG` option
+`cluster-raft-debug-apply-checks` (default `no`) re-runs the validation
+predicate against `S_a` right before applying each committed entry and
+verifies after `raftApplyCommitted()` that `S_p` matches a fresh rebuild
+from `S_a` + uncommitted tail and that `server.cluster->size` equals the
+applied voter count. If an invariant fails, the server logs loudly and
+panics; in production (`no`), apply never rejects or skips entries.
 
 ## PROPOSE and Leader Validation
 
-Followers forward proposals to the leader using the PROPOSE message,
-sent on the outbound link to the leader. The leader accepts
-proposals with best effort pre-validations — it appends them to the log and
-replicates them. Authoritative validation happens at apply time, where the apply
-function can detect conflicts and treat them as no-ops.
-
-This design simplifies the leader: it doesn't need to understand the
-semantics of each entry type. The leader is a pure log replication
-engine. The apply function on each node independently resolves
-conflicts using the same deterministic logic, ensuring all nodes
-converge to the same state.
+Followers forward proposals to the leader using the `PROPOSE` message,
+sent on the outbound link to the leader (or `FORGET_VOTER` when
+`CLUSTER FORGET` targets a voter). The leader authoritatively validates
+every proposal against `S_p` before appending it to the log. Invalid or
+stale proposals are rejected immediately with `REJECT <reason> <type> <data...>`
+without consuming log indices.
 
 ### Proposal retry on leader change
 
-A pending proposal stays in the follower's list until the matching
-entry is committed and applied. Sending PROPOSE does not remove it.
-If the leader dies or a new leader is elected, the proposal is
-retried automatically:
+A pending proposal stays in the originator's list until the matching
+entry is committed and applied, or until the leader sends a terminal
+`REJECT`. Sending `PROPOSE` does not remove it. If the leader dies or a
+new leader is elected, the proposal is retried automatically:
 
-- If the follower becomes the new leader, it appends the pending
-  proposals to its own log.
+- If the follower becomes the new leader, it checks whether the entry is
+  already in its uncommitted tail; if not, it re-validates against `S_p`
+  and appends it (or rejects/defers on stale epoch).
 - If another node becomes leader, the follower forwards the pending
-  proposals to the new leader.
+  proposal to the new leader.
 
-This makes proposals resilient to leader changes. Even if a PROPOSE
-was successfully sent but the leader died before committing, the
-proposal is retried. Duplicate proposals are harmless because all
-entry types are idempotent at apply time.
-
-Pending proposals expire after 3× cluster-node-timeout. This covers
-election detection (1–2× node-timeout), the election itself (~1×),
-plus margin. If a proposal expires, the client receives a timeout
-error.
+Pending proposals expire after 3× `cluster-node-timeout` since last
+send (capped at 10× `cluster-node-timeout` overall). If a proposal
+expires, the client receives a timeout error.
 
 ## Link Identification (HELLO/HI)
 
@@ -389,126 +404,70 @@ yet. This prevents a race where AE
 arrives before MEET on the same link, causing the receiver to step
 down prematurely and defer the MEET.
 
-### Membership changes
+### Membership changes (Config-on-append)
 
-Membership and voting rights are separate. `NODE_JOIN` adds a node to
-the replicated topology as a learner; `ADD_VOTER` and `DEL_VOTER`
-change the voting set. `NODE_FORGET` removes either a learner or a
-voter. When the removed node is a voter, the voting size is decremented
-on apply.
+Membership and voting rights are separate. `NODE_JOIN ... learner` adds
+a node to the replicated topology without changing quorum; only
+`ADD_VOTER` and `DEL_VOTER` change the voter set after bootstrap.
+`NODE_JOIN ... voter` is permitted only as the empty-log bootstrap
+self-join of a singleton, and `NODE_FORGET` may only target a learner.
+To forget a voter via `CLUSTER FORGET`, the leader chains `DEL_VOTER`,
+waits for it to commit, and then appends `NODE_FORGET`.
 
-`server.cluster->size` is the number of voters only. Learners remain in
-`server.cluster->nodes` so they can receive AE, apply topology entries,
-own slots, and act as data primaries or replicas, but they are ignored
-for elections, commit quorum, and leader freshness checks.
+| Entry                                | Changes effective voter set |
+|--------------------------------------|-----------------------------|
+| `NODE_JOIN ... learner`              | no                          |
+| `NODE_FORGET` (learner only)         | no                          |
+| `NODE_JOIN ... voter` (bootstrap)    | yes (0 → 1)                 |
+| `ADD_VOTER`                          | yes (+1 voter)              |
+| `DEL_VOTER`                          | yes (-1 voter)              |
 
-New peers join as learners, following Ongaro §4.2.1 and the etcd
-learner design: the leader replicates log entries to the new node
-without increasing the majority required to commit. Once the learner has
-caught up to the leader's log, the leader can append `ADD_VOTER` to
-promote it to a voting follower.
+Because an entry's voter effect is determined by the entry alone,
+non-voting membership changes (`NODE_JOIN ... learner`, `NODE_FORGET`)
+can still be pipelined freely while voter changes follow Ongaro's
+single-server configuration change rules (§4.1):
 
-Not every membership entry is a configuration change. Only entries that
-touch `server.cluster->size` are:
+1. **Effective voter set `V(S_p)` takes effect on append.** Every node
+   uses the voter set of its projected state `S_p` (latest config in the
+   log, committed or not) for:
+   - `PRE_VOTE` and `VOTE` tallying (deduplicated per voter ID; votes
+     count only from members of the counting node's `V(S_p)`),
+   - `PRE_VOTE_REQ` and `VOTE_REQ` targets and vote-granting eligibility,
+   - leader commit counting and leader quorum freshness checks,
+   - leadership transfer target selection, and
+   - the single-voter fast-commit path, which requires `V(S_p) == {myself}`
+     and a current-term entry (never `size <= 1`).
 
-| Entry                                | Changes quorum |
-|--------------------------------------|----------------|
-| `NODE_JOIN ... learner`              | no             |
-| `NODE_FORGET` of a learner           | no             |
-| `NODE_JOIN ... voter` (self-join)    | yes (size++)   |
-| `ADD_VOTER`                          | yes (size++)   |
-| `DEL_VOTER`                          | yes (size--)   |
-| `NODE_FORGET` of a voter             | yes (size--)   |
+   `server.cluster->size` remains the applied voter count derived from
+   `S_a` (for `CLUSTER INFO` / `CLUSTER NODES`).
 
-Adding or removing a learner does not affect quorum, so the safety
-discussion below only applies to the quorum-changing entries.
+2. **At most one uncommitted voter change.** The leader rejects
+   `ADD_VOTER` and `DEL_VOTER` while any voter-changing entry exists in
+   `log[commit_index+1..lastIndex]`.
 
-**Config takes effect on apply, not on append.** Quorum is computed
-from `server.cluster->size`, which is updated when NODE_JOIN is
-applied (after commit). This differs from Ongaro's single-server
-approach (§4.1) where the new configuration takes effect when the
-entry is appended to the log.
+3. **New leader commits own-term entry first (Ongaro 2015).** A newly
+   elected leader always appends a `NOOP` in its own term and rejects
+   `ADD_VOTER` and `DEL_VOTER` until `commit_index > 0` and
+   `termAt(commit_index) == current_term`. This guarantees every prior
+   configuration is committed before a new configuration is appended,
+   preserving quorum intersection across all simultaneously active
+   configurations.
 
-**Implications of config-on-apply:**
+4. **Leader self-demotion.** A leader may append `DEL_VOTER` for itself
+   as long as `|V(S_p)| > 1`. Once appended, `myself` is no longer in
+   `V(S_p)`: the leader keeps replicating without counting its own ack
+   or freshness, broadcasts a commit `AE`, and steps down to `learner`
+   once the `DEL_VOTER` commits and applies.
 
-1. Multiple NODE_JOINs can be in flight simultaneously. The leader
-   does not need to wait for one to commit before proposing the next.
-   This enables fast cluster formation (all nodes invited in one
-   batch).
+5. **Rollback on truncation.** If a follower truncates conflicting
+   uncommitted entries on `AE`, `S_p` is rebuilt from `S_a` plus the
+   remaining tail and the node's non-leader role (`follower` ↔ `learner`)
+   is re-synchronized with `V(S_p)`.
 
-2. NODE_JOIN is committed using the **old** quorum (the cluster size
-   before the new node is added). For example, adding D to {A,B,C}
-   requires 2 ACKs (majority of 3), not 3 ACKs (majority of 4).
-
-3. If a leader election truncates uncommitted NODE_JOINs, no
-   configuration rollback is needed — the config never took effect.
-   Affected nodes time out as joiners and revert to singleton leaders.
-
-4. Joint consensus is not needed. The quorum transitions atomically
-   at apply time in a single step.
-
-**Comparison to config-on-append (Ongaro §4.1):**
-
-With config-on-append, the new quorum is used to commit the
-membership entry itself. This guarantees the new node has the entry
-before it takes effect, eliminating any window of reduced redundancy.
-However, it adds complexity:
-
-- Only one membership change can be in flight at a time (the leader
-  must wait for commit before proposing the next change).
-- If the entry is truncated after append but before commit, nodes
-  must roll back to the previous configuration.
-- The new node must be caught up before the entry is proposed
-  (otherwise it can't ACK in time, stalling the commit).
-
-**Safety of committing with old quorum — known limitation:**
-
-After committing NODE_JOIN(F) to {A,B,C,D,E} with old quorum
-(3 ACKs), the nodes that have the entry operate at size=6
-(quorum=4), while nodes that don't have it still believe size=5
-(quorum=3). This split in quorum views can violate safety:
-
-Example (size 5→6): 3 nodes have the entry (size=6 view). The
-other 3 nodes don't have it (size=5 view, quorum=3). If 2 of the
-3 nodes with the entry crash, the 3 nodes without it can elect a
-leader among themselves (they have quorum=3 under their view). That
-leader overwrites the entry via log truncation. The committed
-NODE_JOIN is lost.
-
-For size 3→4: 2 nodes have the entry (size=4 view). The other 2
-don't (size=3 view, quorum=2). If 1 node with the entry crashes,
-the 2 without can elect a leader (quorum=2 under their view).
-
-The root cause: nodes disagree on cluster size, leading to two
-different quorum calculations coexisting. This is exactly what
-Ongaro's config-on-append prevents — by making all nodes adopt the
-new config immediately on append, they all agree on quorum.
-
-In practice, this requires crashes within the brief window between
-commit and AE delivery. The leader sends AE immediately after
-commit, so the window is one network round-trip. Once AE is
-delivered, all nodes agree on the new size and the split disappears.
-
-**Worst case if this occurs:** The new node is orphaned — it stepped
-down to joiner but its NODE_JOIN was lost. It reverts to singleton
-leader after timeout. The CLUSTER MEET client already returned OK,
-so the admin believes the node joined. No data loss or split brain
-occurs (the node never had slots). The admin can detect the issue
-via CLUSTER NODES and retry CLUSTER MEET.
-
-**Accepted tradeoff:** We accept this limitation because:
-- The window is extremely brief (one AE round-trip after commit).
-- It enables fast cluster formation (multiple NODE_JOINs in flight,
-  no need to catch up the new node before committing).
-- It avoids the complexity of config-on-append or joint consensus.
-- Kafka's KRaft uses the same approach.
-
-**Future fix:** To eliminate this window entirely, use either
-config-on-append (Ongaro §4.1, where the new configuration takes
-effect on append and its quorum is used for commit) or joint
-consensus (§4.3). Both require the new node to receive AE as a
-non-voting member before its NODE_JOIN is committed, adding
-complexity to the leader's replication logic.
+6. **Crash/restart safety.** On startup, `S_p` is rebuilt from the
+   persisted snapshot (`S_a`) plus the persisted log tail, and the node's
+   role is synchronized with `V(S_p)`. Membership safety does not depend
+   on persisting `commit_index` or on apply/persist ordering.
 
 ## Failure Detection
 
@@ -760,11 +719,13 @@ the background fsync completes.
 
 On load:
 
-1. Node lines are parsed → cluster state restored (snapshot).
+1. Node lines are parsed → applied cluster state (`S_a`) restored (snapshot).
 2. Vars line is parsed → `currentTerm`, `votedFor`, `lastApplied` restored.
    `commit_index` is set to `lastApplied`.
 3. Log lines are parsed → entries added to the in-memory log.
-4. If the node is a replica, replication is started.
+4. `S_p` is rebuilt from `S_a` plus the persisted log tail, and the node's
+   Raft role (`follower` vs `learner`) is synchronized with `V(S_p)`.
+5. If the node is a replica, replication is started.
 
 The leader will send AE after reconnection, updating `commit_index`.
 Entries between `lastApplied + 1` and the new `commit_index` are then
@@ -924,18 +885,17 @@ the entry is stale and is ignored.
 
 ### Validation
 
-Epoch validation happens at two points:
+Epoch and topology validation happens authoritatively at **append time on
+the leader** against the projected state `S_p` (applied state plus the
+whole uncommitted tail). If an epoch is stale, the leader rejects the
+proposal immediately with `REJECT conflict <type> <data...>` without
+appending to the log, and the proposing node defers and retries with a
+fresh epoch once its epoch advances.
 
-1. **Pre-validation on the leader** — before appending to the log.
-   This is a best-effort optimization that rejects obviously stale
-   proposals early, saving log space and replication bandwidth. It
-   performs a read-only check without bumping the epoch.
-
-2. **Apply-time validation** — the authoritative check. Each apply
-   function validates the entry's epoch against the current shard
-   epoch. On match (or epoch 0 for a new shard), the epoch is bumped
-   and the entry is applied. On mismatch, the entry is a no-op and
-   the error is propagated to the caller's callback.
+At apply time, entries are applied purely and deterministically without
+rejection. When the hidden debug config `cluster-raft-debug-apply-checks`
+is enabled, apply re-checks the validation predicate against `S_a` and
+panics on any violation.
 
 ### Retry on stale epoch
 
@@ -971,21 +931,23 @@ immediately starts a real election (skipping pre-vote) without waiting
 for the election timeout.
 (See Ongaro dissertation §3.10.)
 
-When `CLUSTER FORGET` targets the leader, the `NODE_FORGET` proposal is
-forwarded to the leader like any other. The leader validates it, starts
-a leadership transfer instead of appending it, and replies `REJECT` with
-the reason `transfer`. Since the target skips pre-vote, the leader only
-sends `TIMEOUT_NOW` once the target's `match_index` has reached the
-leader's last log index. If that doesn't happen within the node timeout,
-the transfer is abandoned and the leader stays leader. After sending
-`TIMEOUT_NOW`, the leader doesn't append new entries until it steps down
-or the transfer times out, so the target's log stays complete for the
-election. The proposing node keeps the proposal pending. It is resent to
-the new leader after the leader change, or to the same leader on
-reconnect, which starts a new transfer. Otherwise it times out.
+When `CLUSTER FORGET` targets the leader (a voter), the follower sends
+`FORGET_VOTER <leader-id> <epoch>` to the leader. The leader validates
+forget preconditions against `S_p`, starts a leadership transfer instead
+of appending, and replies `REJECT transfer NODE_FORGET ...`. Since the
+target skips pre-vote, the leader only sends `TIMEOUT_NOW` once the
+target's `match_index` has reached the leader's last log index. If that
+doesn't happen within the node timeout, the transfer is abandoned and
+the leader stays leader. After sending `TIMEOUT_NOW`, the leader doesn't
+append new entries until it steps down or the transfer times out, so the
+target's log stays complete for the election. The proposing node keeps
+the proposal pending and resends `FORGET_VOTER` to the new leader after
+the leader change; the new leader then chains `DEL_VOTER` (after
+committing its own-term `NOOP`) followed by `NODE_FORGET`. Otherwise it
+times out.
 
-Nodes in handshake, learners and nodes not yet in the raft log are
-excluded as transfer targets.
+Nodes in handshake, non-voters in `V(S_p)`, and nodes not yet in the
+raft log are excluded as transfer targets.
 
 ## Future Work
 
@@ -995,7 +957,6 @@ excluded as transfer targets.
   per-node availability-zone info to add/remove voters so that voters
   are spread across at least 3 zones, letting the cluster survive a
   single zone outage.
-- Safety regarding membership changes (use new quorum).
 - Cluster merging via MEET: when two independently configured clusters
   are joined via CLUSTER MEET, the clusters should merge, either
   atomically or not.

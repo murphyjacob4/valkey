@@ -11,10 +11,16 @@
  * independent of the data primary/replica role.
  *
  * Invariants:
- * - server.cluster->size counts committed voting members. It is initialized
- *   to 0, incremented by NODE_JOIN/ADD_VOTER apply, and decremented by
- *   NODE_FORGET/DEL_VOTER apply when the affected node is a voter. (This is
- *   used for computing the quorum.)
+ * - Two topology states: applied state S_a (after log[1..last_applied]) and
+ *   projected state S_p = fold(apply, S_a, log[last_applied+1..lastIndex]).
+ * - server.cluster->size counts applied voting members (derived from S_a voter
+ *   flags). All Raft consensus decisions (quorum, elections, commit counting,
+ *   freshness, leader transfer, single-voter fast-commit) use V(S_p).
+ * - Pure apply: raftLogApply is a deterministic function of (S_a, entry) only;
+ *   all validation happens at append time against S_p. Apply-time checks are
+ *   kept only as debug assertions behind cluster-raft-debug-apply-checks.
+ * - Only ADD_VOTER and DEL_VOTER change the voter set after bootstrap
+ *   (NODE_JOIN ... voter is bootstrap-only; NODE_FORGET is learner-only).
  * - The first log entry referencing any node is its NODE_JOIN. Other
  *   entry types (SLOT_CHANGE, SET_REPLICA_OF, etc.) are only proposed
  *   after the node's NODE_JOIN is in the log.
@@ -26,8 +32,9 @@
  * - AE, PRE_VOTE_REQ, and VOTE_REQ are never sent to nodes with CLUSTER_NODE_JOINING.
  *   This prevents AE from arriving before MEET on the same link. Learners receive
  *   AE but are excluded from PRE_VOTE_REQ, VOTE_REQ, and quorum accounting.
- * - Configuration (quorum) takes effect on apply, not on append.
- *   This allows multiple NODE_JOINs in flight simultaneously.
+ * - Configuration (voter set V(S_p)) takes effect on append (Ongaro §4.1), with
+ *   at most one uncommitted voter-changing entry and own-term commit before
+ *   proposing voter changes.
  * - A singleton leader keeps its log empty until it proposes its first
  *   real entry (inviting another node). This prevents log conflicts
  *   when two singletons at the same term merge via MEET.
