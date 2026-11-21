@@ -632,7 +632,7 @@ static void clusterHandleReplicaMigration(int max_replicas) {
      *         'migration-barrier' replicas after my migration. */
     if (my_primary == NULL) return;
     for (j = 0; j < my_primary->num_replicas; j++)
-        if (!nodeFailed(my_primary->replicas[j]) && !nodeTimedOut(my_primary->replicas[j])) ok_replicas++;
+        if ((my_primary->replicas[j] == myself || !nodeFailed(my_primary->replicas[j])) && !nodeTimedOut(my_primary->replicas[j])) ok_replicas++;
     if (ok_replicas <= server.cluster_migration_barrier) return;
 
     /* Step 3: Identify a candidate for migration, and check if among the
@@ -655,7 +655,7 @@ static void clusterHandleReplicaMigration(int max_replicas) {
          * used to have replicas or if failed over a primary that had replicas
          * (MIGRATE_TO flag). This way we only migrate to instances that were
          * supposed to have replicas. */
-        if (nodeIsReplica(node) || nodeFailed(node)) is_orphaned = 0;
+        if (nodeIsReplica(node) || (node != myself && nodeFailed(node))) is_orphaned = 0;
         if (!(node->flags & CLUSTER_NODE_MIGRATE_TO)) is_orphaned = 0;
 
         /* Check number of working replicas. */
@@ -3040,7 +3040,7 @@ static void addNodeDetailsToShardReply(client *c, clusterNode *node) {
 
     addReplyBulkCString(c, "health");
     const char *health_msg = NULL;
-    if (nodeFailed(node)) {
+    if (node != myself && nodeFailed(node)) {
         health_msg = "fail";
     } else if (nodeIsReplica(node) && node_offset == 0) {
         health_msg = "loading";

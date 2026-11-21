@@ -566,9 +566,13 @@ sds clusterGenNodeDescription(client *c, clusterNode *node, int tls_primary) {
         }
     }
 
-    /* Flags */
+    /* Flags: nodes.conf / snapshots (c == NULL) persist exact replicated
+     * flags; client-facing CLUSTER NODES hides FAIL on myself since we are
+     * actively answering the client. */
     ci = sdscatlen(ci, " ", 1);
-    ci = representClusterNodeFlags(ci, node->flags);
+    int flags = node->flags;
+    if (c != NULL && node == myself) flags &= ~CLUSTER_NODE_FAIL;
+    ci = representClusterNodeFlags(ci, flags);
 
     /* Replica of... or just "-" */
     ci = sdscatlen(ci, " ", 1);

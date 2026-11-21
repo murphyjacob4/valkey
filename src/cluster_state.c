@@ -464,7 +464,7 @@ int clusterCountNonFailingReplicas(clusterNode *n) {
     int j, ok_replicas = 0;
 
     for (j = 0; j < n->num_replicas; j++)
-        if (!nodeFailed(n->replicas[j])) ok_replicas++;
+        if (n->replicas[j] == myself || !nodeFailed(n->replicas[j])) ok_replicas++;
     return ok_replicas;
 }
 
@@ -731,7 +731,7 @@ bool isAnySlotInManualMigratingState(void) {
 int isNodeAvailable(clusterNode *node) {
     /* We don't consider PFAIL here because it's not a reliable indicator
      * for node available and we don't want clients to use it. */
-    if (clusterNodeIsFailing(node)) {
+    if (node != myself && clusterNodeIsFailing(node)) {
         return 0;
     }
 

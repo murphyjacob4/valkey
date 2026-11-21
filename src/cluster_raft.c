@@ -1818,7 +1818,7 @@ static void raftProjVerifyMatchesRebuild(void) {
             fn->is_learner != pn->is_learner ||
             fn->numslots != pn->numslots ||
             fn->num_replicas != pn->num_replicas ||
-            (memcmp(fn->name, myself->name, CLUSTER_NAMELEN) != 0 && fn->is_failed != pn->is_failed)) {
+            fn->is_failed != pn->is_failed) {
             dictReleaseIterator(di);
             raftProjFree(fresh);
             serverPanic("Raft invariant violation: projected node %.40s diverged from rebuild", fn->name);
@@ -2873,7 +2873,7 @@ static void raftLogApply(raftLogEntry *e) {
     }
     case RAFT_ENTRY_NODE_FAIL: {
         clusterNode *node = clusterLookupNode(e->data, sdslen(e->data));
-        if (node && node != myself) {
+        if (node) {
             node->flags |= CLUSTER_NODE_FAIL;
             RAFT_NODE(node)->pending_fail_change = 0;
             rs->todo_update_slot_coverage = 1;
@@ -3479,7 +3479,9 @@ static int clusterRaftProcessInstallSnapshot(clusterLink *link, int argc, sds *a
         serverPanic("INSTALL_SNAPSHOT: failed to restore our address: %s", my_addr);
     }
     sdsfree(my_addr);
-    myself->flags &= ~(CLUSTER_NODE_NOFAILOVER | CLUSTER_NODE_FAIL | CLUSTER_NODE_PFAIL);
+    /* Preserve replicated CLUSTER_NODE_FAIL from snapshot so S_a matches
+     * across all nodes; local consumers ignore FAIL on myself. */
+    myself->flags &= ~(CLUSTER_NODE_NOFAILOVER | CLUSTER_NODE_PFAIL);
     if (server.cluster_replica_no_failover == CLUSTER_REPLICA_NO_FAILOVER_YES) myself->flags |= CLUSTER_NODE_NOFAILOVER;
 
     /* Do what applying the skipped slot changes would have done locally. The
@@ -3909,7 +3911,17 @@ static void clusterRaftDetectFailures(mstime_t now) {
     dictEntry *de;
     while ((de = dictNext(di)) != NULL) {
         clusterNode *node = dictGetVal(de);
-        if (node == myself) continue;
+        if (node == myself) {
+            if (nodeFailed(myself) && !RAFT_NODE(myself)->pending_fail_change) {
+                RAFT_NODE(myself)->pending_fail_change = 1;
+                sds entry = sdsnew("NODE_RECOVER ");
+                entry = sdscatlen(entry, myself->name, CLUSTER_NAMELEN);
+                clusterRaftPropose(entry, NULL, NULL);
+                sdsfree(entry);
+                serverLog(LL_NOTICE, "Leader %.40s is alive, proposing NODE_RECOVER for myself.", myself->name);
+            }
+            continue;
+        }
 
         if (nodeFailed(node)) {
             /* For failed nodes, drop stale links periodically so
@@ -4346,7 +4358,7 @@ static void clusterRaftCheckSlotCoverage(void) {
     if (server.cluster_require_full_coverage) {
         for (int j = 0; j < CLUSTER_SLOTS; j++) {
             if (server.cluster->slots[j] == NULL ||
-                nodeFailed(server.cluster->slots[j])) {
+                (server.cluster->slots[j] != myself && nodeFailed(server.cluster->slots[j]))) {
                 all_slots_covered = 0;
                 break;
             }
@@ -5805,7 +5817,7 @@ static void clusterRaftForgetNode(const char *node_id, size_t id_len, void *ctx,
     if (id_len == CLUSTER_NAMELEN && memcmp(node_id, rs->leader, CLUSTER_NAMELEN) == 0) {
         clusterNode *leader_node = clusterLookupNode(node_id, id_len);
         /* The leader would need another voter to hand off to. */
-        if (leader_node && !nodeFailed(leader_node) && raftProjVoterCount() <= 1) {
+        if (leader_node && (leader_node == myself || !nodeFailed(leader_node)) && raftProjVoterCount() <= 1) {
             if (callback) callback(ctx, "no eligible voting member available for leadership transfer");
             return;
         }
@@ -6077,7 +6089,7 @@ static void clusterRaftResetCluster(int hard) {
     clusterRaftCancelManualFailover();
     server.cluster->size = 0;
     myself->flags |= CLUSTER_NODE_JOINING;
-    myself->flags &= ~CLUSTER_NODE_LEARNER;
+    myself->flags &= ~(CLUSTER_NODE_LEARNER | CLUSTER_NODE_FAIL);
 
     /* Hard reset: change node ID. */
     if (hard) {
