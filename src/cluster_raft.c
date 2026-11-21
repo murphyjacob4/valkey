@@ -5722,12 +5722,20 @@ static void clusterRaftApplyNodeForget(sds data) {
     char shard_id[CLUSTER_NAMELEN];
     memcpy(shard_id, node->shard_id, CLUSTER_NAMELEN);
 
-    /* Local side effect (leader): queue a commit AE before dropping links. */
+    /* Local side effect (leader): queue a commit AE before dropping links.
+     * Prefer an already-connected link so a newly reconnecting outbound link
+     * doesn't shadow an open inbound link while the forgotten peer is paused. */
     clusterLink *out = NULL;
     if (rs->role == RAFT_ROLE_LEADER) {
-        out = node->link ? node->link : node->inbound_link;
-        if (out && out->conn) {
-            if (RAFT_NODE(node)->replicating) RAFT_NODE(node)->next_index = RAFT_NODE(node)->match_index + 1;
+        if (node->link && node->link->conn && connGetState(node->link->conn) == CONN_STATE_CONNECTED) {
+            out = node->link;
+        } else if (node->inbound_link && node->inbound_link->conn &&
+                   connGetState(node->inbound_link->conn) == CONN_STATE_CONNECTED) {
+            out = node->inbound_link;
+        }
+        if (out) {
+            if (RAFT_NODE(node)->replicating || RAFT_NODE(node)->match_index > 0)
+                RAFT_NODE(node)->next_index = RAFT_NODE(node)->match_index + 1;
             clusterRaftSendAppendEntries(out, node);
             if (out != rs->processing_link) clusterWriteHandler(out->conn);
         }
