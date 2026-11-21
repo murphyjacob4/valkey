@@ -7,6 +7,7 @@
 sds clusterNodeAppendAddressString(sds s, clusterNode *node, int tls_primary);
 sds clusterNodeAppendAddressStringNoShardId(sds s, clusterNode *node, int tls_primary);
 int clusterNodeParseAddressString(clusterNode *n, char *str);
+int clusterNodeValidateAddressString(const char *str, char *out_shard_id, bool *has_shard_id);
 
 /* Node description / serialization. */
 sds clusterGenNodeDescription(client *c, clusterNode *node, int tls_primary);

@@ -1418,40 +1418,10 @@ static void clusterRaftSyncRoleWithProj(void) {
 }
 
 /* Pure validation of a nodes.conf address string without mutating cluster state.
+ * Shares the exact same parser rules as clusterNodeParseAddressString().
  * Optionally extracts shard-id if present. */
 static bool raftParseAddressForValidation(const char *addr_str, char *out_shard_id, bool *has_shard_id) {
-    if (has_shard_id) *has_shard_id = false;
-    if (!addr_str || addr_str[0] == '\0') return false;
-
-    int aux_argc;
-    sds *aux_argv = sdssplitlen(addr_str, strlen(addr_str), ",", 1, &aux_argc);
-    if (!aux_argv || aux_argc < 1) {
-        if (aux_argv) sdsfreesplitres(aux_argv, aux_argc);
-        return false;
-    }
-
-    bool ok = true;
-    /* Must have ip:port[@cport] */
-    if (!strrchr(aux_argv[0], ':')) ok = false;
-
-    for (int i = 2; ok && i < aux_argc; i++) {
-        int field_argc;
-        sds *field_argv = sdssplitlen(aux_argv[i], sdslen(aux_argv[i]), "=", 1, &field_argc);
-        if (!field_argv || field_argc != 2 || sdslen(field_argv[0]) == 0 || sdslen(field_argv[1]) == 0) {
-            ok = false;
-        } else if (!strcmp(field_argv[0], "shard-id")) {
-            if (sdslen(field_argv[1]) != CLUSTER_NAMELEN) {
-                ok = false;
-            } else {
-                if (out_shard_id) memcpy(out_shard_id, field_argv[1], CLUSTER_NAMELEN);
-                if (has_shard_id) *has_shard_id = true;
-            }
-        }
-        if (field_argv) sdsfreesplitres(field_argv, field_argc);
-    }
-
-    sdsfreesplitres(aux_argv, aux_argc);
-    return ok;
+    return clusterNodeValidateAddressString(addr_str, out_shard_id, has_shard_id) == C_OK;
 }
 
 static bool raftParseSlotRange(const char *s, int *start, int *end) {
@@ -1551,11 +1521,18 @@ static void raftProjApplyEntry(raftProjState *p, uint8_t type, sds data) {
                 break;
             }
             if (!raftProjLookupNode(p, argv[0], CLUSTER_NAMELEN)) {
+                char shard_id[CLUSTER_NAMELEN];
+                memset(shard_id, 0, sizeof(shard_id));
+                bool has_shard = false;
+                if (!raftParseAddressForValidation(argv[1], shard_id, &has_shard)) {
+                    sdsfreesplitres(argv, argc);
+                    break;
+                }
                 raftProjNode *pn = zcalloc(sizeof(*pn));
                 memcpy(pn->name, argv[0], CLUSTER_NAMELEN);
-                bool has_shard = false;
-                raftParseAddressForValidation(argv[1], pn->shard_id, &has_shard);
-                if (!has_shard) {
+                if (has_shard) {
+                    memcpy(pn->shard_id, shard_id, CLUSTER_NAMELEN);
+                } else {
                     clusterNode *existing = clusterLookupNode(argv[0], CLUSTER_NAMELEN);
                     if (existing) memcpy(pn->shard_id, existing->shard_id, CLUSTER_NAMELEN);
                 }
@@ -1816,8 +1793,18 @@ static void raftProjVerifyMatchesRebuild(void) {
     if (fresh->voter_count != rs->proj->voter_count ||
         dictSize(fresh->nodes) != dictSize(rs->proj->nodes) ||
         dictSize(fresh->shard_epochs) != dictSize(rs->proj->shard_epochs)) {
+        int fresh_voters = fresh->voter_count;
+        unsigned long fresh_nodes = dictSize(fresh->nodes);
+        unsigned long fresh_epochs = dictSize(fresh->shard_epochs);
         raftProjFree(fresh);
-        serverPanic("Raft invariant violation: projected state summary diverged from rebuild");
+        serverPanic("Raft invariant violation: projected state summary diverged from rebuild "
+                    "(fresh: voters=%d nodes=%lu epochs=%lu; proj: voters=%d nodes=%lu epochs=%lu; "
+                    "last_applied=%llu commit=%llu last_index=%llu role=%d)",
+                    fresh_voters, fresh_nodes, fresh_epochs,
+                    rs->proj->voter_count, (unsigned long)dictSize(rs->proj->nodes),
+                    (unsigned long)dictSize(rs->proj->shard_epochs),
+                    (unsigned long long)rs->last_applied, (unsigned long long)rs->commit_index,
+                    (unsigned long long)raftLogLastIndex(), rs->role);
     }
 
     dictIterator *di = dictGetSafeIterator(fresh->nodes);
@@ -2160,6 +2147,20 @@ static int clusterRaftProcessPropose(clusterLink *link, int argc, sds *argv) {
     sds entry = sdsjoinsds(argv + 1, argc - 1, " ", 1);
     int type = raftEntryTypeByName(argv[1]);
     if (type < 0) {
+        sdsfree(entry);
+        return 1;
+    }
+
+    /* An unbootstrapped singleton has no peers in S_p; reject remote PROPOSE
+     * before bootstrap rather than appending without a self-join. */
+    if (dictSize(rs->proj->nodes) == 0 && raftLogLastIndex() == 0) {
+        if (link) {
+            sds msg = wireNewMsg("REJECT");
+            msg = sdscatfmt(msg, " %s ", raftProposalResultWireReason(RAFT_RESULT_REJECTED));
+            msg = sdscatlen(msg, entry, sdslen(entry));
+            msg = wireFinishMsg(msg);
+            clusterRaftSendMsg(link, msg);
+        }
         sdsfree(entry);
         return 1;
     }
@@ -2749,9 +2750,10 @@ static void raftLogApply(raftLogEntry *e) {
             /* Clear JOINING and mark voter/learner. */
             clusterNode *joined = existing ? existing : clusterLookupNode(argv[0], CLUSTER_NAMELEN);
             bool first_join = false;
-            if (joined && (!existing || (joined->flags & CLUSTER_NODE_JOINING))) {
+            if (joined && (!existing || (joined->flags & (CLUSTER_NODE_JOINING | CLUSTER_NODE_HANDSHAKE)))) {
                 first_join = true;
-                joined->flags &= ~CLUSTER_NODE_JOINING;
+                joined->flags &= ~(CLUSTER_NODE_JOINING | CLUSTER_NODE_HANDSHAKE);
+                if (!nodeIsReplica(joined)) joined->flags |= CLUSTER_NODE_PRIMARY;
                 if (learner) {
                     joined->flags |= CLUSTER_NODE_LEARNER;
                 } else {
@@ -3421,11 +3423,12 @@ static int clusterRaftProcessInstallSnapshot(clusterLink *link, int argc, sds *a
     bool my_shard_had_slots = old_primary->numslots > 0;
     for (int j = 0; j < CLUSTER_SLOTS; j++) clusterDelSlotKeepChannels(j);
 
-    /* Clear raft log. */
+    /* Clear raft log and stale shard epochs before loading snapshot state. */
     for (uint64_t i = 0; i < rs->log_count; i++) raftLogFree(rs->log[i]);
     rs->log_count = 0;
     rs->log_trim_index = 0;
     rs->log_trim_term = 0;
+    dictEmpty(rs->shard_epochs, NULL);
 
     /* clusterLoadNodeLine() only adds flags and replica links to a node that
      * already exists. Reset them first so that the snapshot fully defines the

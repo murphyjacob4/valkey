@@ -434,7 +434,7 @@ int clusterNodeParseAddressString(clusterNode *n, char *str) {
 
     /* ip:port@cport */
     char *p = strrchr(aux_argv[0], ':');
-    if (!p) goto err;
+    if (!p || (size_t)(p - aux_argv[0]) >= sizeof(n->ip)) goto err;
     *p = '\0';
     memcpy(n->ip, aux_argv[0], strlen(aux_argv[0]) + 1);
     char *port = p + 1;
@@ -461,6 +461,82 @@ int clusterNodeParseAddressString(clusterNode *n, char *str) {
 err:
     sdsfreesplitres(aux_argv, aux_argc);
     return C_ERR;
+}
+
+/* Validate an address+aux string using the exact same rules as
+ * clusterNodeParseAddressString(), without mutating live cluster state
+ * (such as server.cluster->shards). Optionally extracts shard-id if present.
+ * Returns C_OK on success, C_ERR on parse error. */
+int clusterNodeValidateAddressString(const char *str, char *out_shard_id, bool *has_shard_id) {
+    if (has_shard_id) *has_shard_id = false;
+    if (!str || str[0] == '\0') return C_ERR;
+
+    int aux_argc;
+    sds *aux_argv = sdssplitlen(str, strlen(str), ",", 1, &aux_argc);
+    if (aux_argv == NULL || aux_argc < 1) {
+        if (aux_argv) sdsfreesplitres(aux_argv, aux_argc);
+        return C_ERR;
+    }
+
+    clusterNode tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    tmp.hostname = sdsempty();
+    tmp.human_nodename = sdsempty();
+    tmp.announce_client_ipv4 = sdsempty();
+    tmp.announce_client_ipv6 = sdsempty();
+    tmp.availability_zone = sdsempty();
+
+    int ret = C_ERR;
+
+    /* Aux fields */
+    for (int i = 2; i < aux_argc; i++) {
+        int field_argc;
+        sds *field_argv = sdssplitlen(aux_argv[i], sdslen(aux_argv[i]), "=", 1, &field_argc);
+        if (field_argv == NULL || field_argc != 2) {
+            if (field_argv) sdsfreesplitres(field_argv, field_argc);
+            goto cleanup;
+        }
+        if (!isValidAuxString(field_argv[0], sdslen(field_argv[0])) ||
+            !isValidAuxString(field_argv[1], sdslen(field_argv[1]))) {
+            sdsfreesplitres(field_argv, field_argc);
+            goto cleanup;
+        }
+        int found = 0;
+        for (unsigned j = 0; j < af_count; j++) {
+            if (sdslen(field_argv[0]) != strlen(auxFieldHandlers[j].field) ||
+                memcmp(field_argv[0], auxFieldHandlers[j].field, sdslen(field_argv[0])) != 0)
+                continue;
+            found = 1;
+            if (j == af_shard_id) {
+                if (verifyClusterNodeId(field_argv[1], sdslen(field_argv[1])) == C_ERR) {
+                    sdsfreesplitres(field_argv, field_argc);
+                    goto cleanup;
+                }
+                if (out_shard_id) memcpy(out_shard_id, field_argv[1], CLUSTER_NAMELEN);
+                if (has_shard_id) *has_shard_id = true;
+            } else if (auxFieldHandlers[j].setter(&tmp, field_argv[1], sdslen(field_argv[1])) != C_OK) {
+                sdsfreesplitres(field_argv, field_argc);
+                goto cleanup;
+            }
+        }
+        sdsfreesplitres(field_argv, field_argc);
+        if (!found) goto cleanup;
+    }
+
+    /* ip:port@cport */
+    char *p = strrchr(aux_argv[0], ':');
+    if (!p || (size_t)(p - aux_argv[0]) >= sizeof(tmp.ip)) goto cleanup;
+
+    ret = C_OK;
+
+cleanup:
+    sdsfree(tmp.hostname);
+    sdsfree(tmp.human_nodename);
+    sdsfree(tmp.announce_client_ipv4);
+    sdsfree(tmp.announce_client_ipv6);
+    sdsfree(tmp.availability_zone);
+    sdsfreesplitres(aux_argv, aux_argc);
+    return ret;
 }
 
 /* Generate a csv-alike representation of the specified cluster node.
