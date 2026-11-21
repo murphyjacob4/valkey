@@ -339,10 +339,10 @@ test "Raft proto: PRE_VOTE granted after node-timeout even with randomized elect
         set reply [raft_recv $fd1]
         assert_match "ADD_ME*" $reply
 
-        # Send AE with NODE_JOIN entries for both nodes to form the cluster.
+        # Send AE with bootstrap NODE_JOIN + learner NODE_JOIN + ADD_VOTER.
         set node_addr "127.0.0.1:[srv 0 port]@$cport,,tls-port=0,shard-id=[string repeat a 40]"
         set term 1
-        raft_send $fd1 "AE $leader_id $term 0 0 2 2\n1 NODE_JOIN $leader_id $leader_addr voter\n1 NODE_JOIN $node_id $node_addr voter"
+        raft_send $fd1 "AE $leader_id $term 0 0 3 3\n1 NODE_JOIN $leader_id $leader_addr voter\n1 NODE_JOIN $node_id $node_addr learner\n1 ADD_VOTER $node_id"
         set reply [raft_recv $fd1]
         assert_match "AE_ACK *" $reply
         assert_equal "follower" [CI 0 cluster_raft_role]
@@ -352,9 +352,9 @@ test "Raft proto: PRE_VOTE granted after node-timeout even with randomized elect
         after 1100
 
         # The old leader comes back as a candidate, sends PRE_VOTE_REQ.
-        # Its log is at least as up-to-date (same 2 entries at term 1).
+        # Its log is at least as up-to-date (same 3 entries at term 1).
         set prevote_term [expr {$term + 1}]
-        raft_send $fd1 "PRE_VOTE_REQ $leader_id $prevote_term 2 1"
+        raft_send $fd1 "PRE_VOTE_REQ $leader_id $prevote_term 3 1"
         set reply [raft_recv $fd1]
         assert_match "PRE_VOTE $prevote_term 1" $reply
 
@@ -378,9 +378,9 @@ test "Raft proto: INSTALL_SNAPSHOT validation and node removal" {
         set fd [raft_connect_fake_node 127.0.0.1 $cport $leader_id $leader_addr]
         raft_send $fd "MEET cluster"
         assert_match "ADD_ME*" [raft_recv $fd]
-        raft_send $fd "AE $leader_id 1 0 0 3 3\n1 NODE_JOIN $leader_id $leader_addr voter\n1 NODE_JOIN $node_id $node_addr voter\n1 NODE_JOIN $c_id $c_addr voter"
+        raft_send $fd "AE $leader_id 1 0 0 5 5\n1 NODE_JOIN $leader_id $leader_addr voter\n1 NODE_JOIN $node_id $node_addr learner\n1 ADD_VOTER $node_id\n1 NODE_JOIN $c_id $c_addr learner\n1 ADD_VOTER $c_id"
         assert_match "AE_ACK 1 1 *" [raft_recv $fd]
-        assert_equal 3 [CI 0 cluster_raft_last_applied]
+        assert_equal 5 [CI 0 cluster_raft_last_applied]
         raft_send $fd "HELLO $leader_id $leader_addr"
         assert_match "HI *" [raft_recv $fd]
         set fd_c [raft_connect_fake_node 127.0.0.1 $cport $c_id $c_addr]
@@ -392,7 +392,7 @@ test "Raft proto: INSTALL_SNAPSHOT validation and node removal" {
         append snapshot "\n$node_id $node_addr master,bogus - 0 0 1 connected"
         raft_send $fd $snapshot
         assert_match "AE_ACK 1 0 *" [raft_recv $fd]
-        assert_equal 3 [CI 0 cluster_raft_last_applied]
+        assert_equal 5 [CI 0 cluster_raft_last_applied]
         assert_equal 0 [CI 0 cluster_slots_assigned]
         assert_equal 1 [count_log_message 0 "Rejecting INSTALL_SNAPSHOT"]
 
@@ -406,7 +406,7 @@ test "Raft proto: INSTALL_SNAPSHOT validation and node removal" {
             while {![string match "AE_ACK *" [set reply [raft_recv $fd]]]} {}
             assert_match "AE_ACK 1 0 *" $reply
         }
-        assert_equal 3 [CI 0 cluster_raft_last_applied]
+        assert_equal 5 [CI 0 cluster_raft_last_applied]
         assert_equal 3 [count_log_message 0 "Rejecting INSTALL_SNAPSHOT"]
 
         # So is a snapshot whose term is 0 or newer than the message's term.
@@ -418,7 +418,7 @@ test "Raft proto: INSTALL_SNAPSHOT validation and node removal" {
         } else {
             fail "invalid snapshot terms were not rejected"
         }
-        assert_equal 3 [CI 0 cluster_raft_last_applied]
+        assert_equal 5 [CI 0 cluster_raft_last_applied]
         assert_equal 1 [CI 0 cluster_raft_current_term]
 
         # A valid snapshot without C removes C and closes its link. The leak
@@ -509,8 +509,8 @@ test "Raft proto: entries are persisted before they are trimmed" {
         set fd [raft_connect_fake_node 127.0.0.1 $cport $leader_id $leader_addr]
         raft_send $fd "MEET cluster"
         assert_match "ADD_ME*" [raft_recv $fd]
-        set last 2
-        raft_send $fd "AE $leader_id 1 0 0 $last 2\n1 NODE_JOIN $leader_id $leader_addr voter\n1 NODE_JOIN $node_id $node_addr voter"
+        set last 3
+        raft_send $fd "AE $leader_id 1 0 0 $last 3\n1 NODE_JOIN $leader_id $leader_addr voter\n1 NODE_JOIN $node_id $node_addr learner\n1 ADD_VOTER $node_id"
         while {![string match "AE_ACK *" [set reply [raft_recv $fd]]]} {}
 
         # Commit batches of entries. After the second batch, nodes.conf is
@@ -585,20 +585,25 @@ test "Raft proto: MEET deferred by a joiner is answered after a snapshot" {
 test "Raft proto: PRE_VOTE granted when no leader lease is active" {
     start_server {overrides {cluster-enabled yes cluster-protocol raft cluster-node-timeout 1000}} {
         set cport [expr {[srv 0 port] + 10000}]
+        set self_id [R 0 CLUSTER MYID]
+        set self_addr "127.0.0.1:[srv 0 port]@$cport,,tls-port=0,shard-id=[string repeat a 40]"
         set candidate1 [string repeat "g" 40]
         set addr1 "127.0.0.1:9994@19994,,tls-port=0,shard-id=[string repeat h 40]"
         set candidate2 [string repeat "i" 40]
         set addr2 "127.0.0.1:9993@19993,,tls-port=0,shard-id=[string repeat j 40]"
 
-        # Link 1: move node from singleton leader -> follower by higher-term VOTE_REQ.
+        # Link 1: bootstrap node into V(S_p) as a voter, then move to follower by higher-term VOTE_REQ.
         set fd1 [raft_connect 127.0.0.1 $cport]
         raft_send $fd1 "HELLO $candidate1 $addr1"
         set reply [raft_recv $fd1]
         assert_match "HI *" $reply
 
+        raft_send $fd1 "AE $candidate1 1 0 0 1 1\n1 NODE_JOIN $self_id $self_addr voter"
+        assert_match "AE_ACK 1 1 1 *" [raft_recv $fd1]
+
         set term [CI 0 cluster_raft_current_term]
         set vote_term [expr {$term + 1}]
-        raft_send $fd1 "VOTE_REQ $candidate1 $vote_term 0 0"
+        raft_send $fd1 "VOTE_REQ $candidate1 $vote_term 1 1"
         set reply [raft_recv $fd1]
         assert_match "VOTE $vote_term 1" $reply
         assert_equal "follower" [CI 0 cluster_raft_role]
@@ -611,7 +616,7 @@ test "Raft proto: PRE_VOTE granted when no leader lease is active" {
         assert_match "HI *" $reply
 
         set prevote_term [expr {$vote_term + 1}]
-        raft_send $fd2 "PRE_VOTE_REQ $candidate2 $prevote_term 0 0"
+        raft_send $fd2 "PRE_VOTE_REQ $candidate2 $prevote_term 1 1"
         set reply [raft_recv $fd2]
         assert_match "PRE_VOTE $prevote_term 1" $reply
         assert_equal $vote_term [CI 0 cluster_raft_current_term]
@@ -624,19 +629,19 @@ test "Raft proto: PRE_VOTE granted when no leader lease is active" {
 test "Raft proto: PRE_VOTE denied when candidate log is stale" {
     start_server {overrides {cluster-enabled yes cluster-protocol raft cluster-node-timeout 1000}} {
         set cport [expr {[srv 0 port] + 10000}]
+        set self_id [R 0 CLUSTER MYID]
+        set self_addr "127.0.0.1:[srv 0 port]@$cport,,tls-port=0,shard-id=[string repeat m 40]"
 
-        # 1) Seed one committed log entry so receiver's last_log is not empty.
+        # 1) Seed one committed log entry so receiver is a voter in V(S_p) and last_log is not empty.
         set seed_id [string repeat "k" 40]
         set seed_addr "127.0.0.1:9992@19992,,tls-port=0,shard-id=[string repeat l 40]"
-        set joined_id [string repeat "m" 40]
-        set joined_addr "127.0.0.1:9991@19991,,tls-port=0,shard-id=[string repeat l 40]"
         set fd_seed [raft_connect 127.0.0.1 $cport]
         raft_send $fd_seed "HELLO $seed_id $seed_addr"
         set reply [raft_recv $fd_seed]
         assert_match "HI *" $reply
 
         set ae "AE $seed_id 1 0 0 1 1\n"
-        append ae "1 NODE_JOIN $joined_id $joined_addr voter"
+        append ae "1 NODE_JOIN $self_id $self_addr voter"
         raft_send $fd_seed $ae
         set reply [raft_recv $fd_seed]
         assert_match "AE_ACK 1 1 1 *" $reply
@@ -696,14 +701,14 @@ test "Raft proto: pre-vote timeout does not inflate term without quorum" {
             set reply [raft_recv $leader_fd]
             assert_match "HI *" $reply
 
-            # Commit both nodes into the fake leader's log. The real node must
-            # see the fake peer as joined, otherwise pre-vote requests are skipped.
-            set ae "AE $fake_id 2 0 0 2 2\n"
+            # Commit both nodes into the fake leader's log as voters.
+            set ae "AE $fake_id 2 0 0 3 3\n"
             append ae "2 NODE_JOIN $node_id 127.0.0.1:[srv 0 port]@[expr {[srv 0 port] + 10000}],,tls-port=0,shard-id=[string repeat t 40] voter\n"
-            append ae "2 NODE_JOIN $fake_id $fake_addr voter"
+            append ae "2 NODE_JOIN $fake_id $fake_addr learner\n"
+            append ae "2 ADD_VOTER $fake_id"
             raft_send $leader_fd $ae
             set reply [raft_recv $leader_fd]
-            assert_match "AE_ACK 2 1 2 *" $reply
+            assert_match "AE_ACK 2 1 3 *" $reply
             assert_equal "follower" [CI 0 cluster_raft_role]
             assert_equal 2 [CI 0 cluster_raft_current_term]
             assert_equal 2 [CI 0 cluster_size]
@@ -716,7 +721,7 @@ test "Raft proto: pre-vote timeout does not inflate term without quorum" {
         # Stop heartbeats. The follower should pre-vote in term+1, but without
         # a grant it must not increment its persisted current term.
         set reply [raft_recv $fd 5000]
-        assert_match "PRE_VOTE_REQ $node_id 3 2 2" $reply
+        assert_match "PRE_VOTE_REQ $node_id 3 3 2" $reply
         assert_equal 2 [CI 0 cluster_raft_current_term]
 
         # Do not respond to the first pre-vote. A later timeout starts a new
@@ -726,13 +731,13 @@ test "Raft proto: pre-vote timeout does not inflate term without quorum" {
         # Granting the second pre-vote should move the
         # node into a real election and broadcast VOTE_REQ with the bumped term.
         set reply [raft_recv $fd 5000]
-        assert_match "PRE_VOTE_REQ $node_id 3 2 2" $reply
+        assert_match "PRE_VOTE_REQ $node_id 3 3 2" $reply
         raft_send $fd "PRE_VOTE 3 1"
 
         set found_vote_req 0
         for {set i 0} {$i < 20} {incr i} {
             set reply [raft_recv $fd 5000]
-            if {[string match "VOTE_REQ $node_id 3 2 2" $reply]} {
+            if {[string match "VOTE_REQ $node_id 3 3 2" $reply]} {
                 set found_vote_req 1
                 break
             }
@@ -755,8 +760,9 @@ test "Raft proto: REPL_OFFSETS updates node replication offset" {
         set leader_id [string repeat "a" 40]
         set replica_id [string repeat "c" 40]
         set leader_shard [string repeat "b" 40]
+        set replica_shard [string repeat "d" 40]
         set leader_addr "127.0.0.1:9999@19999,,tls-port=0,shard-id=$leader_shard"
-        set replica_addr "127.0.0.1:9998@19998,,tls-port=0,shard-id=$leader_shard"
+        set replica_addr "127.0.0.1:9998@19998,,tls-port=0,shard-id=$replica_shard"
 
         # Connect and do HELLO/HI handshake.
         set fd [raft_connect 127.0.0.1 $cport]
@@ -766,11 +772,10 @@ test "Raft proto: REPL_OFFSETS updates node replication offset" {
 
         # Send AE to establish ourselves as leader and add the replica
         # via NODE_JOIN in the log.
-        # AE <leader-id> <term> <prev-log-idx> <prev-log-term> <commit> <count>
-        # Entry: <term> <type> <data>
-        set ae "AE $leader_id 1 0 0 2 2\n"
-        append ae "1 NODE_JOIN $replica_id $replica_addr voter\n"
-        append ae "1 SET_REPLICA_OF $replica_id $leader_id $leader_shard"
+        set ae "AE $leader_id 1 0 0 3 3\n"
+        append ae "1 NODE_JOIN $leader_id $leader_addr voter\n"
+        append ae "1 NODE_JOIN $replica_id $replica_addr learner\n"
+        append ae "1 SET_REPLICA_OF $replica_id $replica_shard 0 $leader_id $leader_shard 0"
         raft_send $fd $ae
 
         # Read AE_ACK.
@@ -991,7 +996,7 @@ test "Raft proto: outbound link without HI is dropped and reconnected" {
         raft_send $fd1 "MEET cluster"
         assert_match "ADD_ME*" [raft_recv $fd1]
         set node_addr "127.0.0.1:[srv 0 port]@$cport,,tls-port=0,shard-id=[string repeat a 40]"
-        raft_send $fd1 "AE $leader_id 1 0 0 2 2\n1 NODE_JOIN $leader_id $leader_addr voter\n1 NODE_JOIN $node_id $node_addr voter"
+        raft_send $fd1 "AE $leader_id 1 0 0 3 3\n1 NODE_JOIN $leader_id $leader_addr voter\n1 NODE_JOIN $node_id $node_addr learner\n1 ADD_VOTER $node_id"
         assert_match "AE_ACK *" [raft_recv $fd1]
         assert_equal "follower" [CI 0 cluster_raft_role]
 
@@ -999,7 +1004,7 @@ test "Raft proto: outbound link without HI is dropped and reconnected" {
         # counting connections on the silent listener.
         set deadline [expr {[clock milliseconds] + 5000}]
         while {[llength $::_raft_silent_accepts] < 2 && [clock milliseconds] < $deadline} {
-            raft_send $fd1 "AE $leader_id 1 2 1 2 0"
+            raft_send $fd1 "AE $leader_id 1 3 1 3 0"
             after 200 {set ::_raft_tick 1}
             vwait ::_raft_tick
             catch {read $fd1} ;# Discard AE_ACKs.
@@ -1044,7 +1049,7 @@ test "Raft proto: proposal waits for a new leader instead of expiring" {
         set fd_a [raft_connect_fake_node 127.0.0.1 $cport $a_id $a_addr]
         raft_send $fd_a "MEET cluster"
         assert_match "ADD_ME*" [raft_recv $fd_a]
-        raft_send $fd_a "AE $a_id 1 0 0 3 3\n1 NODE_JOIN $a_id $a_addr voter\n1 NODE_JOIN $node_id $node_addr voter\n1 NODE_JOIN $b_id $b_addr voter"
+        raft_send $fd_a "AE $a_id 1 0 0 5 5\n1 NODE_JOIN $a_id $a_addr voter\n1 NODE_JOIN $node_id $node_addr learner\n1 ADD_VOTER $node_id\n1 NODE_JOIN $b_id $b_addr learner\n1 ADD_VOTER $b_id"
         assert_match "AE_ACK *" [raft_recv $fd_a]
         set out_a [raft_accept $listen_a]
         set out_b [raft_accept $listen_b]
@@ -1064,12 +1069,12 @@ test "Raft proto: proposal waits for a new leader instead of expiring" {
         # resends the proposal to B.
         after 2500
         set fd_b [raft_connect_fake_node 127.0.0.1 $cport $b_id $b_addr]
-        raft_send $fd_b "AE $b_id 2 3 1 3 0"
+        raft_send $fd_b "AE $b_id 2 5 1 5 0"
         assert_equal $propose [raft_recv_until $out_b "PROPOSE *"]
 
         # B commits it more than 3x node-timeout after it was first proposed.
         after 1000
-        raft_send $fd_b "AE $b_id 2 3 1 4 1\n2 $entry"
+        raft_send $fd_b "AE $b_id 2 5 1 6 1\n2 $entry"
         assert_equal {OK} [$rd read]
         assert_morethan [expr {[clock milliseconds] - $start}] 3000
 
@@ -1088,18 +1093,19 @@ proc shard_of {id node_id} {
 }
 
 test "Raft proto: SET_REPLICA_OF follows a target that became a replica in its shard" {
-    # Entries applied in this order by a follower: the target X of a
-    # SET_REPLICA_OF fails over before it's applied, so the node replicates
-    # X's new primary. Later X moves to another shard, so a SET_REPLICA_OF
-    # with X's old shard is rejected.
-    start_server {overrides {cluster-enabled yes cluster-protocol raft cluster-node-timeout 1000}} {
+    # Valid entries applied in order by a follower: the target X of a
+    # SET_REPLICA_OF fails over before it's applied, so Z replicates X's new
+    # primary Y. Then X moves to shard W. A subsequent SET_REPLICA_OF with
+    # X's old shard is rejected at append time by a real leader (tested below
+    # in the wrong-shard pre-validation tests), not turned into a no-op at apply.
+    start_server {overrides {cluster-enabled yes cluster-protocol raft cluster-node-timeout 1000 cluster-raft-debug-apply-checks yes}} {
         set cport [expr {[srv 0 port] + 10000}]
         set node_id [R 0 CLUSTER MYID]
         set node_addr "127.0.0.1:[srv 0 port]@$cport,,tls-port=0,shard-id=[string repeat a 40]"
         set a_id [string repeat "1" 40]
         set a_addr "127.0.0.1:9991@19991,,tls-port=0,shard-id=[string repeat b 40]"
         # Fake learners, each in its own shard: X in shard sx, and so on.
-        foreach n {x y z w q} id {7 8 6 5 4} sh {c d e f 9} port {9992 9993 9994 9995 9996} {
+        foreach n {x y z w} id {7 8 6 5} sh {c d e f} port {9992 9993 9994 9995} {
             set ${n}_id [string repeat $id 40]
             set s$n [string repeat $sh 40]
             set ${n}_addr "127.0.0.1:$port@1$port,,tls-port=0,shard-id=[set s$n]"
@@ -1110,16 +1116,16 @@ test "Raft proto: SET_REPLICA_OF follows a target that became a replica in its s
         assert_match "ADD_ME*" [raft_recv $fd]
         set entries [list \
             "1 NODE_JOIN $a_id $a_addr voter" \
-            "1 NODE_JOIN $node_id $node_addr voter"]
-        foreach n {x y z w q} {
+            "1 NODE_JOIN $node_id $node_addr learner" \
+            "1 ADD_VOTER $node_id"]
+        foreach n {x y z w} {
             lappend entries "1 NODE_JOIN [set ${n}_id] [set ${n}_addr] learner"
         }
         lappend entries \
             "1 SET_REPLICA_OF $y_id $sy 0 $x_id $sx 0" \
             "1 FAILOVER $y_id $x_id $sx 1" \
             "1 SET_REPLICA_OF $z_id $sz 0 $x_id $sx 2" \
-            "1 SET_REPLICA_OF $x_id $sx 3 $w_id $sw 0" \
-            "1 SET_REPLICA_OF $q_id $sq 0 $x_id $sx 4"
+            "1 SET_REPLICA_OF $x_id $sx 3 $w_id $sw 0"
         set n [llength $entries]
         raft_send $fd "AE $a_id 1 0 0 $n $n\n[join $entries \n]"
         assert_match "AE_ACK *" [raft_recv $fd]
@@ -1127,11 +1133,9 @@ test "Raft proto: SET_REPLICA_OF follows a target that became a replica in its s
         # Z replicates Y, which took over from X in shard sx.
         assert_equal $y_id [dict get [cluster_get_node_by_id 0 $z_id] slaveof]
         assert_equal $sx [shard_of 0 $z_id]
-        # Q is still a primary in its own shard: X moved to shard sw.
+        # X moved to shard sw as a replica of W.
         assert_equal $w_id [dict get [cluster_get_node_by_id 0 $x_id] slaveof]
         assert_equal $sw [shard_of 0 $x_id]
-        assert_equal - [dict get [cluster_get_node_by_id 0 $q_id] slaveof]
-        assert_equal $sq [shard_of 0 $q_id]
         close $fd
     }
 }
