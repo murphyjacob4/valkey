@@ -3,3 +3,10 @@ import ValkeyRaft.Raft
 import ValkeyRaft.Traces
 import ValkeyRaft.Meta
 import ValkeyRaft.Protocols
+import ValkeyRaft.ConfigOnAppend.Spec
+import ValkeyRaft.ConfigOnAppend.LogLemmas
+import ValkeyRaft.ConfigOnAppend.Invariants
+import ValkeyRaft.ConfigOnAppend.PreservationBasic
+import ValkeyRaft.ConfigOnAppend.PreservationCore
+import ValkeyRaft.ConfigOnAppend.Safety
+import ValkeyRaft.ConfigOnAppend.Counterexamples

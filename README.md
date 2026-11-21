@@ -139,3 +139,43 @@ This one comes from code reading only and is not modelled. After a restart, the 
 2. Fix A1 (ACK index and follower commit), A3 (snapshot term), and A4 (move the leader checks out of apply). These are small and local.
 3. Decide A5 and A6 together. Either SLOT_CHANGE gets an owner check and stale-epoch retries re-check preconditions at the originator, or the doc example is dropped.
 4. Add the §C invariants to `design-docs/cluster-raft.md` before #3926, #4392, #4393, and #3868 build on them.
+
+---
+
+## F. Unbounded Machine-Checked Safety Proofs (`ValkeyRaft/ConfigOnAppend/*`)
+
+While §A–§D model the pre-fix `cluster-v2` code with bounded state-space exploration, [`lean/ValkeyRaft/ConfigOnAppend/`](lean/ValkeyRaft/ConfigOnAppend/) models the **intended** Valkey cluster Raft state machine (config-on-append, applied state `S_a` vs projected state `S_p`, pure total `apply`, append-time validation only against `S_p`, single-server voter-change serialization, Ongaro 2015 own-term-commit-first rule, vote/ack counting strictly from `effVoters = (S_p).voters`, truncation = recompute `S_p`, snapshot compaction + `InstallSnapshot`, restart from snapshot + persisted tail without relying on persisted `commit_index`, `ADD_VOTER`/`DEL_VOTER` as the only voter-changing entries after empty-log singleton bootstrap self-join) under an **unordered asynchronous network** (delay, duplication, reordering, drop) with **node crashes/restarts**, parameterized over an arbitrary `NodeId` type and an arbitrary pure topology specification `T : TopoSpec NodeId` (`valid`/`apply` pair with `valid S op → applyOpt S op = some (applyTotal S op)`).
+
+All proofs are **unbounded** (`∀` reachable states of any length, `∀` cluster sizes, `∀` topology operations), checked by Lean 4.35.0 core with **zero `sorry`**, **zero `native_decide`**, and **zero new axioms**.
+
+### Theorem-to-Contract Property Mapping
+
+| Contract Safety / Structural Property | Lean Theorem (`ValkeyRaft.ConfigOnAppend`) | Module |
+|---|---|---|
+| **1. Election Safety** — at most one leader per term (historical & live) | `election_safety`, `election_safety_live` | [`Safety.lean`](lean/ValkeyRaft/ConfigOnAppend/Safety.lean) |
+| **2. Log Matching** — same index & term implies identical log prefix and entry | `log_matching`, `log_matching_entry` | [`Safety.lean`](lean/ValkeyRaft/ConfigOnAppend/Safety.lean) |
+| **3. Leader Completeness** — every committed entry is present in every higher-term leader's log (election records & live leaders) | `leader_completeness`, `leader_completeness_live` | [`Safety.lean`](lean/ValkeyRaft/ConfigOnAppend/Safety.lean) |
+| **4. State Machine Safety** — no two nodes commit or apply different entries at the same index | `state_machine_safety_commits`, `state_machine_safety`, `state_machine_safety_applied` | [`Safety.lean`](lean/ValkeyRaft/ConfigOnAppend/Safety.lean) |
+| **5. Apply Determinism** — identical `applied` index implies identical `appliedState` | `apply_determinism` | [`Safety.lean`](lean/ValkeyRaft/ConfigOnAppend/Safety.lean) |
+| **6. No Committed No-Ops** — every log/committed entry is `validCmd` w.r.t. its prefix; `applyChecked` never rejects on `applyOne` | `all_log_entries_valid`, `no_committed_noops`, `apply_step_never_rejects`, `validCmd_applyChecked` | [`Safety.lean`](lean/ValkeyRaft/ConfigOnAppend/Safety.lean), [`Spec.lean`](lean/ValkeyRaft/ConfigOnAppend/Spec.lean) |
+| **7. Config Safety / Quorum Overlap** — configs simultaneously in use differ by at most one voter (`Adjacent`) so any two majorities intersect | `config_safety_quorum_overlap`, `config_safety_commit_adjacent`, `config_safety_leader_effective_vs_committed`, `config_safety_voter_changes_serialized`, `config_safety_consecutive_commits_overlap` | [`Safety.lean`](lean/ValkeyRaft/ConfigOnAppend/Safety.lean) |
+| **Projected State Consistency** — `S_p` from `appliedState + tail[applied..]` = `snapState + tail` = `stateOfLog fullLog` (incl. after truncation & restart) | `projected_state_consistency` | [`Safety.lean`](lean/ValkeyRaft/ConfigOnAppend/Safety.lean) |
+| **Voter-Change Exclusivity & Non-Emptiness** — after index 1 bootstrap, only `ADD_VOTER`/`DEL_VOTER` change voters; effective voter set stays non-empty and `Nodup` | `only_add_del_change_voters`, `effVoters_nonempty_and_nodup` | [`Safety.lean`](lean/ValkeyRaft/ConfigOnAppend/Safety.lean) |
+
+### Sanity-Check Counterexamples (Dropping Guards Breaks Safety)
+
+In [`Counterexamples.lean`](lean/ValkeyRaft/ConfigOnAppend/Counterexamples.lean), we verify that dropping any of the key contract guards makes safety violations reachable in the exact same `System`/`Step` semantics (kernel-checked via `rfl`, zero `native_decide`):
+
+| Dropped Guard | Theorem (`ValkeyRaft.ConfigOnAppend.Counterexamples`) | What Breaks |
+|---|---|---|
+| **Single-server voter-change serialization** (`hasUncommittedVoterChange = false`) | `counterexample_a2_no_serialization` | Gap **A2** under config-on-append + own-term-commit-first: pipelining `ADD_VOTER(3)` and `ADD_VOTER(4)` commits `noop` in `{0,1,2,3,4}` on `{0,3,4}` while `{1,2}` elects node 1 in `{0,1,2}` without that committed entry (Leader Completeness violated). |
+| **Ongaro 2015 own-term commit gate** (`termAt commit = term`) | `counterexample_ongaro_2015_no_own_term_guard` | Even with config-on-append + serialization, a leader in term 2 proposing `DEL_VOTER(3)` before committing a term-2 entry allows a split with term 3 proposing `DEL_VOTER(0)` (Leader Completeness violated). |
+| **Pure apply** (`DEL_VOTER` reading node-local `rs->leader`) | `counterexample_del_voter_impure_divergence` | On a valid 3-voter log ending in `DEL_VOTER(1)`, pure `applyCmd` yields `[0, 2]` everywhere, whereas an impure apply rejecting when `target == rs->leader` diverges permanently (`[0, 1, 2]` vs `[0, 2]`). |
+
+### Axioms Report (`#print axioms`)
+
+Verified via `lake env lean` on Lean 4.35.0:
+
+- Every safety and structural theorem in `Safety.lean` depends only on standard Lean axioms `[propext, Classical.choice, Quot.sound]` (`config_safety_quorum_overlap` uses only `[propext, Quot.sound]`).
+- All three counterexample theorems in `Counterexamples.lean` depend only on `[propext, Quot.sound]`.
+- **Zero `sorryAx`**, **zero `Lean.ofReduceBool` / `Lean.trustCompiler`**, and **zero custom axioms** anywhere in `ValkeyRaft/ConfigOnAppend/*`.
