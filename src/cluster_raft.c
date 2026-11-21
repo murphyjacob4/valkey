@@ -514,6 +514,10 @@ static void clusterRaftSyncAppliedSize(void);
 static bool raftParseAddressForValidation(const char *addr_str, char *out_shard_id, bool *has_shard_id);
 static bool raftEntryInUncommittedTail(int type, sds data);
 static bool raftProjIsVoter(const char *node_id);
+static bool raftProjIsLearner(const char *node_id);
+static bool raftProjCandidateKnownLearnerAtLogTip(const char *candidate_id,
+                                                  uint64_t candidate_last_index,
+                                                  uint64_t candidate_last_term);
 static int raftProjVoterCount(void);
 static int raftProjQuorum(void);
 static bool raftProjIsSingleVoterMyself(void);
@@ -1319,6 +1323,25 @@ static bool raftProjIsVoter(const char *node_id) {
     if (!rs || !rs->proj || !node_id) return false;
     raftProjNode *pn = raftProjLookupNode(rs->proj, node_id, CLUSTER_NAMELEN);
     return pn && !pn->is_learner;
+}
+
+static bool raftProjIsLearner(const char *node_id) {
+    clusterRaftState *rs = RAFT_STATE();
+    if (!rs || !rs->proj || !node_id) return false;
+    raftProjNode *pn = raftProjLookupNode(rs->proj, node_id, CLUSTER_NAMELEN);
+    return pn && pn->is_learner;
+}
+
+static bool raftProjCandidateKnownLearnerAtLogTip(const char *candidate_id,
+                                                  uint64_t candidate_last_index,
+                                                  uint64_t candidate_last_term) {
+    /* If the candidate is a learner in our projected state S_p AND its log tip
+     * matches ours, it cannot have an ADD_VOTER for itself beyond our log.
+     * If its log is strictly more up-to-date, it may have been promoted on a
+     * quorum we have not yet received, so Raft §4.1 allows granting the vote. */
+    return raftProjIsLearner(candidate_id) &&
+           candidate_last_index == raftLogLastIndex() &&
+           candidate_last_term == raftLogLastTerm();
 }
 
 static int raftProjVoterCount(void) {
@@ -3622,8 +3645,10 @@ static int clusterRaftProcessPreVoteRequest(clusterLink *link, int argc, sds *ar
     uint64_t candidate_last_term = strtoull(argv[4], NULL, 10);
     int granted = 0;
 
-    if (msg_term > rs->current_term &&
-        clusterRaftCanGrantVote(rs, candidate_last_index, candidate_last_term)) {
+    if (raftProjCandidateKnownLearnerAtLogTip(argv[1], candidate_last_index, candidate_last_term)) {
+        granted = 0;
+    } else if (msg_term > rs->current_term &&
+               clusterRaftCanGrantVote(rs, candidate_last_index, candidate_last_term)) {
         granted = 1;
     }
 
@@ -3674,6 +3699,8 @@ static int clusterRaftProcessRequestVote(clusterLink *link, int argc, sds *argv)
 
     if (msg_term < rs->current_term) {
         /* Stale term. */
+    } else if (raftProjCandidateKnownLearnerAtLogTip(argv[1], candidate_last_index, candidate_last_term)) {
+        /* Non-voters in S_p at the same log tip cannot become Raft leaders. */
     } else if ((clusterRaftIsVotedForNone() || memcmp(rs->voted_for, argv[1], CLUSTER_NAMELEN) == 0) &&
                clusterRaftCanGrantVote(rs, candidate_last_index, candidate_last_term)) {
         granted = 1;
