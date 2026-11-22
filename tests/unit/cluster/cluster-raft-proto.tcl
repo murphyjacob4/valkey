@@ -1098,7 +1098,7 @@ test "Raft proto: SET_REPLICA_OF follows a target that became a replica in its s
     # primary Y. Then X moves to shard W. A subsequent SET_REPLICA_OF with
     # X's old shard is rejected at append time by a real leader (tested below
     # in the wrong-shard pre-validation tests), not turned into a no-op at apply.
-    start_server {overrides {cluster-enabled yes cluster-protocol raft cluster-node-timeout 1000 cluster-raft-debug-apply-checks yes}} {
+    start_server {overrides {cluster-enabled yes cluster-protocol raft cluster-node-timeout 1000}} {
         set cport [expr {[srv 0 port] + 10000}]
         set node_id [R 0 CLUSTER MYID]
         set node_addr "127.0.0.1:[srv 0 port]@$cport,,tls-port=0,shard-id=[string repeat a 40]"

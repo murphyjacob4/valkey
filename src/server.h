@@ -2441,7 +2441,6 @@ struct valkeyServer {
     /* Cluster */
     int cluster_enabled;                                   /* Is cluster enabled? */
     int cluster_protocol;                                  /* Cluster bus protocol (gossip or raft). */
-    int cluster_raft_debug_apply_checks;                   /* Debug-only: assert apply-time invariants in Raft. */
     int cluster_port;                                      /* Set the cluster port for a node. */
     mstime_t cluster_node_timeout;                         /* Cluster node timeout. */
     mstime_t cluster_ping_interval;                        /* A debug configuration for setting how often cluster nodes send ping messages. */

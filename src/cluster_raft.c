@@ -18,7 +18,7 @@
  *   freshness, leader transfer, single-voter fast-commit) use V(S_p).
  * - Pure apply: raftLogApply is a deterministic function of (S_a, entry) only;
  *   all validation happens at append time against S_p. Apply-time checks are
- *   kept only as debug assertions behind cluster-raft-debug-apply-checks.
+ *   kept only as debug assertions behind enable-debug-assert (debugServerAssert).
  * - Only ADD_VOTER and DEL_VOTER change the voter set after bootstrap
  *   (NODE_JOIN ... voter is bootstrap-only; NODE_FORGET is learner-only).
  * - The first log entry referencing any node is its NODE_JOIN. Other
@@ -1770,17 +1770,19 @@ static void raftProjRebuild(void) {
     }
 }
 
-/* Debug invariant check: verify S_p equals fold(apply, S_a, uncommitted tail)
- * and server.cluster->size equals applied voter count. */
+/* Debug invariant check (gated on server.enable_debug_assert): verify S_p
+ * equals fold(apply, S_a, uncommitted tail) and server.cluster->size equals
+ * the applied voter count. */
 static void raftProjVerifyMatchesRebuild(void) {
     clusterRaftState *rs = RAFT_STATE();
-    if (!rs || !rs->proj) return;
+    if (!server.enable_debug_assert || !rs || !rs->proj) return;
 
     int applied_voters = clusterRaftCountAppliedVoters();
     if (server.cluster->size != applied_voters) {
-        serverPanic("Raft invariant violation: cluster->size=%d != applied voters=%d",
-                    server.cluster->size, applied_voters);
+        serverLog(LL_WARNING, "Raft invariant violation: cluster->size=%d != applied voters=%d",
+                  server.cluster->size, applied_voters);
     }
+    debugServerAssert(server.cluster->size == applied_voters);
 
     raftProjState *fresh = raftProjCreate();
     raftProjInitFromApplied(fresh);
@@ -1790,61 +1792,62 @@ static void raftProjVerifyMatchesRebuild(void) {
         raftProjApplyEntry(fresh, e->type, e->data);
     }
 
-    if (fresh->voter_count != rs->proj->voter_count ||
-        dictSize(fresh->nodes) != dictSize(rs->proj->nodes) ||
-        dictSize(fresh->shard_epochs) != dictSize(rs->proj->shard_epochs)) {
-        int fresh_voters = fresh->voter_count;
-        unsigned long fresh_nodes = dictSize(fresh->nodes);
-        unsigned long fresh_epochs = dictSize(fresh->shard_epochs);
-        raftProjFree(fresh);
-        serverPanic("Raft invariant violation: projected state summary diverged from rebuild "
-                    "(fresh: voters=%d nodes=%lu epochs=%lu; proj: voters=%d nodes=%lu epochs=%lu; "
-                    "last_applied=%llu commit=%llu last_index=%llu role=%d)",
-                    fresh_voters, fresh_nodes, fresh_epochs,
-                    rs->proj->voter_count, (unsigned long)dictSize(rs->proj->nodes),
-                    (unsigned long)dictSize(rs->proj->shard_epochs),
-                    (unsigned long long)rs->last_applied, (unsigned long long)rs->commit_index,
-                    (unsigned long long)raftLogLastIndex(), rs->role);
+    bool summary_ok = (fresh->voter_count == rs->proj->voter_count &&
+                       dictSize(fresh->nodes) == dictSize(rs->proj->nodes) &&
+                       dictSize(fresh->shard_epochs) == dictSize(rs->proj->shard_epochs));
+    if (!summary_ok) {
+        serverLog(LL_WARNING,
+                  "Raft invariant violation: projected state summary diverged from rebuild "
+                  "(fresh: voters=%d nodes=%lu epochs=%lu; proj: voters=%d nodes=%lu epochs=%lu; "
+                  "last_applied=%llu commit=%llu last_index=%llu role=%d)",
+                  fresh->voter_count, (unsigned long)dictSize(fresh->nodes),
+                  (unsigned long)dictSize(fresh->shard_epochs),
+                  rs->proj->voter_count, (unsigned long)dictSize(rs->proj->nodes),
+                  (unsigned long)dictSize(rs->proj->shard_epochs),
+                  (unsigned long long)rs->last_applied, (unsigned long long)rs->commit_index,
+                  (unsigned long long)raftLogLastIndex(), rs->role);
     }
+    debugServerAssert(summary_ok);
 
     dictIterator *di = dictGetSafeIterator(fresh->nodes);
     dictEntry *de;
     while ((de = dictNext(di)) != NULL) {
         raftProjNode *fn = dictGetVal(de);
         raftProjNode *pn = raftProjLookupNode(rs->proj, fn->name, CLUSTER_NAMELEN);
-        if (!pn ||
-            memcmp(fn->shard_id, pn->shard_id, CLUSTER_NAMELEN) != 0 ||
-            memcmp(fn->replicaof, pn->replicaof, CLUSTER_NAMELEN) != 0 ||
-            fn->is_learner != pn->is_learner ||
-            fn->numslots != pn->numslots ||
-            fn->num_replicas != pn->num_replicas ||
-            fn->is_failed != pn->is_failed) {
-            dictReleaseIterator(di);
-            raftProjFree(fresh);
-            serverPanic("Raft invariant violation: projected node %.40s diverged from rebuild", fn->name);
+        bool node_ok = (pn != NULL &&
+                        memcmp(fn->shard_id, pn->shard_id, CLUSTER_NAMELEN) == 0 &&
+                        memcmp(fn->replicaof, pn->replicaof, CLUSTER_NAMELEN) == 0 &&
+                        fn->is_learner == pn->is_learner &&
+                        fn->numslots == pn->numslots &&
+                        fn->num_replicas == pn->num_replicas &&
+                        fn->is_failed == pn->is_failed);
+        if (!node_ok) {
+            serverLog(LL_WARNING, "Raft invariant violation: projected node %.40s diverged from rebuild", fn->name);
         }
+        debugServerAssert(node_ok);
     }
     dictReleaseIterator(di);
 
     di = dictGetSafeIterator(fresh->shard_epochs);
     while ((de = dictNext(di)) != NULL) {
         sds key = dictGetKey(de);
-        if (raftProjGetShardEpoch(rs->proj, key) != dictGetUnsignedIntegerVal(de)) {
-            dictReleaseIterator(di);
-            raftProjFree(fresh);
-            serverPanic("Raft invariant violation: projected shard epoch for %.40s diverged", key);
+        bool epoch_ok = (raftProjGetShardEpoch(rs->proj, key) == dictGetUnsignedIntegerVal(de));
+        if (!epoch_ok) {
+            serverLog(LL_WARNING, "Raft invariant violation: projected shard epoch for %.40s diverged", key);
         }
+        debugServerAssert(epoch_ok);
     }
     dictReleaseIterator(di);
 
     for (int j = 0; j < CLUSTER_SLOTS; j++) {
         raftProjNode *fo = fresh->slots[j];
         raftProjNode *po = rs->proj->slots[j];
-        if ((fo == NULL) != (po == NULL) ||
-            (fo && memcmp(fo->name, po->name, CLUSTER_NAMELEN) != 0)) {
-            raftProjFree(fresh);
-            serverPanic("Raft invariant violation: projected owner for slot %d diverged", j);
+        bool slot_ok = ((fo == NULL) == (po == NULL) &&
+                        (!fo || memcmp(fo->name, po->name, CLUSTER_NAMELEN) == 0));
+        if (!slot_ok) {
+            serverLog(LL_WARNING, "Raft invariant violation: projected owner for slot %d diverged", j);
         }
+        debugServerAssert(slot_ok);
     }
 
     raftProjFree(fresh);
@@ -2104,10 +2107,10 @@ done:
     return result;
 }
 
-/* Debug-only apply-time assertion (gated on cluster-raft-debug-apply-checks).
+/* Debug-only apply-time assertion (gated on server.enable_debug_assert).
  * Never silently turns an entry into a no-op in production. */
 static void clusterRaftDebugCheckApply(raftLogEntry *e) {
-    if (!server.cluster_raft_debug_apply_checks) return;
+    if (!server.enable_debug_assert) return;
     raftProjState *sa = raftProjCreate();
     raftProjInitFromApplied(sa);
     RaftProposalResult res = raftValidateEntryOnState(sa, e->type, e->data, false);
@@ -2115,9 +2118,8 @@ static void clusterRaftDebugCheckApply(raftLogEntry *e) {
     if (res != RAFT_RESULT_OK) {
         serverLog(LL_WARNING, "Raft debug apply check FAILED for %s (index %llu, result %d): %s",
                   raftEntryTypeName(e->type), (unsigned long long)e->index, (int)res, e->data);
-        serverPanic("Raft debug apply check failed: invalid entry %s at index %llu",
-                    raftEntryTypeName(e->type), (unsigned long long)e->index);
     }
+    debugServerAssert(res == RAFT_RESULT_OK);
 }
 
 /* Pre-validate a proposal on the leader against the projected state S_p
@@ -2703,7 +2705,7 @@ static void clusterRaftCompletePendingProposal(int type, sds data, RaftProposalR
 
 /* Apply a committed log entry. Pure deterministic transition on (S_a, entry);
  * validation happens at append time against S_p, with optional debug-only
- * assertions gated on cluster-raft-debug-apply-checks. */
+ * assertions gated on enable-debug-assert (debugServerAssert). */
 static void raftLogApply(raftLogEntry *e) {
     clusterRaftState *rs = RAFT_STATE();
     clusterRaftDebugCheckApply(e);
@@ -2975,7 +2977,7 @@ static void raftApplyCommitted(void) {
     if (applied_any && rs->role == RAFT_ROLE_LEADER && listLength(rs->chained_forgets) > 0) {
         rs->todo_process_chained_forgets = 1;
     }
-    if (applied_any && server.cluster_raft_debug_apply_checks) {
+    if (applied_any && server.enable_debug_assert) {
         raftProjVerifyMatchesRebuild();
     }
 }

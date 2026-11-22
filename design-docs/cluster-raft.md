@@ -255,13 +255,15 @@ encoded in the entry (e.g., expected shard epochs). Because proposals
 are validated in log order against `S_p`, racing losers are rejected
 before append (`REJECT`) rather than committed as no-ops.
 
-**Debug-only apply checks:** The hidden `DEBUG_CONFIG` option
-`cluster-raft-debug-apply-checks` (default `no`) re-runs the validation
-predicate against `S_a` right before applying each committed entry and
-verifies after `raftApplyCommitted()` that `S_p` matches a fresh rebuild
-from `S_a` + uncommitted tail and that `server.cluster->size` equals the
-applied voter count. If an invariant fails, the server logs loudly and
-panics; in production (`no`), apply never rejects or skips entries.
+**Debug-only apply checks:** Apply-time invariant checks follow Valkey's
+standard `enable-debug-assert` (`debugServerAssert`, off by default in
+production and enabled in the test harness). When `enable-debug-assert` is
+enabled, apply re-runs the validation predicate against `S_a` right before
+applying each committed entry and verifies after `raftApplyCommitted()` that
+`S_p` matches a fresh rebuild from `S_a` + uncommitted tail and that
+`server.cluster->size` equals the applied voter count, aborting via
+`debugServerAssert` on any violation. In production (`enable-debug-assert no`),
+apply never rejects or skips entries.
 
 ## PROPOSE and Leader Validation
 
@@ -893,9 +895,8 @@ appending to the log, and the proposing node defers and retries with a
 fresh epoch once its epoch advances.
 
 At apply time, entries are applied purely and deterministically without
-rejection. When the hidden debug config `cluster-raft-debug-apply-checks`
-is enabled, apply re-checks the validation predicate against `S_a` and
-panics on any violation.
+rejection. When `enable-debug-assert` is enabled, apply re-checks the
+validation predicate against `S_a` via `debugServerAssert`.
 
 ### Retry on stale epoch
 

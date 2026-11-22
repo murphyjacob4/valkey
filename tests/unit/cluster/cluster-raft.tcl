@@ -31,7 +31,7 @@ proc raft_cluster_formed {num_voters num_nodes} {
 tags {external:skip cluster singledb} {
 
 test "Raft: leader steps down after losing quorum freshness" {
-    start_multiple_servers 3 {overrides {cluster-enabled yes cluster-protocol raft cluster-raft-debug-apply-checks yes cluster-node-timeout 1000}} {
+    start_multiple_servers 3 {overrides {cluster-enabled yes cluster-protocol raft cluster-node-timeout 1000}} {
         set r0 [srv 0 client]
         $r0 CLUSTER MEET [srv -1 host] [srv -1 port]
         $r0 CLUSTER MEET [srv -2 host] [srv -2 port]
@@ -72,7 +72,7 @@ test "Raft: leader steps down after losing quorum freshness" {
 }
 
 test "Raft: CLUSTER FORGET transfers leadership when target is leader" {
-    start_multiple_servers 3 {overrides {cluster-enabled yes cluster-protocol raft cluster-raft-debug-apply-checks yes cluster-node-timeout 1000}} {
+    start_multiple_servers 3 {overrides {cluster-enabled yes cluster-protocol raft cluster-node-timeout 1000}} {
         raft_form_cluster 2 3
         set leader_id [R 0 CLUSTER MYID]
         set target_id [R 1 CLUSTER MYID]
@@ -92,7 +92,7 @@ test "Raft: CLUSTER FORGET transfers leadership when target is leader" {
 
 test "Raft: leader transfer waits for the target to catch up" {
     # Long timeout so the leader keeps its link to the paused target
-    start_multiple_servers 3 {overrides {cluster-enabled yes cluster-protocol raft cluster-raft-debug-apply-checks yes cluster-node-timeout 5000}} {
+    start_multiple_servers 3 {overrides {cluster-enabled yes cluster-protocol raft cluster-node-timeout 5000}} {
         raft_form_cluster 2 3
         set leader_id [R 0 CLUSTER MYID]
         set target_id [R 1 CLUSTER MYID]
@@ -124,7 +124,7 @@ test "Raft: leader transfer waits for the target to catch up" {
 
 test "Raft: leader doesn't append after sending TIMEOUT_NOW" {
     # Long timeout so the leader keeps its link to the paused target
-    start_multiple_servers 3 {overrides {cluster-enabled yes cluster-protocol raft cluster-raft-debug-apply-checks yes cluster-node-timeout 5000}} {
+    start_multiple_servers 3 {overrides {cluster-enabled yes cluster-protocol raft cluster-node-timeout 5000}} {
         raft_form_cluster 2 3
         set leader_id [R 0 CLUSTER MYID]
         set target_id [R 1 CLUSTER MYID]
@@ -156,7 +156,7 @@ test "Raft: leader doesn't append after sending TIMEOUT_NOW" {
 }
 
 test "Raft: CLUSTER FORGET rejects leader transfer without another voter" {
-    start_multiple_servers 2 {overrides {cluster-enabled yes cluster-protocol raft cluster-raft-debug-apply-checks yes cluster-node-timeout 1000}} {
+    start_multiple_servers 2 {overrides {cluster-enabled yes cluster-protocol raft cluster-node-timeout 1000}} {
         raft_form_cluster 1 2
         assert_error "*no eligible voting member available for leadership transfer*" {
             R 1 CLUSTER FORGET [R 0 CLUSTER MYID]
@@ -165,7 +165,7 @@ test "Raft: CLUSTER FORGET rejects leader transfer without another voter" {
 }
 
 test "Raft: CLUSTER FORGET of a leader with slots fails without a leader transfer" {
-    start_multiple_servers 3 {overrides {cluster-enabled yes cluster-protocol raft cluster-raft-debug-apply-checks yes cluster-node-timeout 1000}} {
+    start_multiple_servers 3 {overrides {cluster-enabled yes cluster-protocol raft cluster-node-timeout 1000}} {
         raft_form_cluster 2 3
         set leader_id [R 0 CLUSTER MYID]
         R 0 CLUSTER ADDSLOTS 0
@@ -185,7 +185,7 @@ test "Raft: CLUSTER FORGET of a leader with slots fails without a leader transfe
 # CLUSTER FORGET without RESET. Pause the forgotten node so commit rides
 # the other follower's ACK; the commit AE must still be delivered.
 test "Raft: CLUSTER FORGET of a live node must not reappear via HELLO" {
-    start_multiple_servers 3 {overrides {cluster-enabled yes cluster-protocol raft cluster-raft-debug-apply-checks yes cluster-node-timeout 1000}} {
+    start_multiple_servers 3 {overrides {cluster-enabled yes cluster-protocol raft cluster-node-timeout 1000}} {
         set r0 [srv 0 client]
         $r0 CLUSTER MEET [srv -1 host] [srv -1 port]
         $r0 CLUSTER MEET [srv -2 host] [srv -2 port]
