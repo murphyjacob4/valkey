@@ -51,6 +51,80 @@ tags {"external:skip"} {
         clean_aof_persistence $aof_dirpath
     }
 
+    test {Multi Part AOF fails closed when manifest stat fails with ELOOP} {
+        create_aof $aof_dirpath $aof_base1_file {
+            append_to_aof [formatCommand set k1 v1]
+        }
+
+        exec ln -s "${aof_basename}$::manifest_suffix" $aof_manifest_file
+        set before_err [count_message_lines $server_path/stdout "Fatal error: can't stat the AOF manifest file"]
+        set before_create [count_message_lines $server_path/stdout "Creating AOF base file"]
+        try {
+            start_server_aof_ex [list dir $server_path] [list wait_ready false] {
+                wait_for_condition 100 50 {
+                    ! [is_alive [srv pid]]
+                } else {
+                    fail "Server did not fail closed on manifest stat ELOOP"
+                }
+            }
+            assert_equal [expr {$before_err + 1}] [count_message_lines $server_path/stdout "Fatal error: can't stat the AOF manifest file"]
+            assert_equal $before_create [count_message_lines $server_path/stdout "Creating AOF base file"]
+        } finally {
+            file delete -force $aof_manifest_file
+            clean_aof_persistence $aof_dirpath
+        }
+    }
+
+    test {Multi Part AOF fails closed when manifest stat fails with EACCES} {
+        if {[exec id -u] != 0} {
+            create_aof $aof_dirpath $aof_base1_file {
+                append_to_aof [formatCommand set k1 v1]
+            }
+
+            create_aof_manifest $aof_dirpath $aof_manifest_file {
+                append_to_manifest "file appendonly.aof.1.base.aof seq 1 type b\n"
+            }
+
+            set before_err [count_message_lines $server_path/stdout "Fatal error: can't stat the AOF manifest file"]
+            set before_create [count_message_lines $server_path/stdout "Creating AOF base file"]
+            file attributes $aof_dirpath -permissions 0000
+            try {
+                start_server_aof_ex [list dir $server_path] [list wait_ready false] {
+                    wait_for_condition 100 50 {
+                        ! [is_alive [srv pid]]
+                    } else {
+                        fail "Server did not fail closed on manifest stat EACCES"
+                    }
+                }
+                assert_equal [expr {$before_err + 1}] [count_message_lines $server_path/stdout "Fatal error: can't stat the AOF manifest file"]
+                assert_equal $before_create [count_message_lines $server_path/stdout "Creating AOF base file"]
+            } finally {
+                file attributes $aof_dirpath -permissions 0755
+                clean_aof_persistence $aof_dirpath
+            }
+        }
+    }
+
+    test {Multi Part AOF fails closed when manifest path is not a regular file} {
+        file mkdir $aof_manifest_file
+        set before_err [count_message_lines $server_path/stdout "Fatal error: the AOF manifest file .* is not a regular file"]
+        set before_create [count_message_lines $server_path/stdout "Creating AOF base file"]
+        try {
+            start_server_aof_ex [list dir $server_path] [list wait_ready false] {
+                wait_for_condition 100 50 {
+                    ! [is_alive [srv pid]]
+                } else {
+                    fail "Server did not fail closed when manifest is a directory"
+                }
+            }
+            assert_equal [expr {$before_err + 1}] [count_message_lines $server_path/stdout "Fatal error: the AOF manifest file .* is not a regular file"]
+            assert_equal $before_create [count_message_lines $server_path/stdout "Creating AOF base file"]
+        } finally {
+            file delete -force $aof_manifest_file
+            clean_aof_persistence $aof_dirpath
+        }
+    }
+
     test {Multi Part AOF can't load data when the sequence not increase monotonically} {
         create_aof $aof_dirpath $aof_incr1_file {
             append_to_aof [formatCommand set k1 v1]

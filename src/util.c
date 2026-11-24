@@ -1348,7 +1348,12 @@ int dirCreateIfMissing(char *dname) {
     if (mkdir(dname, 0755) != 0) {
         if (errno != EEXIST) {
             return -1;
-        } else if (!dirExists(dname)) {
+        }
+        struct stat statbuf;
+        if (stat(dname, &statbuf) != 0) {
+            return -1;
+        }
+        if (!S_ISDIR(statbuf.st_mode)) {
             errno = ENOTDIR;
             return -1;
         }

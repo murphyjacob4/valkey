@@ -51,7 +51,6 @@
 off_t getAppendOnlyFileSize(sds filename, int *status);
 off_t getBaseAndIncrAppendOnlyFilesSize(aofManifest *am, int *status);
 int getBaseAndIncrAppendOnlyFilesNum(aofManifest *am);
-int aofFileExist(char *filename);
 int rewriteAppendOnlyFile(char *filename);
 aofManifest *aofLoadManifestFromFile(sds am_filepath);
 void aofManifestFreeAndUpdate(aofManifest *am);
@@ -223,6 +222,25 @@ sds getAofManifestAsString(aofManifest *am) {
     return buf;
 }
 
+/* Check whether `path` exists as a directory (`expect_dir != 0`) or regular
+ * file (`expect_dir == 0`).
+ * Returns:
+ *   1 if `path` exists and matches the expected type,
+ *   0 if `path` does not exist (ENOENT) or has a different type (setting
+ *     `*is_wrong_type = 1` when non-NULL),
+ *  -1 on any stat() error other than ENOENT (errno is preserved). */
+static int aofCheckPathExists(const char *path, int expect_dir, int *is_wrong_type) {
+    struct valkey_stat sb;
+    if (is_wrong_type) *is_wrong_type = 0;
+    if (valkey_stat(path, &sb) == -1) {
+        if (errno == ENOENT) return 0;
+        return -1;
+    }
+    int match = expect_dir ? S_ISDIR(sb.st_mode) : S_ISREG(sb.st_mode);
+    if (!match && is_wrong_type) *is_wrong_type = 1;
+    return match ? 1 : 0;
+}
+
 /* Load the manifest information from the disk to `server.aof_manifest`
  * when the server starts.
  *
@@ -235,14 +253,33 @@ sds getAofManifestAsString(aofManifest *am) {
  */
 void aofLoadManifestFromDisk(void) {
     server.aof_manifest = aofManifestCreate();
-    if (!dirExists(server.aof_dirname)) {
+    int dir_res = aofCheckPathExists(server.aof_dirname, 1, NULL);
+    if (dir_res == -1) {
+        serverLog(LL_WARNING, "Fatal error: can't stat the AOF directory %s: %s", server.aof_dirname, strerror(errno));
+        exit(1);
+    }
+    if (dir_res == 0) {
         serverLog(LL_DEBUG, "The AOF directory %s doesn't exist", server.aof_dirname);
         return;
     }
 
     sds am_name = getAofManifestFileName();
     sds am_filepath = makePath(server.aof_dirname, am_name);
-    if (!fileExist(am_filepath)) {
+    int wrong_type = 0;
+    int file_res = aofCheckPathExists(am_filepath, 0, &wrong_type);
+    if (file_res == -1) {
+        serverLog(LL_WARNING, "Fatal error: can't stat the AOF manifest file %s: %s", am_filepath, strerror(errno));
+        sdsfree(am_name);
+        sdsfree(am_filepath);
+        exit(1);
+    }
+    if (wrong_type) {
+        serverLog(LL_WARNING, "Fatal error: the AOF manifest file %s is not a regular file", am_filepath);
+        sdsfree(am_name);
+        sdsfree(am_filepath);
+        exit(1);
+    }
+    if (file_res == 0) {
         serverLog(LL_DEBUG, "The AOF manifest file %s doesn't exist", am_name);
         sdsfree(am_name);
         sdsfree(am_filepath);
@@ -618,7 +655,15 @@ int persistAofManifest(aofManifest *am) {
  * problems, and the server will retry the upgrade process when it restarts.
  */
 void aofUpgradePrepare(aofManifest *am) {
-    serverAssert(!aofFileExist(server.aof_filename));
+    sds migrated_path = makePath(server.aof_dirname, server.aof_filename);
+    int migrated_res = aofCheckPathExists(migrated_path, 0, NULL);
+    if (migrated_res == -1) {
+        serverLog(LL_WARNING, "Fatal error: can't stat the AOF file %s: %s", server.aof_filename, strerror(errno));
+        sdsfree(migrated_path);
+        exit(1);
+    }
+    sdsfree(migrated_path);
+    serverAssert(migrated_res == 0);
 
     /* Create AOF directory use 'server.aof_dirname' as the name. */
     if (dirCreateIfMissing(server.aof_dirname) == -1) {
@@ -747,7 +792,11 @@ void aofOpenIfNeededOnServerStart(void) {
         exit(1);
     }
 
-    server.aof_last_incr_size = getAppendOnlyFileSize(aof_name, NULL);
+    int status;
+    server.aof_last_incr_size = getAppendOnlyFileSize(aof_name, &status);
+    if (status != AOF_OK) {
+        exit(1);
+    }
     server.aof_last_incr_fsync_offset = server.aof_last_incr_size;
 
     if (incr_aof_len) {
@@ -755,13 +804,6 @@ void aofOpenIfNeededOnServerStart(void) {
     } else {
         serverLog(LL_NOTICE, "Creating AOF incr file %s on server start", aof_name);
     }
-}
-
-int aofFileExist(char *filename) {
-    sds file_path = makePath(server.aof_dirname, filename);
-    int ret = fileExist(file_path);
-    sdsfree(file_path);
-    return ret;
 }
 
 /* Called in `rewriteAppendOnlyFileBackground`. If `server.aof_state`
@@ -1738,7 +1780,13 @@ int loadSingleAppendOnlyFile(char *filename) {
         }
     }
 
-    if (fp && valkey_fstat(fileno(fp), &sb) != -1 && sb.st_size == 0) {
+    if (valkey_fstat(fileno(fp), &sb) == -1) {
+        serverLog(LL_WARNING, "Fatal error: can't fstat the append log file %s: %s", filename, strerror(errno));
+        fclose(fp);
+        sdsfree(aof_filepath);
+        return AOF_OPEN_ERR;
+    }
+    if (sb.st_size == 0) {
         fclose(fp);
         sdsfree(aof_filepath);
         return AOF_EMPTY;
@@ -1939,10 +1987,33 @@ int loadAppendOnlyFiles(aofManifest *am) {
      *    has only one base AOF record, and the file name of this base AOF is 'server.aof_filename',
      *    and the 'server.aof_filename' file not exist in 'server.aof_dirname' directory
      * */
-    if (fileExist(server.aof_filename)) {
-        if (!dirExists(server.aof_dirname) || (am->base_aof_info == NULL && listLength(am->incr_aof_list) == 0) ||
-            (am->base_aof_info != NULL && listLength(am->incr_aof_list) == 0 &&
-             !strcmp(am->base_aof_info->file_name, server.aof_filename) && !aofFileExist(server.aof_filename))) {
+    int old_aof_res = aofCheckPathExists(server.aof_filename, 0, NULL);
+    if (old_aof_res == -1) {
+        serverLog(LL_WARNING, "Fatal error: can't stat the AOF file %s: %s", server.aof_filename, strerror(errno));
+        return AOF_OPEN_ERR;
+    }
+    if (old_aof_res == 1) {
+        int dir_res = aofCheckPathExists(server.aof_dirname, 1, NULL);
+        if (dir_res == -1) {
+            serverLog(LL_WARNING, "Fatal error: can't stat the AOF directory %s: %s", server.aof_dirname,
+                      strerror(errno));
+            return AOF_OPEN_ERR;
+        }
+        int need_upgrade = !dir_res || (am->base_aof_info == NULL && listLength(am->incr_aof_list) == 0);
+        if (!need_upgrade && am->base_aof_info != NULL && listLength(am->incr_aof_list) == 0 &&
+            !strcmp(am->base_aof_info->file_name, server.aof_filename)) {
+            sds migrated_path = makePath(server.aof_dirname, server.aof_filename);
+            int migrated_res = aofCheckPathExists(migrated_path, 0, NULL);
+            if (migrated_res == -1) {
+                serverLog(LL_WARNING, "Fatal error: can't stat the AOF file %s: %s", server.aof_filename,
+                          strerror(errno));
+                sdsfree(migrated_path);
+                return AOF_OPEN_ERR;
+            }
+            sdsfree(migrated_path);
+            if (migrated_res == 0) need_upgrade = 1;
+        }
+        if (need_upgrade) {
             aofUpgradePrepare(am);
         }
     }
@@ -1973,7 +2044,11 @@ int loadAppendOnlyFiles(aofManifest *am) {
         serverAssert(am->base_aof_info->file_type == AOF_FILE_TYPE_BASE);
         aof_name = (char *)am->base_aof_info->file_name;
         updateLoadingFileName(aof_name);
-        base_size = getAppendOnlyFileSize(aof_name, NULL);
+        base_size = getAppendOnlyFileSize(aof_name, &status);
+        if (status != AOF_OK) {
+            ret = status == AOF_NOT_EXIST ? AOF_FAILED : status;
+            goto cleanup;
+        }
         last_file = ++aof_num == total_num;
         start = ustime();
         ret = loadSingleAppendOnlyFile(aof_name);
