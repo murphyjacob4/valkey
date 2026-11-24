@@ -1402,4 +1402,98 @@ tags {"external:skip"} {
             }
         }
     }
+
+    if {[exec id -u] != 0} {
+        start_server {tags {"Multi Part AOF"} overrides {appendonly {yes} aof-use-rdb-preamble {yes} auto-aof-rewrite-percentage {0} save {}}} {
+            set dir [get_valkey_dir]
+            set aof_basename "appendonly.aof"
+            set aof_dirname "appendonlydir"
+            set aof_dirpath "$dir/$aof_dirname"
+            set aof_manifest_file "$aof_dirpath/${aof_basename}$::manifest_suffix"
+
+            test "BGREWRITEAOF does not unlink new base file when post-rename fsyncFileDir fails" {
+                r set k1 v1
+                r config set rdb-key-save-delay 1000000
+
+                r bgrewriteaof
+
+                # Mode 0300 (-wx------) allows open(O_WRONLY|O_CREAT), rename(),
+                # and unlink() in the AOF dir, while making fsyncFileDir()'s
+                # open(dir, O_RDONLY) fail with EACCES after rename().
+                file attributes $aof_dirpath -permissions 0300
+                try {
+                    assert_equal 1 [s aof_rewrite_in_progress]
+                    waitForBgrewriteaof r
+                } finally {
+                    file attributes $aof_dirpath -permissions 0755
+                }
+
+                assert {[count_log_message 0 "Fail to fsync AOF directory"] >= 1}
+                assert_equal "err" [s aof_last_bgrewrite_status]
+
+                # Manifest on disk already references seq 2; both new files and
+                # history files must remain on disk until a manifest persist succeeds.
+                assert_aof_manifest_content $aof_manifest_file {
+                    {file appendonly.aof.2.base.rdb seq 2 type b}
+                    {file appendonly.aof.1.incr.aof seq 1 type h}
+                    {file appendonly.aof.1.base.rdb seq 1 type h}
+                    {file appendonly.aof.2.incr.aof seq 2 type i}
+                }
+                assert_equal 1 [check_file_exist $aof_dirpath "appendonly.aof.2.base.rdb"]
+                assert_equal 1 [check_file_exist $aof_dirpath "appendonly.aof.2.incr.aof"]
+                assert_equal 1 [check_file_exist $aof_dirpath "appendonly.aof.1.base.rdb"]
+                assert_equal 1 [check_file_exist $aof_dirpath "appendonly.aof.1.incr.aof"]
+
+                r set k2 v2
+
+                # Restarting the server must load both pre- and post-rewrite keys.
+                restart_server 0 true false
+                assert_equal "v1" [r get k1]
+                assert_equal "v2" [r get k2]
+            }
+        }
+
+        start_server {tags {"Multi Part AOF"} overrides {appendonly {yes} aof-use-rdb-preamble {yes} auto-aof-rewrite-percentage {0} save {} appendfsync {always}}} {
+            set dir [get_valkey_dir]
+            set aof_basename "appendonly.aof"
+            set aof_dirname "appendonlydir"
+            set aof_dirpath "$dir/$aof_dirname"
+            set aof_manifest_file "$aof_dirpath/${aof_basename}$::manifest_suffix"
+
+            test "openNewIncrAofForAppend keeps in-memory manifest consistent when post-rename fsyncFileDir fails" {
+                r set k1 v1
+
+                # Fail fsyncFileDir() inside openNewIncrAofForAppend() after the
+                # manifest rename has already added appendonly.aof.2.incr.aof.
+                file attributes $aof_dirpath -permissions 0300
+                try {
+                    assert_error "*Can't execute an AOF background rewriting*" {r bgrewriteaof}
+                } finally {
+                    file attributes $aof_dirpath -permissions 0755
+                }
+
+                assert {[count_log_message 0 "Fail to fsync AOF directory"] >= 1}
+                assert_equal "err" [s aof_last_bgrewrite_status]
+
+                # Subsequent writes must go to 2.incr.aof (matching the on-disk manifest).
+                r set k2 v2
+                assert {[file size "$aof_dirpath/appendonly.aof.2.incr.aof"] > 0}
+
+                # A subsequent rewrite must succeed and clean up both 1.incr.aof and 2.incr.aof.
+                r bgrewriteaof
+                waitForBgrewriteaof r
+                assert_equal "ok" [s aof_last_bgrewrite_status]
+                wait_for_condition 1000 10 {
+                    [check_file_exist $aof_dirpath "appendonly.aof.1.incr.aof"] == 0 &&
+                    [check_file_exist $aof_dirpath "appendonly.aof.2.incr.aof"] == 0
+                } else {
+                    fail "Failed to delete history incr AOF files after subsequent rewrite"
+                }
+
+                restart_server 0 true false
+                assert_equal "v1" [r get k1]
+                assert_equal "v2" [r get k2]
+            }
+        }
+    }
 }

@@ -525,6 +525,12 @@ void markRewrittenIncrAofAsHistory(aofManifest *am) {
     am->dirty = 1;
 }
 
+/* Return code from writeAofManifestFile() / persistAofManifest() when
+ * rename(temp-manifest, manifest) already succeeded and only the trailing
+ * fsyncFileDir() failed. The renamed manifest is already visible on disk,
+ * so callers must not unlink or roll back files it references. */
+#define AOF_MANIFEST_ERR_AFTER_RENAME (-2)
+
 /* Write the formatted manifest string to disk. */
 int writeAofManifestFile(sds buf) {
     int ret = C_OK;
@@ -581,7 +587,7 @@ int writeAofManifestFile(sds buf) {
     if (fsyncFileDir(am_filepath) == -1) {
         serverLog(LL_WARNING, "Fail to fsync AOF directory %s: %s.", am_filepath, strerror(errno));
 
-        ret = C_ERR;
+        ret = AOF_MANIFEST_ERR_AFTER_RENAME;
         goto cleanup;
     }
 
@@ -667,6 +673,13 @@ int aofDelHistoryFiles(void) {
         return C_OK;
     }
 
+    /* If a prior manifest persist failed after rename (e.g. fsyncFileDir()
+     * failed), the previous manifest may still survive a crash. Ensure the
+     * current manifest is durably persisted before unlinking history files. */
+    if (server.aof_manifest->dirty && persistAofManifest(server.aof_manifest) != C_OK) {
+        return C_ERR;
+    }
+
     listNode *ln;
     listIter li;
 
@@ -682,7 +695,7 @@ int aofDelHistoryFiles(void) {
     }
 
     server.aof_manifest->dirty = 1;
-    return persistAofManifest(server.aof_manifest);
+    return persistAofManifest(server.aof_manifest) == C_OK ? C_OK : C_ERR;
 }
 
 /* Used to clean up temp INCR AOF when AOFRW fails. */
@@ -803,10 +816,18 @@ int openNewIncrAofForAppend(void) {
         goto cleanup;
     }
 
+    int persist_ret = C_OK;
     if (temp_am) {
         /* Persist AOF Manifest. */
-        if (persistAofManifest(temp_am) == C_ERR) {
+        persist_ret = persistAofManifest(temp_am);
+        if (persist_ret == C_ERR) {
             goto cleanup;
+        }
+        if (persist_ret == AOF_MANIFEST_ERR_AFTER_RENAME) {
+            serverLog(LL_WARNING,
+                      "AOF manifest was renamed for new incr file %s, but fsyncing the AOF directory failed; "
+                      "adopting new incr file to keep in-memory and on-disk manifests consistent",
+                      new_aof_name);
         }
     }
 
@@ -831,7 +852,7 @@ int openNewIncrAofForAppend(void) {
     server.aof_last_incr_fsync_offset = 0;
     /* Update `server.aof_manifest`. */
     if (temp_am) aofManifestFreeAndUpdate(temp_am);
-    return C_OK;
+    return persist_ret == C_OK ? C_OK : C_ERR;
 
 cleanup:
     if (new_aof_name) sdsfree(new_aof_name);
@@ -1057,14 +1078,26 @@ int restartAOFWithSyncRdb(void) {
         goto cleanup;
     }
 
-    if (persistAofManifest(temp_am) == C_ERR) {
+    int persist_ret = persistAofManifest(temp_am);
+    if (persist_ret == C_ERR) {
         goto cleanup;
     }
 
     aofManifestFreeAndUpdate(temp_am);
     temp_am = NULL;
 
-    aofDelHistoryFiles();
+    if (persist_ret == AOF_MANIFEST_ERR_AFTER_RENAME) {
+        /* The renamed manifest on disk already references the new base and
+         * incr files, but the directory fsync failed so the old manifest may
+         * still survive a crash. Keep history files on disk (skip
+         * aofDelHistoryFiles()) and leave server.aof_manifest->dirty set so
+         * a subsequent persist retries fsyncFileDir(). */
+        serverLog(LL_WARNING,
+                  "AOF manifest was renamed, but fsyncing the AOF directory failed; "
+                  "keeping history files on disk until a future manifest persist succeeds");
+    } else {
+        aofDelHistoryFiles();
+    }
 
     sdsfree(new_base_filepath);
     new_base_filepath = NULL;
@@ -1089,8 +1122,13 @@ int restartAOFWithSyncRdb(void) {
         server.aof_last_write_status = C_OK;
     }
 
-    server.aof_lastbgrewrite_status = C_OK;
-    server.stat_aofrw_consecutive_failures = 0;
+    if (persist_ret == AOF_MANIFEST_ERR_AFTER_RENAME) {
+        server.aof_lastbgrewrite_status = C_ERR;
+        server.stat_aofrw_consecutive_failures++;
+    } else {
+        server.aof_lastbgrewrite_status = C_OK;
+        server.stat_aofrw_consecutive_failures = 0;
+    }
 
     server.aof_last_fsync = server.mstime;
     server.aof_last_incr_size = 0;
@@ -3014,7 +3052,8 @@ void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
         markRewrittenIncrAofAsHistory(temp_am);
 
         /* Persist our modifications. */
-        if (persistAofManifest(temp_am) == C_ERR) {
+        int persist_ret = persistAofManifest(temp_am);
+        if (persist_ret == C_ERR) {
             bg_unlink(new_base_filepath);
             aofManifestFree(temp_am);
             sdsfree(new_base_filepath);
@@ -3038,14 +3077,27 @@ void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
             server.aof_rewrite_base_size = server.aof_current_size;
         }
 
-        /* We don't care about the return value of `aofDelHistoryFiles`, because the history
-         * deletion failure will not cause any problems. */
-        aofDelHistoryFiles();
+        if (persist_ret == AOF_MANIFEST_ERR_AFTER_RENAME) {
+            /* The renamed manifest on disk already references the new files,
+             * but the directory fsync failed so the old manifest may still
+             * survive a crash. Keep history files on disk (skip
+             * aofDelHistoryFiles()) and leave server.aof_manifest->dirty set
+             * so a subsequent persist retries fsyncFileDir(). */
+            serverLog(LL_WARNING,
+                      "AOF manifest was renamed, but fsyncing the AOF directory failed; "
+                      "keeping history files on disk until a future manifest persist succeeds");
+            server.aof_lastbgrewrite_status = C_ERR;
+            server.stat_aofrw_consecutive_failures++;
+        } else {
+            /* We don't care about the return value of `aofDelHistoryFiles`, because the history
+             * deletion failure will not cause any problems. */
+            aofDelHistoryFiles();
 
-        server.aof_lastbgrewrite_status = C_OK;
-        server.stat_aofrw_consecutive_failures = 0;
+            server.aof_lastbgrewrite_status = C_OK;
+            server.stat_aofrw_consecutive_failures = 0;
 
-        serverLog(LL_NOTICE, "Background AOF rewrite finished successfully");
+            serverLog(LL_NOTICE, "Background AOF rewrite finished successfully");
+        }
         /* Change state from WAIT_REWRITE to ON if needed */
         if (server.aof_state == AOF_WAIT_REWRITE) {
             server.aof_state = AOF_ON;
