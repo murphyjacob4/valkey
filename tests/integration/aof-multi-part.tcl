@@ -819,6 +819,101 @@ tags {"external:skip"} {
         clean_aof_persistence $aof_dirpath
     }
 
+    test {Multi Part AOF truncates stale unreferenced incr file on startup when manifest has no incr entries} {
+        create_aof $aof_dirpath $aof_base2_file {
+            append_to_aof [formatCommand set k1 new]
+        }
+        create_aof $aof_dirpath $aof_incr1_file {
+            append_to_aof [formatCommand set k1 stale]
+        }
+        create_aof_manifest $aof_dirpath $aof_manifest_file {
+            append_to_manifest "file appendonly.aof.2.base.aof seq 2 type b\n"
+        }
+
+        try {
+            start_server_aof [list dir $server_path] {
+                set client [valkey [srv host] [srv port] 0 $::tls]
+                wait_done_loading $client
+                assert_equal "new" [$client get k1]
+                assert_equal OK [$client set k2 v2]
+                $client close
+
+                restart_server 0 true false
+
+                set client [valkey [srv host] [srv port] 0 $::tls]
+                wait_done_loading $client
+                assert_equal "new" [$client get k1]
+                assert_equal "v2" [$client get k2]
+                $client close
+            }
+        } finally {
+            clean_aof_persistence $aof_dirpath
+        }
+    }
+
+    test {Multi Part AOF advances incr seq past history incr entries on startup} {
+        try {
+            # Phase 1: create base seq 1 + incr seq 1, then disable AOF and run
+            # BGREWRITEAOF with auto-gc disabled so the manifest holds base seq 2
+            # and history 1.incr.aof / 1.base.rdb, with no active incr entries.
+            start_server_aof [list dir $server_path aof-use-rdb-preamble yes auto-aof-rewrite-percentage 0 aof-disable-auto-gc yes save ""] {
+                set client [valkey [srv host] [srv port] 0 $::tls]
+                wait_done_loading $client
+                $client set k1 old
+                $client config set appendonly no
+                $client set k1 new
+                $client bgrewriteaof
+                waitForBgrewriteaof $client
+                $client close
+            }
+
+            assert_aof_manifest_content $aof_manifest_file {
+                {file appendonly.aof.2.base.rdb seq 2 type b}
+                {file appendonly.aof.1.incr.aof seq 1 type h}
+                {file appendonly.aof.1.base.rdb seq 1 type h}
+            }
+
+            # Phase 2: start with appendonly yes and auto-gc enabled (default).
+            # Startup must allocate seq 2 for the new incr file so
+            # aofDelHistoryFiles() deletes 1.incr.aof without unlinking the
+            # active incr file.
+            start_server_aof [list dir $server_path aof-use-rdb-preamble yes auto-aof-rewrite-percentage 0 save ""] {
+                set aof_dir [file join [lindex [r config get dir] 1] [lindex [r config get appenddirname] 1]]
+                set manifest [file join $aof_dir "appendonly.aof$::manifest_suffix"]
+
+                wait_for_condition 1000 10 {
+                    [check_file_exist $aof_dir "appendonly.aof.1.incr.aof"] == 0 &&
+                    [check_file_exist $aof_dir "appendonly.aof.1.base.rdb"] == 0
+                } else {
+                    fail "Failed to delete history AOF files on startup"
+                }
+
+                assert_aof_manifest_content $manifest {
+                    {file appendonly.aof.2.base.rdb seq 2 type b}
+                    {file appendonly.aof.2.incr.aof seq 2 type i}
+                }
+                assert_equal 1 [check_file_exist $aof_dir "appendonly.aof.2.incr.aof"]
+
+                set client [valkey [srv host] [srv port] 0 $::tls]
+                wait_done_loading $client
+                assert_equal "new" [$client get k1]
+                assert_equal OK [$client set k2 v2]
+                $client close
+
+                # A subsequent restart must recover both k1 and k2 cleanly.
+                restart_server 0 true false
+
+                set client [valkey [srv host] [srv port] 0 $::tls]
+                wait_done_loading $client
+                assert_equal "new" [$client get k1]
+                assert_equal "v2" [$client get k2]
+                $client close
+            }
+        } finally {
+            clean_aof_persistence $aof_dirpath
+        }
+    }
+
     # Test Part 2
     #
     # To test whether the AOFRW behaves as expected during the server run.

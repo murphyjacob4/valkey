@@ -255,6 +255,12 @@ void aofLoadManifestFromDisk(void) {
     sdsfree(am_filepath);
 }
 
+static int aofNameHasSuffix(sds name, const char *suffix) {
+    size_t name_len = sdslen(name);
+    size_t suffix_len = strlen(suffix);
+    return name_len >= suffix_len && memcmp(name + name_len - suffix_len, suffix, suffix_len) == 0;
+}
+
 /* Generic manifest loading function, used in `aofLoadManifestFromDisk` and valkey-check-aof tool. */
 #define MANIFEST_MAX_LINE 1024
 aofManifest *aofLoadManifestFromFile(sds am_filepath) {
@@ -348,16 +354,25 @@ aofManifest *aofLoadManifestFromFile(sds am_filepath) {
                 goto loaderr;
             }
             am->base_aof_info = ai;
-            am->curr_base_file_seq = ai->file_seq;
+            if (ai->file_seq > am->curr_base_file_seq) am->curr_base_file_seq = ai->file_seq;
         } else if (ai->file_type == AOF_FILE_TYPE_HIST) {
             listAddNodeTail(am->history_aof_list, ai);
+            /* Advance sequence counters past history entries so newly allocated
+             * files on startup cannot collide with history files that
+             * aofDelHistoryFiles() is about to unlink. */
+            if (aofNameHasSuffix(ai->file_name, INCR_FILE_SUFFIX AOF_FORMAT_SUFFIX)) {
+                if (ai->file_seq > am->curr_incr_file_seq) am->curr_incr_file_seq = ai->file_seq;
+            } else if (aofNameHasSuffix(ai->file_name, BASE_FILE_SUFFIX AOF_FORMAT_SUFFIX) ||
+                       aofNameHasSuffix(ai->file_name, BASE_FILE_SUFFIX RDB_FORMAT_SUFFIX)) {
+                if (ai->file_seq > am->curr_base_file_seq) am->curr_base_file_seq = ai->file_seq;
+            }
         } else if (ai->file_type == AOF_FILE_TYPE_INCR) {
             if (ai->file_seq <= maxseq) {
                 err = "Found a non-monotonic sequence number";
                 goto loaderr;
             }
             listAddNodeTail(am->incr_aof_list, ai);
-            am->curr_incr_file_seq = ai->file_seq;
+            if (ai->file_seq > am->curr_incr_file_seq) am->curr_incr_file_seq = ai->file_seq;
             maxseq = ai->file_seq;
         } else {
             err = "Unknown AOF file type";
@@ -732,9 +747,12 @@ void aofOpenIfNeededOnServerStart(void) {
      * we don't need atomic modification here. */
     sds aof_name = getLastIncrAofName(server.aof_manifest);
 
-    /* Here we should use 'O_APPEND' flag. */
+    /* Use O_TRUNC when creating a new INCR file (incr_aof_len == 0) so we never
+     * append to a stale unreferenced file left on disk; keep O_APPEND when
+     * reopening an existing INCR file from the manifest. */
     sds aof_filepath = makePath(server.aof_dirname, aof_name);
-    server.aof_fd = open(aof_filepath, O_WRONLY | O_APPEND | O_CREAT, 0666);
+    int open_flags = O_WRONLY | O_APPEND | O_CREAT | (incr_aof_len ? 0 : O_TRUNC);
+    server.aof_fd = open(aof_filepath, open_flags, 0666);
     sdsfree(aof_filepath);
     if (server.aof_fd == -1) {
         serverLog(LL_WARNING, "Can't open the append-only file %s: %s", aof_name, strerror(errno));
